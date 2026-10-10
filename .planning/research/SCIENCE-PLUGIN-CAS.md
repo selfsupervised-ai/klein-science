@@ -163,7 +163,10 @@ is large and judges it important for Klein.
 6. Numerics live in the same science plugin.
 7. The Symbolica-clean rule becomes a D-R now.
 
-## 9. GPU lane box: cost estimate (2026-10-11)
+## 9. GPU lane box: cost estimate (2026-10-11) — DEFERRED
+
+**Operator 2026-10-11: work on the local GPU first** (Mac M3 Max, 30-core GPU, Metal 4, via CubeCL), and look at a remote GPU
+later. This section stays as the reference for when a remote box is needed (CUDA conformance, f64 budgets).
 
 **Prices.** Nebius list prices (nebius.com/prices, fetched 2026-10-11; USD excluding tax; on-demand prices effective
 2026-10-01). The platforms are available in the project's region, eu-north1. The GPU quota there has not been checked [U].
