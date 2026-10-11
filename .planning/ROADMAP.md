@@ -96,7 +96,7 @@ Wasmtime pin) are measured and filed as klein-rs requests.
 - Also measure, on the oracle, the share of TIR definite integrals that SymPy routes through `meijerint`. It decides
   whether Meijer G leaves the v2 tail.
 
-**Plans**: 2/18 plans executed in 8 waves
+**Plans**: 4/18 plans executed in 8 waves
 
 Plans:
 **Wave 1**
@@ -106,8 +106,8 @@ Plans:
 - [x] 01-02-PLAN.md — xtask spine: recipe fetch, artifact-store client, pinned host tools, heavy-job guard, RFC 8785 vectors, no-corpus (wave 2)
 
 **Wave 3** *(blocked on Wave 2 completion)*
-- [ ] 01-03-PLAN.md — determinism and licence guards: clippy, cargo-deny, provenance headers and NOTICE, each seen RED (wave 3)
-- [ ] 01-04-PLAN.md — ksci-ops and the R2 worker: `science.cas.canonicalize`, logical step budget, stdio frames (wave 3)
+- [x] 01-03-PLAN.md — determinism and licence guards: clippy, cargo-deny, provenance headers and NOTICE, each seen RED (wave 3)
+- [x] 01-04-PLAN.md — ksci-ops and the R2 worker: `science.cas.canonicalize`, logical step budget, stdio frames (wave 3)
 - [ ] 01-05-PLAN.md — digest-pinned SymPy oracle image, hardened program runner, introspection table (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
@@ -405,7 +405,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Contracts, Oracles and Risk Probes | 2/18 | In Progress | - |
+| 1. Contracts, Oracles and Risk Probes | 4/18 | In Progress | - |
 | 2. Core Expressions | 0/TBD | Not started | - |
 | 3. Polynomials, Number Theory and Algebraic Solve | 0/TBD | Not started | - |
 | 4. Solve, Simplify, Assumptions and Piecewise | 0/TBD | Not started | - |
