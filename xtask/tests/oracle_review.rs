@@ -174,34 +174,69 @@ fn oracle_review_case_cannot_kill_the_harness() {
 }
 
 /// R1 (b): a case that SIGSTOPs and SIGKILLs every sibling wrapper it finds in /proc must not
-/// change their records.
+/// change their records. Deterministic (review round 3): each victim announces itself in /tmp
+/// and waits for the attacker's done-file, and the attacker acts only once it has seen all three,
+/// so the victims are alive when it signals. On the pre-fix runner (c61dc69) this gives
+/// `ready 3 signalled 6` and three Signal SIGKILL records, run after run.
 #[test]
 #[ignore = "needs docker and the pinned base image; run with -- --ignored"]
 fn oracle_review_case_cannot_signal_siblings() {
     let records = run_records("testdata/programs/review-r1-sibling.jsonl", "4");
-    let attacker = "888f20c271bdd543b77bab2ee8db0eeb28adba696d3fd1a8665af09ea2d972c7";
+    let attacker = "72e2939e8a99cbf8cbe9ed1a6ce2e4de256ae158d93eb6fee0edbaf19d310acf";
     assert_eq!(
-        records[attacker]["stdout"], "signalled 0\n",
+        records[attacker]["stdout"], "ready 3 signalled 0\n",
         "{}",
         records[attacker]
     );
     for (case_id, n) in [
         (
-            "0b8e306577734ba362b5d7a64420e59f2060fccaa89f2e76c58bdb7121a1f680",
+            "24d86ea394aee16937bad408c3fd8cd5ab03485c76c7ae6634d2c95075a3c943",
             0,
         ),
         (
-            "ac24f984c86e9969f144da95aecd087feefa21876e2beeefdde6e888025a26b1",
+            "42918454b9f0fe24f2a31ddab6da5d965a513241a867333613488977b47cbed5",
             1,
         ),
         (
-            "81ec346cea3876111cf3ea4cf92cf4a3e6de11a5d6c7a2af519000c2e253cf01",
+            "b44ebbb6cebe3db7f08d798b28b07ebf6c06144b89d6b8e7cee9e048f15926a4",
             2,
         ),
     ] {
         let r = &records[case_id];
         assert_eq!(r["status"], "ok", "{r}");
-        assert_eq!(r["stdout"], format!("victim {n}\n"), "{r}");
+        assert_eq!(
+            r["stdout"],
+            format!("victim {n} saw the attack end\n"),
+            "{r}"
+        );
+    }
+}
+
+/// Review round 3: the container's pid budget is an invariant. With `--jobs 32`, 31 cases
+/// that each hold 15 sleeping children plus a control that later starts a subprocess
+/// exhausted the 512-task limit before the fix: the control failed with EAGAIN, and some hogs
+/// got fewer children, depending on timing. Now every hog gets all 15 and the control is ok.
+#[test]
+#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
+fn oracle_review_pid_budget_holds() {
+    let records = run_records("testdata/programs/review-pids.jsonl", "32");
+    assert_eq!(records.len(), 32);
+    let control = "64d83a3e4f562948898f4a31448221a8302bbafafb2775ff0014e61160f6048a";
+    assert_eq!(
+        (
+            records[control]["status"].as_str(),
+            records[control]["stdout"].as_str()
+        ),
+        (Some("ok"), Some("control 42 0\n")),
+        "{}",
+        records[control]
+    );
+    for (case_id, r) in &records {
+        if case_id != control {
+            assert_eq!(r["status"], "ok", "{r}");
+            let out = r["stdout"].as_str().unwrap();
+            assert!(out.ends_with(" forked 15\n"), "{r}");
+        }
     }
 }
 
