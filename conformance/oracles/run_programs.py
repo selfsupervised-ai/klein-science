@@ -24,8 +24,26 @@ program text arrives on a pipe, and an uncaught exception is reported as one JSO
 second, dedicated pipe. The parent kills the case's whole process group at 4x the CPU limit of
 wall-clock time.
 
+Containment (review W3). A case ends when its wrapper ends, and everything it started ends with
+it. This process and each wrapper are subreapers (PR_SET_CHILD_SUBREAPER): while a case runs,
+its orphans are adopted by its own wrapper; once the wrapper is gone they are adopted here,
+however they detached (a new session or process group does not escape). When a wrapper exits,
+every child of this process that is not a live wrapper is SIGKILLed and reaped, in rounds, so
+nothing a finished case started survives into another case. A per-case PID namespace would be
+the stronger primitive, but unshare(CLONE_NEWPID) and unshare(CLONE_NEWUSER) are EPERM in the
+hardened container (measured), and granting them would weaken the sandbox.
+
+A case is classified only from complete channels: if stdout or the exception channel has not
+reached EOF after the sweep, the case is an error (HarnessError), never ok.
+
+Failures. Per case, any failure of the harness itself (spawn, read, classification) is recorded
+as that case's HarnessError; one case never discards the batch (review W2). Batch-fatal, with
+no records written: invalid input or arguments (exit 2), --require-sympy-env unmet (exit 3),
+this process cannot become a subreaper (exit 4), and failing to write the outputs.
+
 Exit status: 0 after a run (whatever the cases did), 2 for invalid input or arguments, 3 when
---require-sympy-env is given and the ground types or the mpmath backend are not "python".
+--require-sympy-env is given and the ground types or the mpmath backend are not "python", 4
+when cases cannot be contained.
 """
 
 import argparse
@@ -47,6 +65,16 @@ WALL_FACTOR = 4
 # Environment variables a case inherits from this process when they are set (PYTHONPATH only
 # when xtask set it). Everything else is dropped.
 COPIED_ENV = ("SYMPY_GROUND_TYPES", "MPMATH_NOGMPY", "SYMPY_USE_CACHE", "LC_ALL", "TZ")
+# prctl(2) option; Linux UAPI value.
+PR_SET_CHILD_SUBREAPER = 36
+# Seconds a finished case's stdout and exception channel get to reach EOF after the sweep.
+CLOSE_GRACE = 2.0
+# Sweep rounds before a case's descendants count as uncontained.
+REAP_ROUNDS = 1000
+# Pids of the case wrappers started and not yet reaped. SPAWN_LOCK guards it and serialises
+# spawning against the stray sweep, so a just-forked wrapper is never taken for a stray.
+SPAWN_LOCK = threading.Lock()
+LIVE = set()
 
 WRAPPER = r"""
 import json, os, resource, sys, types
@@ -59,6 +87,16 @@ with os.fdopen(code_fd, "rb") as f:
     source = f.read()
 exc_out = os.fdopen(exc_fd, "w", encoding="utf-8", errors="backslashreplace")
 sys.argv = ["<program>"]
+
+# Adopt the case's orphans while the case runs, so they stay inside this case.
+import ctypes
+_libc = ctypes.CDLL(None, use_errno=True)
+if _libc.prctl(36, 1, 0, 0, 0) != 0:
+    exc_out.write(json.dumps({"type": "HarnessError",
+                              "message": "PR_SET_CHILD_SUBREAPER failed: errno %d" % ctypes.get_errno()}) + "\n")
+    exc_out.flush()
+    os._exit(0)
+del _libc
 
 def _report(e):
     try:
@@ -157,6 +195,61 @@ def case_env():
     return env
 
 
+def set_subreaper():
+    """Make this process adopt its orphaned descendants. Returns 0, or the errno of the failure."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        return ctypes.get_errno()
+    return 0
+
+
+def children_of(pid):
+    """Pids whose parent is `pid`, from /proc (the container's own pid namespace)."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # After the parenthesised command name: state, then ppid.
+        fields = stat.rsplit(b")", 1)[-1].split()
+        if len(fields) > 1 and int(fields[1]) == pid:
+            found.append(int(entry))
+    return found
+
+
+def sweep_strays():
+    """Kill and reap every child of this process that is not a live case wrapper.
+
+    This process is a subreaper, so a descendant of a finished case (one whose wrapper has
+    exited) is re-parented here, however it detached: a new session or process group does not
+    escape. Killing a stray re-parents its own children here, hence the rounds. Returns False
+    when strays remained after REAP_ROUNDS rounds.
+    """
+    me = os.getpid()
+    with SPAWN_LOCK:
+        for _ in range(REAP_ROUNDS):
+            strays = [p for p in children_of(me) if p not in LIVE]
+            if not strays:
+                return True
+            for p in strays:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for p in strays:
+                try:
+                    os.waitpid(p, 0)
+                except ChildProcessError:
+                    pass
+    return False
+
+
 def kill_group(pid):
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -164,23 +257,61 @@ def kill_group(pid):
         pass
 
 
+def signal_name(sig):
+    """`SIGSEGV` for a named signal; the number (`36`) for one without a `signal.Signals`
+    member, such as a real-time signal."""
+    try:
+        return signal.Signals(sig).name
+    except ValueError:
+        return str(sig)
+
+
+def harness_error(message):
+    """The record of a case the harness could not run or observe completely. Partial stdout is
+    timing-dependent, so none is recorded."""
+    return {
+        "status": "error",
+        "stdout": "",
+        "stdout_truncated": False,
+        "exception": {"type": "HarnessError", "message": clean(message)},
+    }
+
+
+def run_case_recorded(code, env, limits):
+    """`run_case`, with any failure of the harness itself recorded as this case's error: one
+    case never aborts the batch (review W2)."""
+    try:
+        return run_case(code, env, limits)
+    except Exception as e:
+        return harness_error(f"{type(e).__name__}: {e}")
+
+
 def run_case(code, env, limits):
+    """Run one case to completion. When it returns, every process the case started is dead."""
     cpu, mem, prelude = limits["cpu_seconds"], limits["mem_bytes"], limits["prelude"]
     code_r, code_w = os.pipe()
     exc_r, exc_w = os.pipe()
     argv = [sys.executable, "-s", "-c", WRAPPER, str(code_r), str(exc_w)]
     argv += [str(cpu), str(mem), str(FSIZE_BYTES), prelude or ""]
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        pass_fds=(code_r, exc_w),
-        env=env,
-        start_new_session=True,
-    )
-    os.close(code_r)
-    os.close(exc_w)
+    try:
+        with SPAWN_LOCK:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                pass_fds=(code_r, exc_w),
+                env=env,
+                start_new_session=True,
+            )
+            LIVE.add(proc.pid)
+    except BaseException:
+        os.close(code_w)
+        os.close(exc_r)
+        raise
+    finally:
+        os.close(code_r)
+        os.close(exc_w)
 
     def feed():
         try:
@@ -192,68 +323,107 @@ def run_case(code, env, limits):
     feeder = threading.Thread(target=feed, daemon=True)
     feeder.start()
 
-    exc_chunks = []
+    exc = {"chunks": [], "size": 0, "eof": False}
 
     def drain_exc():
-        with os.fdopen(exc_r, "rb") as f:
+        # Raw reads, so whatever has arrived is kept even if the channel never closes.
+        try:
             while True:
-                chunk = f.read(65536)
+                chunk = os.read(exc_r, 65536)
                 if not chunk:
+                    exc["eof"] = True
                     return
-                if sum(len(c) for c in exc_chunks) < STDOUT_CAP:
-                    exc_chunks.append(chunk)
+                if exc["size"] < STDOUT_CAP:
+                    exc["chunks"].append(chunk)
+                    exc["size"] += len(chunk)
+        finally:
+            os.close(exc_r)
 
     exc_reader = threading.Thread(target=drain_exc, daemon=True)
     exc_reader.start()
 
-    out_fd = proc.stdout.fileno()
-    os.set_blocking(out_fd, False)
     captured = bytearray()
     truncated = False
     eof = False
     killed = False
+    contained = True
     wait_status = None
     rusage = None
-    deadline = time.monotonic() + WALL_FACTOR * cpu
-    exited_at = None
-    while True:
-        if wait_status is None:
-            pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
-            if pid:
-                wait_status, rusage = status, usage
-                exited_at = time.monotonic()
-                # Anything the program left running in its group goes with it.
-                kill_group(proc.pid)
-        if wait_status is not None and (eof or time.monotonic() - exited_at > 1.0):
-            break
-        if not killed and time.monotonic() >= deadline:
-            kill_group(proc.pid)
-            killed = True
-        if eof:
-            time.sleep(0.01)
-            continue
-        ready, _, _ = select.select([out_fd], [], [], 0.05)
-        if not ready:
-            continue
+    closed_by = None
+    try:
+        out_fd = proc.stdout.fileno()
+        os.set_blocking(out_fd, False)
+        deadline = time.monotonic() + WALL_FACTOR * cpu
         while True:
+            if wait_status is None:
+                pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
+                if pid:
+                    wait_status, rusage = status, usage
+                    with SPAWN_LOCK:
+                        LIVE.discard(proc.pid)
+                    # The case is over: everything it started dies with it (review W3).
+                    contained = sweep_strays()
+                    closed_by = time.monotonic() + CLOSE_GRACE
+            if wait_status is not None and (eof or time.monotonic() >= closed_by):
+                break
+            if not killed and time.monotonic() >= deadline:
+                kill_group(proc.pid)
+                killed = True
+            if eof:
+                time.sleep(0.01)
+                continue
+            ready, _, _ = select.select([out_fd], [], [], 0.05)
+            if not ready:
+                continue
+            while True:
+                try:
+                    chunk = os.read(out_fd, 65536)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    eof = True
+                    break
+                room = STDOUT_CAP - len(captured)
+                if len(chunk) > room:
+                    truncated = True
+                captured += chunk[: max(room, 0)]
+    finally:
+        if wait_status is None:
+            # The harness failed mid-case: end the case and everything it started anyway.
+            kill_group(proc.pid)
             try:
-                chunk = os.read(out_fd, 65536)
-            except BlockingIOError:
-                break
-            if not chunk:
-                eof = True
-                break
-            room = STDOUT_CAP - len(captured)
-            if len(chunk) > room:
-                truncated = True
-            captured += chunk[: max(room, 0)]
-    proc.stdout.close()
-    proc.returncode = os.waitstatus_to_exitcode(wait_status)
-    exc_reader.join(timeout=1.0)
-    feeder.join(timeout=1.0)
+                os.kill(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _, wait_status, rusage = os.wait4(proc.pid, 0)
+            with SPAWN_LOCK:
+                LIVE.discard(proc.pid)
+            sweep_strays()
+        proc.returncode = os.waitstatus_to_exitcode(wait_status)
+        proc.stdout.close()
+    # Every writer is dead, so the exception channel reaches EOF unless containment failed.
+    exc_reader.join(timeout=CLOSE_GRACE)
+    feeder.join(timeout=CLOSE_GRACE)
+
+    cpu_used = rusage.ru_utime + rusage.ru_stime
+    signalled = os.WIFSIGNALED(wait_status)
+    sig = os.WTERMSIG(wait_status) if signalled else None
+    if (
+        killed
+        or sig == signal.SIGXCPU
+        or (sig == signal.SIGKILL and cpu_used >= cpu)
+    ):
+        # What a killed program had flushed depends on timing, so a timeout records no stdout.
+        return {"status": "timeout", "stdout": "", "stdout_truncated": False, "exception": None}
+    if not contained:
+        return harness_error("processes started by the case survived the sweep")
+    if not eof:
+        return harness_error("stdout stayed open after the case ended")
+    if not exc["eof"]:
+        return harness_error("the exception channel stayed open after the case ended")
 
     exception = None
-    lines = b"".join(exc_chunks).decode("utf-8", "backslashreplace").splitlines()
+    lines = b"".join(exc["chunks"]).decode("utf-8", "backslashreplace").splitlines()
     if lines:
         try:
             record = json.loads(lines[-1])
@@ -267,18 +437,8 @@ def run_case(code, env, limits):
         except ValueError:
             exception = {"type": "InvalidExceptionRecord", "message": clean(lines[-1][:200])}
 
-    cpu_used = rusage.ru_utime + rusage.ru_stime
-    signalled = os.WIFSIGNALED(wait_status)
-    sig = os.WTERMSIG(wait_status) if signalled else None
-    if (
-        killed
-        or sig == signal.SIGXCPU
-        or (sig == signal.SIGKILL and cpu_used >= cpu)
-    ):
-        # What a killed program had flushed depends on timing, so a timeout records no stdout.
-        return {"status": "timeout", "stdout": "", "stdout_truncated": False, "exception": None}
     if exception is None and signalled:
-        exception = {"type": "Signal", "message": signal.Signals(sig).name}
+        exception = {"type": "Signal", "message": signal_name(sig)}
     elif exception is None and os.WEXITSTATUS(wait_status) != 0:
         exception = {"type": "ExitCode", "message": str(os.WEXITSTATUS(wait_status))}
     return {
@@ -335,6 +495,9 @@ def main():
 
     cases, inputs = load_cases(args.input)
     env = case_env()
+    errno = set_subreaper()
+    if errno:
+        fail(4, f"cannot contain cases: PR_SET_CHILD_SUBREAPER failed with errno {errno}")
     limits = {
         "cpu_seconds": args.cpu_seconds,
         "wall_seconds": WALL_FACTOR * args.cpu_seconds,
@@ -347,7 +510,8 @@ def main():
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(run_case, code, env, limits): case_id for case_id, code in cases.items()
+            pool.submit(run_case_recorded, code, env, limits): case_id
+            for case_id, code in cases.items()
         }
         for future in concurrent.futures.as_completed(futures):
             results[futures[future]] = future.result()

@@ -34,9 +34,9 @@ fn cache_dir() -> PathBuf {
     }
 }
 
-#[test]
-#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
-fn oracle_review_cases_are_recorded_and_contained() {
+/// Runs `input` through `cargo xtask oracle run` in the pinned base image and returns the
+/// stored records by case_id. The run itself must succeed (W2: one case never discards it).
+fn run_records(input: &str, jobs: &str) -> BTreeMap<String, Value> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
         .current_dir(root)
@@ -50,18 +50,16 @@ fn oracle_review_cases_are_recorded_and_contained() {
             "--script",
             "conformance/oracles/run_programs.py",
             "--input",
-            "testdata/programs/review.jsonl",
+            input,
             "--cpu-seconds",
             "5",
-            // Sequential, so the stray check runs after the stray spawn.
             "--jobs",
-            "1",
+            jobs,
         ])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // W2: one case must never discard the batch.
     assert!(
         out.status.success(),
         "oracle run failed ({}):\n{stdout}\n{stderr}",
@@ -72,13 +70,44 @@ fn oracle_review_cases_are_recorded_and_contained() {
         .find_map(|l| l.strip_prefix("records.jsonl sha256="))
         .unwrap_or_else(|| panic!("no records digest in:\n{stdout}"));
     let text = fs::read_to_string(cache_dir().join("blobs").join("sha256").join(hex)).unwrap();
-    let records: BTreeMap<String, Value> = text
-        .lines()
+    text.lines()
         .map(|l| {
             let v: Value = serde_json::from_str(l).unwrap();
             (v["case_id"].as_str().unwrap().to_owned(), v)
         })
-        .collect();
+        .collect()
+}
+
+/// The sweep that ends a finished case must never reach into a case that is still running:
+/// its child, and its orphaned grandchild (adopted by the case's own wrapper), both survive
+/// while 24 other cases finish around them. Seen RED with the wrapper's subreaper disabled:
+/// the orphan was killed by another case's sweep and the case printed an empty line.
+#[test]
+#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
+fn oracle_review_sweep_spares_running_cases() {
+    let records = run_records("testdata/programs/review-concurrency.jsonl", "4");
+    assert_eq!(records.len(), 26);
+    assert!(records.values().all(|r| r["status"] == "ok"));
+    let child = "d979b41a8fab9a83e5426777c3dedfedc37d0fc7e515846f685327092878e8d4";
+    let orphan = "1d69cd63b82b2b067ad869844a3ce4be2d933e514a0fa649736664aaff2c972c";
+    assert_eq!(
+        records[child]["stdout"], "child done 0\n",
+        "{}",
+        records[child]
+    );
+    assert_eq!(
+        records[orphan]["stdout"], "orphan done\n",
+        "{}",
+        records[orphan]
+    );
+}
+
+#[test]
+#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
+fn oracle_review_cases_are_recorded_and_contained() {
+    // Sequential, so the stray check runs after the stray spawn.
+    let records = run_records("testdata/programs/review.jsonl", "1");
+    let text = format!("{records:?}");
     assert_eq!(records.len(), 5, "{text}");
 
     // W2: the real-time signal is named by its number.

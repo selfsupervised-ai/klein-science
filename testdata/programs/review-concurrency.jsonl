@@ -1,0 +1,26 @@
+{"case_id": "d979b41a8fab9a83e5426777c3dedfedc37d0fc7e515846f685327092878e8d4", "code": "import subprocess, sys\np = subprocess.run([sys.executable, '-c', 'import time; time.sleep(3); print(\"child done\")'], capture_output=True, text=True)\nprint(p.stdout.strip(), p.returncode)\n"}
+{"case_id": "1d69cd63b82b2b067ad869844a3ce4be2d933e514a0fa649736664aaff2c972c", "code": "import os, time\nr, w = os.pipe()\nif os.fork() == 0:\n    if os.fork() == 0:\n        time.sleep(3)\n        os.write(w, b'orphan done')\n        os._exit(0)\n    os._exit(0)\nos.close(w)\nprint(os.read(r, 100).decode())\n"}
+{"case_id": "0b4a82039ef0f6758ebe01370e28afd40c737a3bd15ba9bdc368ec08da60082d", "code": "print(0)\n"}
+{"case_id": "cc42155088fca5730758db72b2a5bca33112a941dfaa2d43098ec422ce4ea213", "code": "print(1)\n"}
+{"case_id": "0111afd387e1ad576083c5039aa542faa2ed4a53d3e128bd03de990f9ea4255f", "code": "print(2)\n"}
+{"case_id": "a80ac71a28f94cd42123f2e97d4ef92ffbd48849a188edc27f06a04acc06dc8c", "code": "print(3)\n"}
+{"case_id": "e1d57648f5d8862748ad33df19e6c6beaafb90977e85ea02967903699a649370", "code": "print(4)\n"}
+{"case_id": "082411d66dca409ce8602f74bbed4bd25e4bcd6f8eced3234d048ee3af672ce5", "code": "print(5)\n"}
+{"case_id": "b20d3502104d782ade9b24643100eca2949096572263e29ee1c85a7056b05b12", "code": "print(6)\n"}
+{"case_id": "896abce6abd56a56397a878660d2cba6f1398ef128ca6ead0acac98a6c8f38f7", "code": "print(7)\n"}
+{"case_id": "e96e6c042043a4b6e574fda9890e8cb13978d96b84a6ca6aeba0ef56d5fdcded", "code": "print(8)\n"}
+{"case_id": "e958af6894beb87720aa45d30cd737cdfd3378ff5c97571f678cd21aae9a8f52", "code": "print(9)\n"}
+{"case_id": "9338bacc9d09ccab9e962b48df339fda838d06d2475805749f10a302b740724a", "code": "print(10)\n"}
+{"case_id": "8508f581dfba045ee5783211dbd66197c15926bf6fd2b5ddedb119ee5bbc2456", "code": "print(11)\n"}
+{"case_id": "9cf3683cdf38b84b326385636dd3dc26a6482b6315981a15c9f75fd64906ee66", "code": "print(12)\n"}
+{"case_id": "961ecce99fd34f54af99ac1e792d7323ff1023628939dd64b6b92110095613f5", "code": "print(13)\n"}
+{"case_id": "cfbbc3987ebfd0af5c1dc37f3ce0be6963fd6e92286a931bc37e53dfe7f346f4", "code": "print(14)\n"}
+{"case_id": "2d230878e6fe8d7fb452662203c49eeb501325ea46f729da532a65bb1b923688", "code": "print(15)\n"}
+{"case_id": "b190c7c8d78d3b8ac195de489fb46aed4b36c0828c1d50211077e2b0e7de0719", "code": "print(16)\n"}
+{"case_id": "4c5bd8418cdf2e378d9ae8dd9b8d53eae0d757216a720c0f5fccff79d24e4a82", "code": "print(17)\n"}
+{"case_id": "c14bfee63c128ba79eb063d34e5fbaad407e64475fd0ac235273643fa74967f5", "code": "print(18)\n"}
+{"case_id": "758212d960922a1a0cd524aede2853f4c4bc2e5c4872feee036c1aba0d18abd1", "code": "print(19)\n"}
+{"case_id": "e6b8844004c52de805b790cd8e73093e872c96aaa9c81c0ce6261af2110dc6b4", "code": "print(20)\n"}
+{"case_id": "fe4de14e20dcb9aecb2c914892f7a8d60d52f884209ffe15a9be8a5d6e229d53", "code": "print(21)\n"}
+{"case_id": "310e6e695cb00e25262938bc49f40a62c31ceffd054381146d3a2766a6834892", "code": "print(22)\n"}
+{"case_id": "a3418f895ca3c96746c9a2951fc45f09e47bb0f691813edf1b1be508201c07cf", "code": "print(23)\n"}
