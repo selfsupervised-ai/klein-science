@@ -115,18 +115,26 @@ struct Built {
     artifacts: BTreeMap<String, PathBuf>,
 }
 
+/// The target directory of every release build, relative to the tree it builds. It lies inside
+/// the tree, so the source remap covers it, and it is the same relative path in every build: the
+/// native link records object paths relative to the tree (`-oso_prefix`), so a different relative
+/// target directory alone gives a different worker. It is apart from `target/`, so the release
+/// rustflags never invalidate the developer's own builds.
+const BUILD_DIR: &str = "target/dist-build";
+
 /// The one build path of the shipped artifacts (D-01): builds the tree at `src_root` into
-/// `target_dir`, which must lie inside `src_root` so the source remap covers it, and writes the
-/// component and the host worker into `out_dir`.
+/// `target_dir`, which must be `src_root/`[`BUILD_DIR`], and writes the component and the host
+/// worker into `out_dir`.
 fn build_artifacts(
     tc: &Toolchain,
     src_root: &Path,
     target_dir: &Path,
     out_dir: &Path,
 ) -> Res<Built> {
-    if !target_dir.starts_with(src_root) {
+    if target_dir != src_root.join(BUILD_DIR) {
         return Err(format!(
-            "target dir {} is outside the source tree {}; its paths would not be remapped",
+            "target dir {} is not {BUILD_DIR} of the source tree {}; its paths would not \
+             reproduce",
             target_dir.display(),
             src_root.display()
         ));
@@ -247,14 +255,13 @@ fn remap_flags(src_root: &Path, cargo_home: &Path) -> Res<Vec<String>> {
     Ok(flags)
 }
 
-/// `dist`: one build of the checkout itself, into `target/dist-build`.
+/// `dist`: one build of the checkout itself, into [`BUILD_DIR`].
 fn dist() -> Res<()> {
     let root = workspace::root()?;
     let tc = Toolchain::resolve()?;
     let _held = heavy_job()?;
-    let target = root.join("target");
-    let dist = target.join("dist");
-    let built = build_artifacts(&tc, &root, &target.join("dist-build"), &dist)?;
+    let dist = root.join("target").join("dist");
+    let built = build_artifacts(&tc, &root, &root.join(BUILD_DIR), &dist)?;
     write_digests(&tc, &dist, &built, false)?;
     Ok(())
 }
@@ -289,7 +296,7 @@ fn dist_twice() -> Res<ExitCode> {
             fs::canonicalize(&src_root).map_err(|e| format!("{}: {e}", src_root.display()))?;
         println!("dist --twice: building {}", src_root.display());
         let out = base.join("dist");
-        let built = build_artifacts(&tc, &src_root, &src_root.join("target"), &out)?;
+        let built = build_artifacts(&tc, &src_root, &src_root.join(BUILD_DIR), &out)?;
         runs.push((src_root, built));
     }
 
