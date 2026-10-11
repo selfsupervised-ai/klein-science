@@ -9,6 +9,11 @@
 //! - `digests.json`: the JCS of each artifact's SHA-256, the host triple, the toolchain and
 //!   wasm-tools versions, and whether two builds were compared (`reproducible`).
 //!
+//! Every build runs the artifact gates, also available alone as `cargo xtask release gates
+//! <component>`: the component's WIT holds no `import` (D-16), and the component and the core
+//! module it wraps validate with `--features=-relaxed-simd`. Each gate has a permanent RED fixture
+//! in `xtask/tests/fixtures/gates/`.
+//!
 //! Every artifact lands under `target/dist/` of the checkout ([`workspace::root`]):
 //! `science_cas.component.wasm`, `<host-triple>/ksci-worker` and `digests.json`. The conformance
 //! host (`ksci-conform`) runs exactly these files.
@@ -51,6 +56,11 @@ pub enum ReleaseCmd {
         #[arg(long)]
         twice: bool,
     },
+    /// Check a component: it imports nothing (D-16) and validates without relaxed SIMD.
+    Gates {
+        /// The component to check.
+        artifact: PathBuf,
+    },
 }
 
 /// Runs one `release` command.
@@ -58,6 +68,7 @@ pub fn run(cmd: ReleaseCmd) -> Res<ExitCode> {
     match cmd {
         ReleaseCmd::Dist { twice: false } => dist().map(|()| ExitCode::SUCCESS),
         ReleaseCmd::Dist { twice: true } => dist_twice(),
+        ReleaseCmd::Gates { artifact } => gates(&artifact).map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -166,6 +177,12 @@ fn build_artifacts(
         .arg("-o")
         .arg(&component);
     run_checked(&mut wrap, "wasm-tools component new")?;
+
+    // The gates, on every build: the component imports nothing, and neither the component nor
+    // the core module it wraps uses relaxed SIMD.
+    gate_imports(&tc.wasm_tools, &component)?;
+    gate_relaxed(&tc.wasm_tools, &component)?;
+    gate_relaxed(&tc.wasm_tools, &core)?;
     artifacts.insert(COMPONENT.to_owned(), component);
 
     // c. The R2 worker for the host triple.
@@ -439,14 +456,66 @@ fn write_digests(tc: &Toolchain, dist: &Path, built: &Built, reproducible: bool)
     Ok(())
 }
 
-/// The zero-import gate (D-16). Not implemented yet (RED).
-fn gate_imports(_wasm_tools: &Path, _artifact: &Path) -> Res<()> {
+/// `gates <artifact>`: both artifact gates on one component.
+fn gates(artifact: &Path) -> Res<()> {
+    let wasm_tools = pinned_tool("wasm-tools")?;
+    gate_imports(&wasm_tools, artifact)?;
+    gate_relaxed(&wasm_tools, artifact)?;
+    println!(
+        "gates ok: {} imports nothing and uses no relaxed SIMD",
+        artifact.display()
+    );
     Ok(())
 }
 
-/// The relaxed-SIMD gate. Not implemented yet (RED).
-fn gate_relaxed(_wasm_tools: &Path, _artifact: &Path) -> Res<()> {
-    Ok(())
+/// The zero-import gate (D-16): the component's WIT (`wasm-tools component wit`) may hold no
+/// `import` line. The error lists every import.
+fn gate_imports(wasm_tools: &Path, artifact: &Path) -> Res<()> {
+    let wit = output_text(
+        Command::new(wasm_tools)
+            .args(["component", "wit"])
+            .arg(artifact),
+        "wasm-tools component wit",
+    )?;
+    let imports = import_lines(&wit);
+    if imports.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "import gate: {} has {} import(s); the R0 component must import nothing (D-16):\n{}",
+        artifact.display(),
+        imports.len(),
+        imports.join("\n")
+    ))
+}
+
+/// The lines of a WIT text that declare an import (`^\s*import\s`).
+fn import_lines(wit: &str) -> Vec<&str> {
+    wit.lines()
+        .filter(|l| {
+            l.trim_start()
+                .strip_prefix("import")
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        })
+        .collect()
+}
+
+/// The relaxed-SIMD gate: `artifact` (a component or a core module) must validate with relaxed
+/// SIMD disabled. Relaxed SIMD results are implementation-defined and would break replay.
+fn gate_relaxed(wasm_tools: &Path, artifact: &Path) -> Res<()> {
+    let out = Command::new(wasm_tools)
+        .args(["validate", "--features=-relaxed-simd"])
+        .arg(artifact)
+        .output()
+        .map_err(|e| format!("run wasm-tools validate: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "relaxed-SIMD gate: {} does not validate with --features=-relaxed-simd: {}",
+        artifact.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
 }
 
 /// The SHA-256 of a file, as lowercase hex.
@@ -550,6 +619,20 @@ mod tests {
         let linux = native_link_flags("x86_64-unknown-linux-gnu", Path::new("/t/src")).unwrap();
         assert!(linux.is_empty());
         assert!(native_link_flags("aarch64-apple-darwin", Path::new("/a,b")).is_err());
+    }
+
+    #[test]
+    fn release_import_lines() {
+        let wit = "package root:component;\n\nworld root {\n  import wasi:cli/environment@0.2.6;\n  \
+                   import\tf: func();\n  export klein:science/cas;\n  importer: func();\n}\n";
+        assert_eq!(
+            import_lines(wit),
+            [
+                "  import wasi:cli/environment@0.2.6;",
+                "  import\tf: func();"
+            ]
+        );
+        assert!(import_lines("world root {\n  export run: func();\n}\n").is_empty());
     }
 
     #[test]
