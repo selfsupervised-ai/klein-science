@@ -20,7 +20,7 @@ v1 = milestones M0–M5 (roadmap phases 1–6). M6, the parity long tail, is v2.
 - [x] **DET-02**: Every numeric leaf on the wire is a tagged string (Integer, Rational, Float with precision) and special
       values are named atoms, so no CAS number passes through a JSON number.
 - [x] **DET-03**: Provenance (implementation, device, driver, timings) travels in an envelope outside the hashed bytes.
-- [ ] **DET-04**: `fuel_exhausted` is raised only by a logical step budget counted identically on R0, R1 and R2;
+- [x] **DET-04**: `fuel_exhausted` is raised only by a logical step budget counted identically on R0, R1 and R2;
       Wasmtime fuel, memory caps and GPU timeouts surface as host errors, not as results.
 - [ ] **DET-05**: A CI job runs the same exact operation on R0, R1 (emulated) and R2 at several thread counts and fails on
       any byte difference; it has been seen RED before it is trusted.
@@ -68,7 +68,7 @@ v1 = milestones M0–M5 (roadmap phases 1–6). M6, the parity long tail, is v2.
 
 - [ ] **PLUG-01**: CI builds a reproducible zero-import WASM component (D-16) and a native worker, a `klein.plugin.v1` manifest,
       a raw detached Ed25519 signature that passes `verify_strict`, and an artifact addressed by digest.
-- [ ] **PLUG-02**: A WIT interface exposes one typed tool (`invoke`, `plan`, `map`, `reduce` over JCS bytes), and one
+- [x] **PLUG-02**: A WIT interface exposes one typed tool (`invoke`, `plan`, `map`, `reduce` over JCS bytes), and one
       trivial operation returns byte-identical results from R0 and R2.
 - [ ] **PLUG-03**: `science.cas` and `science.numerics` are built from one workspace as two signed bundles sharing the
       mpmath port; `evalf` lives in `science.cas`.
@@ -257,7 +257,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DET-01 | Phase 1 | Pending |
 | DET-02 | Phase 1 | Complete |
 | DET-03 | Phase 1 | Complete |
-| DET-04 | Phase 1 | Pending |
+| DET-04 | Phase 1 | Complete |
 | DET-05 | Phase 2 | Pending |
 | DET-06 | Phase 5 | Pending |
 | DET-07 | Phase 2 | Pending |
@@ -274,7 +274,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DEP-02 | Phase 1 | Pending |
 | DEP-03 | Phase 1 | Pending |
 | PLUG-01 | Phase 1 | Pending |
-| PLUG-02 | Phase 1 | Pending |
+| PLUG-02 | Phase 1 | Complete |
 | PLUG-03 | Phase 5 | Pending |
 | PLUG-04 | Phase 5 | Pending |
 | GUEST-01 | Phase 1 | Pending |
