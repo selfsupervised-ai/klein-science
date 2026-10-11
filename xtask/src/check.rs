@@ -253,9 +253,277 @@ pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     out
 }
 
+/// The provenance violations among `(path, contents)` pairs, judged against the NOTICE text,
+/// sorted by path. (RED stub: the real check lands with the GREEN commit.)
+pub fn provenance_violations(files: &[(String, Vec<u8>)], _notice: &str) -> Vec<String> {
+    files
+        .iter()
+        .map(|(path, _)| format!("{path}: unimplemented"))
+        .collect()
+}
+
+/// Whether the provenance check judges `path`. (RED stub.)
+pub fn provenance_in_scope(_path: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NOTICE with one `Project: sympy` block.
+    const NOTICE_SYMPY: &str = "klein-science\n\nPorted code notices\n\nProject: sympy\nCopyright (c) 2006-2023 SymPy Development Team\n";
+    /// A NOTICE with no Project blocks.
+    const NOTICE_EMPTY: &str = "klein-science\n\nPorted code notices\n";
+
+    fn judge(files: &[(&str, &str)], notice: &str) -> Vec<String> {
+        let files: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(p, c)| ((*p).to_owned(), c.as_bytes().to_vec()))
+            .collect();
+        provenance_violations(&files, notice)
+    }
+
+    const SYMPY_PORT_PY: &str =
+        "# provenance: port sympy@sympy-1.14.0:sympy/__init__.py (BSD-3-Clause)\nimport x\n";
+
+    #[test]
+    fn provenance_original_ok() {
+        let tree = [
+            (
+                "crates/a/src/lib.rs",
+                "// provenance: original\n//! Docs.\n",
+            ),
+            ("standin/a.py", "# provenance: original\nimport x\n"),
+            (
+                "standin/run.py",
+                "#!/usr/bin/env python3\n# provenance: original\n",
+            ),
+            (
+                "standin/enc.py",
+                "# -*- coding: utf-8 -*-\n# provenance: original\n",
+            ),
+            ("crates/a/src/one.rs", "// provenance: original"),
+        ];
+        assert_eq!(judge(&tree, NOTICE_EMPTY), Vec::<String>::new());
+    }
+
+    #[test]
+    fn provenance_missing() {
+        let tree = [
+            ("crates/a/src/lib.rs", "//! Docs.\npub fn f() {}\n"),
+            ("crates/a/src/empty.rs", ""),
+            ("standin/empty.py", ""),
+            // The header on line 2 counts only after a shebang or coding cookie, and only in Python.
+            ("crates/a/src/late.rs", "\n// provenance: original\n"),
+            ("standin/late.py", "import x\n# provenance: original\n"),
+        ];
+        assert_eq!(
+            judge(&tree, NOTICE_EMPTY),
+            [
+                "crates/a/src/empty.rs: no provenance header",
+                "crates/a/src/late.rs: no provenance header",
+                "crates/a/src/lib.rs: no provenance header",
+                "standin/empty.py: no provenance header",
+                "standin/late.py: no provenance header",
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_port_ok() {
+        let tree = [
+            ("standin/names.py", SYMPY_PORT_PY),
+            (
+                "crates/a/src/poly.rs",
+                "// provenance: port sympy@sympy-1.14.0:sympy/polys/densearith.py (BSD-3-Clause)\n",
+            ),
+        ];
+        assert_eq!(judge(&tree, NOTICE_SYMPY), Vec::<String>::new());
+    }
+
+    #[test]
+    fn provenance_port_not_in_notice() {
+        let tree = [("standin/names.py", SYMPY_PORT_PY)];
+        let expected = [r#"standin/names.py: port sympy has no "Project: sympy" line in NOTICE"#];
+        assert_eq!(judge(&tree, NOTICE_EMPTY), expected);
+        // A near-miss in NOTICE is not the line.
+        for notice in [
+            "Project: sympyy\n",
+            "Project: SymPy\n",
+            " Project: sympy\n",
+            "Project: sympy \n",
+            "Project:sympy\n",
+        ] {
+            assert_eq!(judge(&tree, notice), expected, "NOTICE {notice:?}");
+        }
+    }
+
+    #[test]
+    fn provenance_port_not_allowed() {
+        let tree = [
+            (
+                "crates/a/src/a.rs",
+                "// provenance: port symbolica@v1:src/lib.rs (MIT)\n",
+            ),
+            (
+                "crates/a/src/b.rs",
+                "// provenance: port flint@v3.0.0:src/fmpz.c (LGPL-3.0-or-later)\n",
+            ),
+            (
+                "crates/a/src/c.rs",
+                "// provenance: port giac@1.9:src/giac.cc (GPL-3.0-or-later)\n",
+            ),
+        ];
+        let notice = "Project: symbolica\nProject: flint\nProject: giac\n";
+        assert_eq!(
+            judge(&tree, notice),
+            [
+                r#"crates/a/src/a.rs: port project "symbolica" is not in the licence policy"#,
+                r#"crates/a/src/b.rs: port project "flint" is not in the licence policy"#,
+                r#"crates/a/src/c.rs: port project "giac" is not in the licence policy"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_spdx_mismatch() {
+        let tree = [
+            (
+                "standin/a.py",
+                "# provenance: port sympy@sympy-1.14.0:sympy/core/add.py (MIT)\n",
+            ),
+            (
+                "crates/a/src/a.rs",
+                "// provenance: port symengine@v0.14.0:symengine/add.cpp (BSD-3-Clause)\n",
+            ),
+        ];
+        let notice = "Project: sympy\nProject: symengine\n";
+        assert_eq!(
+            judge(&tree, notice),
+            [
+                "crates/a/src/a.rs: port symengine declares BSD-3-Clause, the licence policy requires MIT",
+                "standin/a.py: port sympy declares MIT, the licence policy requires BSD-3-Clause",
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_adjacent_name() {
+        let tree = [
+            (
+                "standin/a.py",
+                "# provenance: port sympyy@sympy-1.14.0:sympy/core/add.py (BSD-3-Clause)\n",
+            ),
+            (
+                "standin/b.py",
+                "# provenance: port SymPy@sympy-1.14.0:sympy/core/add.py (BSD-3-Clause)\n",
+            ),
+        ];
+        let notice = "Project: sympy\nProject: sympyy\nProject: SymPy\n";
+        assert_eq!(
+            judge(&tree, notice),
+            [
+                r#"standin/a.py: port project "sympyy" is not in the licence policy"#,
+                r#"standin/b.py: port project "SymPy" is not in the licence policy"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_paper_ok() {
+        let tree = [
+            (
+                "crates/a/src/a.rs",
+                "// provenance: paper doi:10.1145/1234\n",
+            ),
+            (
+                "standin/a.py",
+                "# provenance: paper doi:10.1006/jsco.1996.0052\n",
+            ),
+        ];
+        assert_eq!(judge(&tree, NOTICE_EMPTY), Vec::<String>::new());
+    }
+
+    #[test]
+    fn provenance_sorted() {
+        let tree = [
+            ("crates/a/src/b.rs", "pub fn b() {}\n"),
+            ("crates/a/src/a.rs", "pub fn a() {}\n"),
+        ];
+        assert_eq!(
+            judge(&tree, NOTICE_EMPTY),
+            [
+                "crates/a/src/a.rs: no provenance header",
+                "crates/a/src/b.rs: no provenance header",
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_malformed() {
+        let tree = [
+            ("crates/a/src/a.rs", "// provenance: originall\n"),
+            ("crates/a/src/b.rs", "// provenance: original \n"),
+            ("crates/a/src/c.rs", "// provenance: paper doi:\n"),
+            ("crates/a/src/d.rs", "// provenance: paper 10.1145/1234\n"),
+            (
+                "crates/a/src/e.rs",
+                "// provenance: port sympy@sympy-1.14.0 (BSD-3-Clause)\n",
+            ),
+            (
+                "crates/a/src/f.rs",
+                "// provenance: port sympy:sympy/a.py (BSD-3-Clause)\n",
+            ),
+            (
+                "crates/a/src/g.rs",
+                "// provenance: port sympy@sympy-1.14.0:sympy/a.py BSD-3-Clause\n",
+            ),
+            ("crates/a/src/h.rs", "# provenance: original\n"),
+            ("standin/a.py", "// provenance: original\n"),
+            ("crates/a/src/i.rs", "// provenance: original\r\n"),
+        ];
+        let found = judge(&tree, NOTICE_SYMPY);
+        let paths: Vec<&str> = found
+            .iter()
+            .map(|v| v.split_once(": ").map_or(v.as_str(), |(p, _)| p))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "crates/a/src/a.rs",
+                "crates/a/src/b.rs",
+                "crates/a/src/c.rs",
+                "crates/a/src/d.rs",
+                "crates/a/src/e.rs",
+                "crates/a/src/f.rs",
+                "crates/a/src/g.rs",
+                "crates/a/src/h.rs",
+                "crates/a/src/i.rs",
+                "standin/a.py",
+            ]
+        );
+        assert_eq!(
+            found[0],
+            r#"crates/a/src/a.rs: malformed provenance header "// provenance: originall""#
+        );
+        // A Rust file with a Python-style header has no header at all.
+        assert_eq!(found[7], "crates/a/src/h.rs: no provenance header");
+    }
+
+    #[test]
+    fn provenance_scope() {
+        assert!(provenance_in_scope("crates/ksci-wire/src/lib.rs"));
+        assert!(provenance_in_scope("crates/ksci-wire/tests/contract.rs"));
+        assert!(provenance_in_scope("crates/x/src/Upper.RS"));
+        assert!(provenance_in_scope("standin/names.py"));
+        assert!(provenance_in_scope("standin/pkg/sub/mod.py"));
+        assert!(!provenance_in_scope("xtask/src/main.rs"));
+        assert!(!provenance_in_scope("crates/ksci-wire/Cargo.toml"));
+        assert!(!provenance_in_scope("crates/x/tool.py"));
+        assert!(!provenance_in_scope("standin/x.rs"));
+        assert!(!provenance_in_scope("docs/crates/x.rs"));
+    }
 
     fn files(list: &[(&str, u64)]) -> Vec<(String, u64)> {
         list.iter().map(|(p, s)| ((*p).to_owned(), *s)).collect()
