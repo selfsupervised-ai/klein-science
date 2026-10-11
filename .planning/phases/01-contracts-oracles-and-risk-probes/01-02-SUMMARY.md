@@ -347,3 +347,141 @@ None for this plan. The first real push to GHCR still needs the operator's `oras
 - All 10 key files exist on disk.
 - Task commits ecee41f and b04b90b and the SUMMARY commit 8224fe4 are on this branch.
 - REQUIREMENTS.md not changed: DET-01 and CONF-02 are held by the shared-ID gate (0/2 ready) until sibling plans that declare them finish.
+
+## Review fixes
+
+Three review findings (R1–R3), all confirmed: on the merged code each bypass passed its guard. Each fix went
+test-first: the RED run came first, then the fix, then mutation witnesses on the fixed code. A new integration test
+file, `xtask/tests/review_bypass.rs` (11 tests), drives the built `xtask` binary as a child process against temporary
+git repositories and fake binaries placed first on `PATH`. The xtask unit tests went from 15 to 20.
+
+On the final tree:
+- `cargo test --workspace --locked` passes (36 + 6 + 20 + 11 + 5 tests).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo fmt --all --check` are clean.
+- `cargo xtask ci` reports "all 6 steps passed", with nextest at 73/73.
+
+### R1: `check no-corpus` judged the working tree, and judged the wrong tree
+
+- **Counter-examples (all were "no violations"):**
+  - a 300 KiB `conformance/corpora/leak.bin` staged with its working copy truncated to 1 byte;
+  - the same file staged with its working copy deleted;
+  - a gitlink index entry, whose `fs::metadata` error was skipped silently.
+- **Further hole (why the reviewer's untruncated 300 KiB file passed too):** `workspace_root()` is the compile-time
+  `CARGO_MANIFEST_DIR`. A binary built in one checkout and run in another checked the checkout it was built in. This
+  was reproduced: the scratch clone's binary, run in a second clone with the staged leak, printed
+  `no-corpus: 72 files checked, no violations`. Through `cargo xtask` in the same checkout, the size rule did catch
+  the intact file.
+- **Fix (one mechanism: judge the bytes git would commit, in the repository asked about):**
+  - The repository is the `git rev-parse --show-toplevel` of the current directory.
+  - Each index entry (`git ls-files -z --stage`) is sized from its staged blob, through one
+    `git cat-file --batch-check` (the writer runs on a thread, so a large index cannot deadlock the pipes). The
+    working copy of a tracked file is never consulted.
+  - An untracked, non-ignored file is judged by its working copy (`symlink_metadata`). An embedded repository is
+    named in a note.
+  - Fail closed: a gitlink, a missing or non-blob object, or an unreadable untracked entry is an error, never a skip.
+  - A new rule (e), added under deviation Rule 2 and backed by CLAUDE.md rule 6: `conformance/corpora/` holds only
+    `.toml` recipes and `.md` notes. The plan's rules (a)–(d) are unchanged. A path that appears in several merge
+    stages is reported once.
+
+### R2: `cargo xtask ci` ran `cargo` from `PATH`
+
+- **Counter-example:** a `cargo` stub that exits 0, placed first on `PATH`, produced `ci: all 6 steps passed` with
+  nothing run.
+- **Fix:** `host::cargo()` returns the cargo that invoked xtask (`$CARGO`) or, when that is unset, the pinned
+  toolchain's cargo from `rustup which cargo --toolchain <channel>`.
+  - The path must be absolute, and `--version` must report the pinned channel; otherwise ci stops before the first
+    step.
+  - Every step runs by that absolute path, and a step whose argv does not start with `cargo` is refused.
+  - `tools install` uses the same resolver.
+- **Bug found while fixing (Rule 1):** when the toolchain cargo is run directly, which is the fallback path, a nested
+  `rustc` proxy started in a dependency's directory cannot see rust-toolchain.toml, so it fell back to the default
+  toolchain. Observed: E0514, "found crate `cfg_if` compiled by rustc 1.99.0 … this compiler (rustc 1.97.0)", during
+  the nextest step, which also left mixed artifacts in `target/` (`cargo clean` in the worktree fixed that).
+  `Cargo::command()` now sets `RUSTUP_TOOLCHAIN=<channel>`, as the rustup proxy itself does. With a fake cargo on
+  `PATH` and `CARGO` unset, the binary then ran all 6 real steps green.
+
+### R3: `tools check` ran `rust-analyzer` from `PATH`
+
+- **Counter-example:** a stub on `PATH` printing `rust-analyzer 1.99.0` was reported as `ok (toolchain component)`.
+- **Fix:** `host::toolchain_bin()` runs `$CARGO_HOME/bin/rustup which <bin> --toolchain <channel>`, never a `rustup`
+  found on `PATH`.
+  - It canonicalises the result and checks that it lies in `$RUSTUP_HOME/toolchains/<channel>-<host>/`
+    (`in_toolchain`).
+  - rust-analyzer then runs by that absolute path, and the `tools check` line prints the path.
+
+### RED evidence (commit `5aa8310`, run against the unfixed code)
+
+`cargo test -p xtask --test review_bypass`: 10 run, 0 passed, 10 failed. Every failure was on an assertion.
+
+- R1, all six `no_corpus_*` tests: "no-corpus passed: … `no-corpus: 73 files checked, no violations`". That count
+  is the worktree, not the temporary repository.
+- `tools_check_never_runs_rust_analyzer_from_path`: "tools check ran a binary found on PATH
+  (…/fakes/rust-analyzer --version)".
+- `ci_never_runs_cargo_from_path`: "ci ran the cargo found on PATH (…/fakes/cargo xtask tools check … /fakes/cargo
+  xtask check no-corpus)", and the output ended in `ci: all 6 steps passed`.
+- `ci_rejects_cargo_of_another_toolchain` and `ci_rejects_relative_cargo`: "ci passed: … `ci: all 6 steps passed`".
+
+The 11th test, `no_corpus_fails_closed_on_missing_blob` (commit `f10ab20`), was added after the fix. It was seen RED
+under mutation M1e.
+
+### Mutation witnesses (on the fixed code)
+
+For each witness the core of the fix was reverted, the tests run, and the file restored with
+`git checkout -- <file>`. `git status` was clean afterwards, and the full suite was green again.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1a | Size index entries by working-copy `fs::metadata`, skipping errors | `…_working_copy_truncated` and `…_working_copy_deleted` FAIL (4/6 pass) |
+| M1b | `repo_root()` back to the compile-time `workspace_root()` | all 6 `no_corpus_*` integration tests FAIL |
+| M1c | Gitlink branch `continue` instead of an error | `no_corpus_fails_closed_on_unsized_index_entry` FAIL |
+| M1d | Corpora rule (e) disabled | `no_corpus_corpora_extensions` (unit) and `no_corpus_corpora_holds_only_recipes` FAIL |
+| M1e | A missing object sized as 0 bytes | `no_corpus_fails_closed_on_missing_blob` FAIL |
+| M2a | `Cargo::command` uses `Command::new("cargo")` | `ci_never_runs_cargo_from_path` and `tools_cargo_pins_toolchain_for_children` FAIL |
+| M2b | Version check off | `ci_rejects_cargo_of_another_toolchain` FAIL |
+| M2c | Absolute-path check off | `ci_rejects_relative_cargo` FAIL (the version probe ran the `PATH` stub) |
+| M2d | No `RUSTUP_TOOLCHAIN` on children | `tools_cargo_pins_toolchain_for_children` FAIL (live effect: the E0514 above) |
+| M3a | `rust_analyzer_version` runs `Command::new("rust-analyzer")` | `tools_check_never_runs_rust_analyzer_from_path` FAIL |
+| M3b | `toolchain_bin` runs `Command::new("rustup")` | `tools_check_never_runs_rust_analyzer_from_path` FAIL |
+| M3c | `in_toolchain` always true | `tools_in_toolchain` FAIL |
+
+### Code oracles (rule 7)
+
+- **Compiler:** `cargo check --workspace --all-targets --locked` is clean after the signature changes. Those changes
+  are:
+  - `toolchain_channel` became `pub`;
+  - `rust_analyzer_version` now returns `Result<(String, PathBuf), String>`;
+  - `cargo()` returns `Cargo`;
+  - `toolchain_bin` and `in_toolchain` are new;
+  - `check.rs` no longer imports `workspace_root`.
+- **ast-grep 0.45.3, `Command::new($X)` over `xtask/`:**
+  - **Before the fix (10 sites):** three of them started a pinned binary by bare name: `ci.rs:51` (`program`, which
+    was `"cargo"`), `host.rs:301` (`"rust-analyzer"`) and `host.rs:334` (`"cargo"`, in `tools install`).
+  - **After the fix (12 sites in `src`):**
+    - Absolute paths: `host.rs:227` (pinned tool by `tool_path`), `host.rs:326` (`$CARGO_HOME/bin/rustup`),
+      `host.rs:363` (rust-analyzer by `toolchain_bin`), `host.rs:388` (`Cargo::command`), `host.rs:410` (cargo
+      `--version` probe, absolute only) and `store.rs:501` (oras by `tool_path`).
+    - Bare names, which are system tools that are not pinned: `check.rs:80` and `check.rs:148` (`git`),
+      `store.rs:652` (`curl`), `host.rs:497` (`tar`) and `host.rs:591` (`ps`).
+    - `host.rs:622` (`tools guard`) runs the program the operator names, by design.
+  - Tests: `review_bypass.rs:21` (`CARGO_BIN_EXE_xtask`) and `:77` (`git`, test setup only).
+  - `std::process::Command::new($X)` has no hits, and no module aliases `Command`.
+
+### Open for the operator (not changed here)
+
+- **`git`, `curl`, `tar` and `ps` still come from `PATH`.** They are not in the pin table, and there is no pinned
+  location to run them from. A fake `git` that prints nothing would still make no-corpus see an empty index.
+  - Options:
+    - (a) Leave them as trusted system tools.
+    - (b) Run them from fixed platform paths (`/usr/bin/git` and so on).
+    - (c) Pin `git` in `TOOLS` with a version probe.
+  - Recommendation: (c) for `git`, which a guard depends on, and (a) for the rest.
+- **Store and host still use the compile-time `workspace_root()`.** That includes `target/corpora`, which is used
+  unless `CARGO_TARGET_DIR` is set, and `rust-toolchain.toml`. Under `cargo xtask` that is the right tree. A binary
+  copied to another checkout would read the original tree's files. This is the same class of hole as R1's root
+  problem.
+
+### Commits
+
+- `5aa8310` `test(01-02)`: reproduce no-corpus, ci and tools-check bypasses (review R1–R3)
+- `dee1f84` `fix(01-02)`: guards judge staged bytes and run pinned binaries by absolute path (review R1–R3)
+- `f10ab20` `test(01-02)`: no-corpus fails closed on an index entry whose blob is missing (review R1)
