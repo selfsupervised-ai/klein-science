@@ -8,9 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use ksci_wire::MAX_DOCUMENT_BYTES;
-use ksci_wire::frame::{
-    TAG_BAD_REQUEST, TAG_OK, TAG_UNSUPPORTED_OP, read_response_frame, write_request_frame,
-};
+use ksci_wire::frame::{Tag, read_response_frame, write_request_frame};
 
 /// Longest wait for the worker before a test fails instead of hanging.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -31,7 +29,7 @@ fn spawn() -> (Child, ChildStdin, ChildStdout) {
 }
 
 /// Read one response frame, or kill the worker and fail if none arrives within [`PATIENCE`].
-fn next_frame(child: &mut Child, stdout: ChildStdout) -> (ChildStdout, Option<(u8, Vec<u8>)>) {
+fn next_frame(child: &mut Child, stdout: ChildStdout) -> (ChildStdout, Option<(Tag, Vec<u8>)>) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut stdout = stdout;
@@ -93,7 +91,7 @@ fn worker_roundtrip_matches_invoke() {
         let (out, frame) = next_frame(&mut child, stdout);
         stdout = out;
         let expected = ksci_ops::invoke(line).expect("every corpus line is a valid request");
-        assert_eq!(frame, Some((TAG_OK, expected)), "line {}", i + 1);
+        assert_eq!(frame, Some((Tag::Ok, expected)), "line {}", i + 1);
     }
     let (code, rest, _) = finish(child, stdin, stdout);
     assert_eq!(
@@ -112,7 +110,7 @@ fn worker_frame_cap() {
     stdin.flush().unwrap();
     let (stdout, frame) = next_frame(&mut child, stdout);
     let (tag, message) = frame.expect("a response frame");
-    assert_eq!(tag, TAG_BAD_REQUEST);
+    assert_eq!(tag, Tag::BadRequest);
     let message = String::from_utf8(message).unwrap();
     assert!(
         message.contains(&MAX_DOCUMENT_BYTES.to_string()),
@@ -146,19 +144,19 @@ fn worker_error_tags() {
 
     write_request_frame(&mut stdin, spaced.as_bytes()).unwrap();
     let (stdout, frame) = next_frame(&mut child, stdout);
-    assert_eq!(frame.map(|(tag, _)| tag), Some(TAG_BAD_REQUEST));
+    assert_eq!(frame.map(|(tag, _)| tag), Some(Tag::BadRequest));
 
     write_request_frame(&mut stdin, nope.as_bytes()).unwrap();
     let (stdout, frame) = next_frame(&mut child, stdout);
     let (tag, message) = frame.expect("a response frame");
-    assert_eq!(tag, TAG_UNSUPPORTED_OP);
+    assert_eq!(tag, Tag::UnsupportedOp);
     assert_eq!(message, b"science.cas.nope");
 
     // The worker keeps serving after error frames.
     write_request_frame(&mut stdin, good.as_bytes()).unwrap();
     let (stdout, frame) = next_frame(&mut child, stdout);
     let expected = ksci_ops::invoke(good.as_bytes()).unwrap();
-    assert_eq!(frame, Some((TAG_OK, expected)));
+    assert_eq!(frame, Some((Tag::Ok, expected)));
 
     let (code, rest, _) = finish(child, stdin, stdout);
     assert_eq!((code, rest), (0, Vec::new()));
@@ -173,7 +171,7 @@ fn worker_error_frame_bounded() {
     write_request_frame(&mut stdin, request.as_bytes()).unwrap();
     let (stdout, frame) = next_frame(&mut child, stdout);
     let (tag, message) = frame.expect("a response frame");
-    assert_eq!(tag, TAG_BAD_REQUEST);
+    assert_eq!(tag, Tag::BadRequest);
     let bound = ksci_ops::MAX_ERROR_MESSAGE_BYTES;
     assert!(message.len() <= bound, "{} bytes", message.len());
     let (code, rest, _) = finish(child, stdin, stdout);

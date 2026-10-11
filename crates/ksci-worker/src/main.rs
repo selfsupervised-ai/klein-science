@@ -9,10 +9,7 @@ use std::io::{self, BufWriter, Write};
 use std::process::ExitCode;
 
 use ksci_ops::OpError;
-use ksci_wire::frame::{
-    FrameError, TAG_BAD_REQUEST, TAG_INTERNAL, TAG_OK, TAG_UNSUPPORTED_OP, read_request_frame,
-    write_response_frame,
-};
+use ksci_wire::frame::{FrameError, Tag, read_request_frame, write_response_frame};
 
 fn main() -> ExitCode {
     let mut input = io::stdin().lock();
@@ -30,22 +27,22 @@ fn serve(input: &mut impl io::Read, output: &mut impl Write) -> io::Result<ExitC
             Ok(Some(request)) => request,
             Ok(None) => return Ok(ExitCode::SUCCESS),
             Err(e @ FrameError::TooLarge(_)) => {
-                write_response_frame(output, TAG_BAD_REQUEST, e.to_string().as_bytes())?;
+                write_response_frame(output, Tag::BadRequest, e.to_string().as_bytes())?;
                 return Ok(ExitCode::from(2));
             }
             Err(_) => return Ok(ExitCode::from(2)),
         };
         match ksci_ops::invoke(&request) {
-            Ok(response) => write_response_frame(output, TAG_OK, &response)?,
+            Ok(response) => write_response_frame(output, Tag::Ok, &response)?,
             Err(e) => write_response_frame(output, tag(&e), e.message().as_bytes())?,
         }
     }
 }
 
-fn tag(error: &OpError) -> u8 {
+fn tag(error: &OpError) -> Tag {
     match error {
-        OpError::BadRequest(_) => TAG_BAD_REQUEST,
-        OpError::UnsupportedOp(_) => TAG_UNSUPPORTED_OP,
-        OpError::Internal(_) => TAG_INTERNAL,
+        OpError::BadRequest(_) => Tag::BadRequest,
+        OpError::UnsupportedOp(_) => Tag::UnsupportedOp,
+        OpError::Internal(_) => Tag::Internal,
     }
 }

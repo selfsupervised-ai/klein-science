@@ -3,7 +3,7 @@
 //!
 //! - A request frame is a big-endian `u32` length, then that many bytes of a canonical JCS request.
 //! - A response frame is a `u8` tag, a big-endian `u32` length, then the payload. The tag mirrors the WIT
-//!   `result<list<u8>, error>`: [`TAG_OK`] carries response JCS bytes, every other tag a UTF-8 error message.
+//!   `result<list<u8>, error>`: [`Tag::Ok`] carries response JCS bytes, every other tag a UTF-8 error message.
 //!
 //! Every length is checked against [`MAX_DOCUMENT_BYTES`] before any payload byte is read, and a payload is read
 //! incrementally, so a length prefix alone never makes the reader allocate the declared size.
@@ -12,14 +12,41 @@ use std::io::{self, ErrorKind, Read, Write};
 
 use crate::MAX_DOCUMENT_BYTES;
 
-/// The response bytes of a request.
-pub const TAG_OK: u8 = 0;
-/// The request was malformed, non-canonical or oversized.
-pub const TAG_BAD_REQUEST: u8 = 1;
-/// The request named an operation the plugin does not have.
-pub const TAG_UNSUPPORTED_OP: u8 = 2;
-/// The plugin failed on a valid request.
-pub const TAG_INTERNAL: u8 = 3;
+/// The kind of a response frame, its first byte. Writer and reader share this type, so a frame with any other tag
+/// cannot be written, and every frame written reads back (review N1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Tag {
+    /// The response bytes of a request.
+    Ok = 0,
+    /// The request was malformed, non-canonical or oversized.
+    BadRequest = 1,
+    /// The request named an operation the plugin does not have.
+    UnsupportedOp = 2,
+    /// The plugin failed on a valid request.
+    Internal = 3,
+}
+
+impl Tag {
+    /// Every tag, in byte order.
+    pub const ALL: [Tag; 4] = [Tag::Ok, Tag::BadRequest, Tag::UnsupportedOp, Tag::Internal];
+
+    /// The tag's byte on the wire.
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
+    /// The tag a byte stands for, if any.
+    pub const fn from_byte(byte: u8) -> Option<Tag> {
+        match byte {
+            0 => Some(Tag::Ok),
+            1 => Some(Tag::BadRequest),
+            2 => Some(Tag::UnsupportedOp),
+            3 => Some(Tag::Internal),
+            _ => None,
+        }
+    }
+}
 
 /// Why a frame could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -85,17 +112,14 @@ pub fn write_request_frame(writer: &mut impl Write, request: &[u8]) -> io::Resul
 }
 
 /// Read one response frame as `(tag, payload)`. `Ok(None)` is a clean end of input before a tag.
-pub fn read_response_frame(reader: &mut impl Read) -> Result<Option<(u8, Vec<u8>)>, FrameError> {
+pub fn read_response_frame(reader: &mut impl Read) -> Result<Option<(Tag, Vec<u8>)>, FrameError> {
     let mut head = [0u8; 5];
     match read_full(reader, &mut head)? {
         0 => return Ok(None),
         5 => {}
         _ => return Err(FrameError::Truncated),
     }
-    let tag = head[0];
-    if tag > TAG_INTERNAL {
-        return Err(FrameError::UnknownTag(tag));
-    }
+    let tag = Tag::from_byte(head[0]).ok_or(FrameError::UnknownTag(head[0]))?;
     let payload = read_payload(reader, [head[1], head[2], head[3], head[4]])?;
     Ok(Some((tag, payload)))
 }
@@ -109,9 +133,9 @@ pub fn read_response_frame(reader: &mut impl Read) -> Result<Option<(u8, Vec<u8>
 /// let mut out = Vec::new();
 /// ksci_wire::frame::write_response_frame(&mut out, 4, b"").unwrap();
 /// ```
-pub fn write_response_frame(writer: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
+pub fn write_response_frame(writer: &mut impl Write, tag: Tag, payload: &[u8]) -> io::Result<()> {
     let len = frame_len(payload)?;
-    writer.write_all(&[tag])?;
+    writer.write_all(&[tag.byte()])?;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(payload)?;
     writer.flush()
