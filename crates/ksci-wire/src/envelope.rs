@@ -17,6 +17,14 @@ use crate::{
 };
 
 /// A request: `{"args":{name: table},"budget":{"steps":"<decimal>"},"op":"...","v":1}`.
+///
+/// The fields are private, so a request cannot be edited out of its rules (review F3):
+///
+/// ```compile_fail,E0616
+/// fn edit(request: &mut ksci_wire::Request) {
+///     request.v = 2;
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -77,6 +85,28 @@ pub enum Status {
 }
 
 /// A response: `{"identity":"<hex>"|null,"numeric_class":"exact","result":<table>|null,"status":"...","v":1}`.
+///
+/// The fields are private, so a response that breaks the response rules cannot be built (review F3):
+///
+/// ```compile_fail,E0451
+/// use ksci_wire::{Response, Status, Table};
+/// let result = Table::from_slice(br#"{"nodes":[["Int","1"]],"root":0,"v":1}"#).unwrap();
+/// let response = Response {
+///     v: 1,
+///     status: Status::Exact,
+///     numeric_class: "approx".into(),
+///     result: Some(result),
+///     identity: Some("0".repeat(64)),
+/// };
+/// ```
+///
+/// nor can a valid one be edited into one that does:
+///
+/// ```compile_fail,E0616
+/// fn edit(response: &mut ksci_wire::Response) {
+///     response.numeric_class = "approx".into();
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
@@ -205,6 +235,23 @@ pub struct Provenance {
 }
 
 /// A record of one request: the two digests, and provenance outside them.
+///
+/// A record is built from a decoded request and response, never from raw bytes, so it cannot hash bytes that break
+/// the envelope rules (review F3):
+///
+/// ```compile_fail,E0308
+/// fn record(provenance: ksci_wire::Provenance) -> ksci_wire::Record {
+///     ksci_wire::Record::new(b"{}", b"not a response", provenance)
+/// }
+/// ```
+///
+/// and its digests cannot be overwritten:
+///
+/// ```compile_fail,E0616
+/// fn edit(record: &mut ksci_wire::Record) {
+///     record.response_digest = "not a digest".into();
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Record {

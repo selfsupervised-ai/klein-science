@@ -596,12 +596,11 @@ fn is_invalid_response(err: &WireError, path: &str) -> bool {
 
 const INT_1: &str = r#"{"nodes":[["Int","1"]],"root":0,"v":1}"#;
 
-/// Review F1: a response must be internally consistent, not merely well-typed.
-#[test]
-fn envelope_response_invariants() {
+/// Invariant-invalid responses, each in canonical form, with the InvalidResponse path each is rejected at, or `None`
+/// for IdentityMismatch.
+fn invalid_responses() -> Vec<(String, Option<&'static str>)> {
     let x2 = format!(r#""{X2_PLUS_1_IDENTITY}""#);
-    let int1_identity = table(INT_1).identity();
-    let int1 = format!(r#""{int1_identity}""#);
+    let int1 = format!(r#""{}""#, table(INT_1).identity());
     let zeros = format!(r#""{}""#, "0".repeat(64));
     // The reviewer's counter-example: a wrong numeric class and an all-zero identity.
     let counter = response_json(&zeros, "approx", INT_1, "exact");
@@ -609,8 +608,7 @@ fn envelope_response_invariants() {
         counter,
         r#"{"identity":"0000000000000000000000000000000000000000000000000000000000000000","numeric_class":"approx","result":{"nodes":[["Int","1"]],"root":0,"v":1},"status":"exact","v":1}"#
     );
-    // Each case names the InvalidResponse path it expects, or None for IdentityMismatch.
-    let cases: Vec<(String, Option<&str>)> = vec![
+    vec![
         (counter, Some("/numeric_class")),
         // numeric_class is "exact" in Phase 1, whatever the status.
         (
@@ -672,8 +670,15 @@ fn envelope_response_invariants() {
             ),
             Some("/result"),
         ),
-    ];
-    for (json, path) in &cases {
+    ]
+}
+
+/// Review F1: a response must be internally consistent, not merely well-typed.
+#[test]
+fn envelope_response_invariants() {
+    let int1_identity = table(INT_1).identity();
+    let int1 = format!(r#""{int1_identity}""#);
+    for (json, path) in &invalid_responses() {
         let err = response_rejected(json);
         let expected = match path {
             Some(path) => is_invalid_response(&err, path),
@@ -695,6 +700,139 @@ fn envelope_response_invariants() {
     for response in [Response::exact(&dirty), Response::fuel_exhausted()] {
         assert_eq!(Response::from_slice(&response.to_jcs()), Ok(response));
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review F3: the invariants hold on every path, not only on the byte decoders. serde's own entry points validate,
+// and the struct-literal and field-assignment bypasses are compile errors (the compile_fail doctests in
+// src/envelope.rs).
+
+/// Decode each case through plain serde_json, which never sees the byte decoders, and list every case that is not
+/// rejected with an error containing its expected text. Collecting, not panicking on the first, shows every bypass.
+fn serde_bypasses<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+    cases: &[(String, String)],
+) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|(json, expected)| match serde_json::from_str::<T>(json) {
+            Ok(value) => Some(format!("{json}\n  accepted as {value:?}")),
+            Err(e) if !e.to_string().contains(expected.as_str()) => {
+                Some(format!("{json}\n  rejected as {e}, expected {expected:?}"))
+            }
+            Err(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn serde_response_validates() {
+    // Every response the byte decoder rejects, serde rejects with the same rule.
+    let mut cases: Vec<(String, String)> = invalid_responses()
+        .into_iter()
+        .map(|(json, path)| {
+            let expected = match path {
+                Some(path) => format!("invalid response at {path}"),
+                None => "is not the result's identity".to_owned(),
+            };
+            (json, expected)
+        })
+        .collect();
+    // The keys are always present: a missing result or identity is not read as null.
+    for json in [
+        r#"{"numeric_class":"exact","result":null,"status":"fuel_exhausted","v":1}"#,
+        r#"{"identity":null,"numeric_class":"exact","status":"fuel_exhausted","v":1}"#,
+    ] {
+        cases.push((json.to_owned(), "missing field".to_owned()));
+    }
+    let bypasses = serde_bypasses::<Response>(&cases);
+    assert!(bypasses.is_empty(), "{}", bypasses.join("\n"));
+    // Valid responses decode to the same value as the byte decoder gives.
+    let exact =
+        String::from_utf8(Response::exact(&table(X2_PLUS_1_CANONICAL)).to_jcs()).expect("utf-8");
+    let exhausted = String::from_utf8(Response::fuel_exhausted().to_jcs()).expect("utf-8");
+    for json in [exact, exhausted] {
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).ok(),
+            Response::from_slice(json.as_bytes()).ok(),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn serde_request_validates() {
+    let canonical = request_json(r#""100""#);
+    let numeral = "bad numeral at /budget/steps".to_owned();
+    let cases = [
+        // A version other than 1.
+        (
+            format!(
+                r#"{}"v":2}}"#,
+                canonical
+                    .strip_suffix(r#""v":1}"#)
+                    .expect("request ends with v")
+            ),
+            "unsupported schema version at /v".to_owned(),
+        ),
+        // Step numerals outside the grammar or above u64.
+        (request_json(r#""007""#), numeral.clone()),
+        (request_json(r#""""#), numeral.clone()),
+        (request_json(r#""18446744073709551616""#), numeral),
+        // A repeated argument name: serde's map would keep the last one.
+        (
+            canonical.replacen(r#"{"expr":"#, &format!(r#"{{"expr":{INT_1},"expr":"#), 1),
+            "duplicate object key at /args/expr".to_owned(),
+        ),
+    ];
+    let bypasses = serde_bypasses::<Request>(&cases);
+    assert!(bypasses.is_empty(), "{}", bypasses.join("\n"));
+    // The serde path cannot see the original bytes, so a valid request in another spelling decodes. Its value is the
+    // canonical request: it encodes, and so hashes, to the canonical bytes.
+    let spaced = canonical.replacen('{', "{ ", 1);
+    let request =
+        serde_json::from_str::<Request>(&spaced).expect("valid request decodes through serde");
+    assert_eq!(to_jcs(&request).expect("encodes"), canonical.as_bytes());
+}
+
+#[test]
+fn serde_record_validates() {
+    let digest = "ab".repeat(32);
+    let record = |request: &str, response: &str, wall_ms: &str| {
+        format!(
+            r#"{{"provenance":{{"backend":"b","device":"d","driver":"r","impl":"i","wall_ms":{wall_ms}}},"request_digest":{request},"response_digest":{response}}}"#
+        )
+    };
+    let quoted = |s: &str| format!(r#""{s}""#);
+    let good = quoted(&digest);
+    let request_digest = "at /request_digest".to_owned();
+    let response_digest = "at /response_digest".to_owned();
+    let wall_ms = "wall_ms".to_owned();
+    let cases = [
+        // A digest is 64 lowercase hex digits.
+        (record(&quoted("xyz"), &good, r#""5""#), request_digest),
+        (
+            record(&good, &quoted(&digest.to_uppercase()), r#""5""#),
+            response_digest.clone(),
+        ),
+        (
+            record(&good, &quoted(&"a".repeat(63)), r#""5""#),
+            response_digest,
+        ),
+        // wall_ms is a decimal numeral string.
+        (record(&good, &good, r#""abc""#), wall_ms.clone()),
+        (record(&good, &good, r#""05""#), wall_ms.clone()),
+        (record(&good, &good, "5"), wall_ms.clone()),
+    ];
+    let mut bypasses = serde_bypasses::<Record>(&cases);
+    bypasses.extend(serde_bypasses::<Provenance>(&[(
+        r#"{"backend":"b","device":"d","driver":"r","impl":"i","wall_ms":"-1"}"#.to_owned(),
+        wall_ms,
+    )]));
+    assert!(bypasses.is_empty(), "{}", bypasses.join("\n"));
+    // A valid record round-trips byte for byte.
+    let json = record(&good, &good, r#""5""#);
+    let decoded = serde_json::from_str::<Record>(&json).expect("valid record decodes");
+    assert_eq!(to_jcs(&decoded).expect("encodes"), json.as_bytes());
 }
 
 // ---------------------------------------------------------------------------------------------------------------
