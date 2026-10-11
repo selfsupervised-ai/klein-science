@@ -45,17 +45,25 @@ const STANDIN_MOUNT: &str = "/opt/ksci/standin";
 /// `cargo xtask oracle ...`
 #[derive(Subcommand)]
 pub enum OracleCmd {
-    /// Pull (`base`) an oracle image for each platform and pin the identity docker reports.
+    /// Pull (`base`) or build (conformance/oracles/<name>/Containerfile) an oracle image for each
+    /// platform and pin the identity docker reports; a built image is also saved to the store.
     BuildImage {
         /// Image name: a key of conformance/oracles/images.json.
         name: String,
-        /// Platforms to pin (repeatable), e.g. linux/arm64.
+        /// Platforms (repeatable), e.g. linux/arm64.
         #[arg(long = "platform", required = true)]
         platforms: Vec<String>,
+        /// Do not build: obtain the pinned image (`docker load` of the stored tar when it is
+        /// absent locally) and check its identity against the pin. images.json is not written.
+        #[arg(long)]
+        from_store: bool,
     },
     /// Run a script in a pinned oracle image inside the hardened container, then canonicalise
     /// and store its outputs.
     Run(RunArgs),
+    /// Produce the SymPy introspection table in the sympy image on every platform, require the
+    /// canonical outputs to be identical, store it and pin its digest.
+    Introspect,
 }
 
 /// `cargo xtask oracle run ...`
@@ -100,10 +108,18 @@ pub struct RunArgs {
 /// Runs one `oracle` command.
 pub fn run(cmd: OracleCmd) -> Res<ExitCode> {
     match cmd {
-        OracleCmd::BuildImage { name, platforms } => {
-            build_image(&name, &platforms).map(|()| ExitCode::SUCCESS)
+        OracleCmd::BuildImage {
+            name,
+            platforms,
+            from_store,
+        } => if from_store {
+            obtain_pinned(&name, &platforms)
+        } else {
+            build_image(&name, &platforms)
         }
+        .map(|()| ExitCode::SUCCESS),
         OracleCmd::Run(args) => run_script(&args).map(|(code, _)| code),
+        OracleCmd::Introspect => introspect().map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -121,8 +137,6 @@ pub struct Pins {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ImagePin {
-    /// The reference docker runs (a digest reference, or a local tag for a built image).
-    pub reference: String,
     /// Platform (`linux/arm64`) to its pin.
     pub platforms: BTreeMap<String, PlatformPin>,
     /// sha256 of the stored introspection table (the sympy image).
@@ -134,6 +148,9 @@ pub struct ImagePin {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformPin {
+    /// The reference docker runs: the base image's digest reference, or the local per-platform
+    /// tag of a built image (`ksci-oracle-<name>:linux-arm64`).
+    pub reference: String,
     /// The identity `docker image inspect --platform <p>` reports (`sha256:<hex>`).
     pub identity: String,
     /// Whether the platform was pinned under emulation on the pinning host.
@@ -247,52 +264,235 @@ fn native_platform() -> Res<String> {
     Ok(format!("linux/{arch}"))
 }
 
+/// Image names are directory names under conformance/oracles/: `[a-z0-9-]+`.
+fn check_name(name: &str) -> Res<()> {
+    if !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err(format!("image name must match [a-z0-9-]+: {name:?}"))
+    }
+}
+
+/// The local tag of a built image on one platform: `ksci-oracle-sympy:linux-arm64`.
+pub fn built_tag(name: &str, platform: &str) -> String {
+    format!("ksci-oracle-{name}:{}", platform.replace('/', "-"))
+}
+
+/// Runs the pinned docker with `args`, its output passed through; a non-zero exit is an error.
+fn docker_status(args: &[&str]) -> Res<()> {
+    let status = host::docker()?
+        .args(args)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|e| format!("run docker {}: {e}", args.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("docker {}: {status}", args.join(" ")))
+    }
+}
+
 fn build_image(name: &str, platforms: &[String]) -> Res<()> {
+    check_name(name)?;
     for p in platforms {
         check_platform(p)?;
     }
-    if name != "base" {
+    let root = workspace::root()?;
+    let context = root.join("conformance").join("oracles").join(name);
+    let containerfile = context.join("Containerfile");
+    if name != "base" && !containerfile.is_file() {
         return Err(format!(
-            "oracle build-image {name}: only `base` (the pinned python image) can be pinned so far"
+            "no image definition {}",
+            containerfile
+                .strip_prefix(&root)
+                .unwrap_or(&containerfile)
+                .display()
         ));
     }
-    let root = workspace::root()?;
     let native = native_platform()?;
+    let cache = Cache::from_env()?;
     let mut pins = load_pins(&root)?;
     for platform in platforms {
-        let status = host::docker()?
-            .args(["pull", "--platform", platform, BASE_REFERENCE])
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|e| format!("run docker pull: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "docker pull {BASE_REFERENCE} ({platform}): {status}"
-            ));
-        }
-        let identity = image_identity(BASE_REFERENCE, platform)?;
-        println!("base {platform} identity={identity}");
-        let image = pins
-            .images
-            .entry(name.to_owned())
-            .or_insert_with(|| ImagePin {
-                reference: BASE_REFERENCE.to_owned(),
-                platforms: BTreeMap::new(),
-                introspection_sha256: None,
-            });
-        image.reference = BASE_REFERENCE.to_owned();
-        image.platforms.insert(
-            platform.clone(),
+        let pin = if name == "base" {
+            docker_status(&["pull", "--platform", platform, BASE_REFERENCE])?;
             PlatformPin {
-                identity,
+                reference: BASE_REFERENCE.to_owned(),
+                identity: image_identity(BASE_REFERENCE, platform)?,
                 emulated: *platform != native,
                 tar_sha256: None,
-            },
+            }
+        } else {
+            let tag = built_tag(name, platform);
+            let context = path_str(&context)?;
+            let containerfile = path_str(&containerfile)?;
+            let held = host::heavy_job()?;
+            docker_status(&[
+                "buildx",
+                "build",
+                "--platform",
+                platform,
+                "--load",
+                "--provenance=false",
+                "--sbom=false",
+                "-t",
+                &tag,
+                "-f",
+                containerfile,
+                context,
+            ])?;
+            drop(held);
+            let identity = image_identity(&tag, platform)?;
+            let tar = store::target_dir()?
+                .join("oracle")
+                .join(format!("save-{}.tar", std::process::id()));
+            if let Some(parent) = tar.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+            let saved = docker_status(&["save", "-o", path_str(&tar)?, &tag])
+                .and_then(|()| store::put(&cache, &tar));
+            let _ = fs::remove_file(&tar);
+            PlatformPin {
+                reference: tag,
+                identity,
+                emulated: *platform != native,
+                tar_sha256: Some(saved?),
+            }
+        };
+        println!(
+            "{name} {platform} identity={}{}",
+            pin.identity,
+            pin.tar_sha256
+                .as_deref()
+                .map(|t| format!(" tar_sha256={t}"))
+                .unwrap_or_default()
         );
+        pins.images
+            .entry(name.to_owned())
+            .or_insert_with(|| ImagePin {
+                platforms: BTreeMap::new(),
+                introspection_sha256: None,
+            })
+            .platforms
+            .insert(platform.clone(), pin);
+    }
+    // A rebuilt image may differ from the one the introspection table came from.
+    if name != "base"
+        && let Some(image) = pins.images.get_mut(name)
+    {
+        image.introspection_sha256 = None;
     }
     save_pins(&root, &pins)?;
     println!("wrote {PINS_PATH}");
     Ok(())
+}
+
+/// Makes the pinned image available on each platform without building it: pulled by digest
+/// (`base`), or `docker load`ed from its stored tar when absent locally. Either way the local
+/// identity must equal the pin.
+fn obtain_pinned(name: &str, platforms: &[String]) -> Res<()> {
+    check_name(name)?;
+    let root = workspace::root()?;
+    let pins = load_pins(&root)?;
+    let image = pins
+        .images
+        .get(name)
+        .ok_or_else(|| format!("image {name:?} is not pinned in {PINS_PATH}"))?;
+    let cache = Cache::from_env()?;
+    for platform in platforms {
+        check_platform(platform)?;
+        let pin = image
+            .platforms
+            .get(platform)
+            .ok_or_else(|| format!("image {name:?} has no pin for {platform} in {PINS_PATH}"))?;
+        if image_identity(&pin.reference, platform).is_err() {
+            match &pin.tar_sha256 {
+                None => docker_status(&["pull", "--platform", platform, &pin.reference])?,
+                Some(hex) => {
+                    let (source, tar) =
+                        store::fetch_blob(&cache, hex, None, Some(&Remote::from_env()))?;
+                    println!("{name} {platform}: loading sha256:{hex} ({source})");
+                    docker_status(&["load", "-i", path_str(&tar)?])?;
+                }
+            }
+        }
+        let local = image_identity(&pin.reference, platform)?;
+        if local != pin.identity {
+            return Err(format!(
+                "image {name} ({platform}) is {local} locally but pinned as {}",
+                pin.identity
+            ));
+        }
+        println!("{name} {platform} identity={local} ok");
+    }
+    Ok(())
+}
+
+fn path_str(path: &Path) -> Res<&str> {
+    path.to_str()
+        .ok_or_else(|| format!("path is not UTF-8: {}", path.display()))
+}
+
+/// The introspection script, relative to the checkout.
+pub const INTROSPECT_SCRIPT: &str = "conformance/oracles/sympy/introspect.py";
+
+/// Runs introspect.py in the sympy image on every platform; the canonical names.json must be
+/// byte-identical across them. Stores it and pins its digest under the sympy entry.
+fn introspect() -> Res<()> {
+    let mut results: Vec<(&str, String)> = Vec::new();
+    for platform in PLATFORMS {
+        let args = RunArgs {
+            image: "sympy".to_owned(),
+            platform: (*platform).to_owned(),
+            script: PathBuf::from(INTROSPECT_SCRIPT),
+            inputs: Vec::new(),
+            seed: 0,
+            jobs: None,
+            cpu_seconds: None,
+            prelude: None,
+            mount_standin: false,
+            require_sympy_env: true,
+            script_args: Vec::new(),
+        };
+        let (_, outputs) = run_script(&args)?;
+        let hex = outputs
+            .get("names.json")
+            .ok_or_else(|| format!("introspect.py produced no names.json on {platform}"))?;
+        println!("{platform} names.json sha256={hex}");
+        results.push((platform, hex.clone()));
+    }
+    let cache = Cache::from_env()?;
+    let (first_platform, first) = &results[0];
+    let first_bytes = read_blob(&cache, first)?;
+    for (platform, hex) in &results[1..] {
+        if read_blob(&cache, hex)? != first_bytes {
+            return Err(format!(
+                "introspection differs: {first_platform} sha256={first}, {platform} sha256={hex}"
+            ));
+        }
+    }
+    let root = workspace::root()?;
+    let mut pins = load_pins(&root)?;
+    let image = pins
+        .images
+        .get_mut("sympy")
+        .ok_or_else(|| format!("image \"sympy\" is not pinned in {PINS_PATH}"))?;
+    image.introspection_sha256 = Some(first.clone());
+    save_pins(&root, &pins)?;
+    println!("introspection sha256={first}");
+    Ok(())
+}
+
+/// The verified bytes of a cached blob.
+fn read_blob(cache: &Cache, hex: &str) -> Res<Vec<u8>> {
+    let blob = cache
+        .lookup(hex)?
+        .ok_or_else(|| format!("sha256:{hex} is not in the cache"))?;
+    fs::read(&blob).map_err(|e| format!("read {}: {e}", blob.display()))
 }
 
 /// The hardening flags of every oracle container (T-01-13). Asserted by the acceptance greps and
@@ -435,7 +635,7 @@ pub fn run_script(args: &RunArgs) -> Res<(ExitCode, Outputs)> {
             args.image, args.platform
         )
     })?;
-    let local = image_identity(&image.reference, &args.platform)?;
+    let local = image_identity(&pinned.reference, &args.platform)?;
     if local != pinned.identity {
         return Err(format!(
             "image {} ({}) is {local} locally but pinned as {}; refusing to run",
@@ -510,7 +710,7 @@ pub fn run_script(args: &RunArgs) -> Res<(ExitCode, Outputs)> {
     let out = fresh_out_dir()?;
     let argv = run_argv(
         &args.platform,
-        &image.reference,
+        &pinned.reference,
         &mounts,
         &out,
         &env,
@@ -763,22 +963,33 @@ mod tests {
         platforms.insert(
             "linux/arm64".to_owned(),
             PlatformPin {
+                reference: built_tag("sympy", "linux/arm64"),
                 identity: format!("sha256:{}", "a".repeat(64)),
                 emulated: false,
-                tar_sha256: None,
+                tar_sha256: Some("b".repeat(64)),
             },
         );
         pins.images.insert(
-            "base".to_owned(),
+            "sympy".to_owned(),
             ImagePin {
-                reference: BASE_REFERENCE.to_owned(),
                 platforms,
-                introspection_sha256: None,
+                introspection_sha256: Some("c".repeat(64)),
             },
         );
         let bytes = pins.to_bytes().unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.starts_with(r#"{"images":{"base":{"platforms":{"linux/arm64":{"emulated":false,"identity":"sha256:aaaa"#), "{text}");
+        assert!(
+            text.starts_with(r#"{"images":{"sympy":{"introspection_sha256":"cccc"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""linux/arm64":{"emulated":false,"identity":"sha256:aaaa"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""reference":"ksci-oracle-sympy:linux-arm64""#),
+            "{text}"
+        );
         assert_eq!(Pins::parse(&bytes).unwrap(), pins);
         let other = text.replace(PINS_SCHEMA, "ksci.oracle-images.v0");
         assert!(Pins::parse(other.as_bytes()).is_err());
