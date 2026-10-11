@@ -4,9 +4,13 @@
 //!
 //! - `bench box-manifest --box <label>` takes the box readings, [`admit`]s them and writes
 //!   `conformance/boxes/<label>/box.json`: the JCS of a `ksci.box.v1` manifest.
-//! - `bench probe metal --box <label>` builds `ksci-metal-probe`, re-takes and re-admits the
-//!   readings, rewrites `box.json`, runs the probe on each Metal path under the heavy-job guard,
-//!   and writes `conformance/boxes/<label>/probe-metal.json` (JCS) carrying `box_manifest_sha256`,
+//! - `bench probe metal --box <label> [--quick | --watchdog [--max-loops N] | --full]` builds
+//!   `ksci-metal-probe`, re-takes and re-admits the readings, rewrites `box.json`, and under the
+//!   heavy-job guard runs the probe: both Metal paths (all four integer kernels and the fast-math
+//!   probes; `mulhi_u32` only with `--quick`), the CPU Montgomery baselines on one and on all
+//!   P-cores, and with `--watchdog` or `--full` the watchdog search on the wgpu-msl path (capped
+//!   by `--max-loops`, or to failure with `--full`, which needs the operator at the Mac). It
+//!   writes `conformance/boxes/<label>/probe-metal.json` (JCS) carrying `box_manifest_sha256`,
 //!   the SHA-256 of the `box.json` bytes it was measured under.
 //!
 //! Admission refuses to record when the box is not on AC power, when a klein-rs build runs, when
@@ -20,7 +24,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
@@ -65,9 +69,54 @@ pub enum BenchCmd {
         #[arg(long = "box")]
         box_label: String,
         /// One kernel (u32 mul_hi) per path: the measurement path end to end, nothing more.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["watchdog", "full"])]
         quick: bool,
+        /// Add the watchdog search on the wgpu-msl path (a capped self-test with --max-loops).
+        #[arg(long)]
+        watchdog: bool,
+        /// Stop the watchdog search's doubling above this many loops per element.
+        #[arg(long, requires = "watchdog", conflicts_with = "full")]
+        max_loops: Option<u64>,
+        /// Everything: both paths, all kernels, the CPU baselines and the watchdog search to
+        /// failure. Operator present at the Mac, on AC power (research Pitfall F).
+        #[arg(long)]
+        full: bool,
     },
+}
+
+/// What `bench probe metal` measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeScope {
+    /// `mulhi_u32` on each path.
+    Quick,
+    /// All kernels and the fast-math probes on each path, and the CPU baselines.
+    Standard,
+    /// [`ProbeScope::Standard`] and the watchdog search, its doubling capped.
+    WatchdogCapped(u64),
+    /// [`ProbeScope::Standard`] and the watchdog search to failure.
+    Full,
+}
+
+impl ProbeScope {
+    /// The scope the `bench probe` flags select.
+    pub fn from_flags(quick: bool, watchdog: bool, max_loops: Option<u64>, full: bool) -> Self {
+        match (quick, watchdog || full, max_loops) {
+            (true, _, _) => ProbeScope::Quick,
+            (false, false, _) => ProbeScope::Standard,
+            (false, true, Some(cap)) if !full => ProbeScope::WatchdogCapped(cap),
+            (false, true, _) => ProbeScope::Full,
+        }
+    }
+
+    /// The report's `mode`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ProbeScope::Quick => "quick",
+            ProbeScope::Standard => "standard",
+            ProbeScope::WatchdogCapped(_) => "watchdog-capped",
+            ProbeScope::Full => "full",
+        }
+    }
 }
 
 /// The probes `bench probe` runs.
@@ -83,15 +132,25 @@ pub fn run(cmd: BenchCmd) -> Res<ExitCode> {
         BenchCmd::BoxManifest { box_label } => {
             let root = workspace::root()?;
             check_label(&box_label)?;
-            let (path, digest) = record_manifest(&root, &box_label)?;
-            println!("bench: wrote {} (sha256:{digest})", rel(&root, &path));
+            let recorded = record_manifest(&root, &box_label)?;
+            println!(
+                "bench: wrote {} (sha256:{})",
+                rel(&root, &recorded.path),
+                recorded.sha256
+            );
             Ok(ExitCode::SUCCESS)
         }
         BenchCmd::Probe {
             target: ProbeTarget::Metal,
             box_label,
             quick,
-        } => probe_metal(&box_label, quick).map(|()| ExitCode::SUCCESS),
+            watchdog,
+            max_loops,
+            full,
+        } => {
+            let scope = ProbeScope::from_flags(quick, watchdog, max_loops, full);
+            probe_metal(&box_label, scope).map(|()| ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -277,15 +336,29 @@ fn box_dir(root: &Path, label: &str) -> PathBuf {
     root.join("conformance").join("boxes").join(label)
 }
 
-/// Takes the readings, admits them and writes `box.json`; returns its path and SHA-256.
-fn record_manifest(root: &Path, label: &str) -> Res<(PathBuf, String)> {
+/// An admitted manifest, written.
+struct Recorded {
+    /// The admitted readings.
+    readings: Readings,
+    /// Where `box.json` was written.
+    path: PathBuf,
+    /// SHA-256 (hex) of the `box.json` bytes.
+    sha256: String,
+}
+
+/// Takes the readings, admits them and writes `box.json`.
+fn record_manifest(root: &Path, label: &str) -> Res<Recorded> {
     let readings = take_readings(root)?;
     let bytes = manifest_bytes(label, &readings)?;
     let dir = box_dir(root, label);
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let path = dir.join("box.json");
     fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok((path, ksci_wire::sha256_hex(&bytes)))
+    Ok(Recorded {
+        readings,
+        path,
+        sha256: ksci_wire::sha256_hex(&bytes),
+    })
 }
 
 /// `path` relative to the checkout root, for messages.
@@ -434,7 +507,7 @@ fn locked_version(root: &Path, krate: &str) -> Res<String> {
 }
 
 /// `bench probe metal`: build, admit, measure each path, write the report.
-fn probe_metal(label: &str, quick: bool) -> Res<()> {
+fn probe_metal(label: &str, scope: ProbeScope) -> Res<()> {
     check_label(label)?;
     if !cfg!(target_os = "macos") {
         return Err("bench probe metal runs on macOS only".to_owned());
@@ -470,10 +543,11 @@ fn probe_metal(label: &str, quick: bool) -> Res<()> {
     }
     let exe = target.join(PROBE_PROFILE).join(PROBE_CRATE);
 
-    let (box_path, box_digest) = record_manifest(&root, label)?;
+    let recorded = record_manifest(&root, label)?;
+    let box_digest = recorded.sha256.clone();
     println!(
         "bench: admitted; wrote {} (sha256:{box_digest})",
-        rel(&root, &box_path)
+        rel(&root, &recorded.path)
     );
 
     let mut report = Map::new();
@@ -484,17 +558,42 @@ fn probe_metal(label: &str, quick: bool) -> Res<()> {
         "cubecl_version".into(),
         json!(locked_version(&root, "cubecl")?),
     );
-    report.insert(
-        "mode".into(),
-        json!(if quick { "quick" } else { "standard" }),
-    );
+    report.insert("mode".into(), json!(scope.name()));
     for (arg, key) in METAL_PATHS {
         let mut args = vec!["--path", arg];
-        if quick {
+        if scope == ProbeScope::Quick {
             args.push("--quick");
         }
         println!("bench: probe {key}");
         report.insert((*key).into(), run_probe(&exe, &args)?);
+    }
+    if scope != ProbeScope::Quick {
+        let p_cores = recorded
+            .readings
+            .cpu_p_cores
+            .ok_or("the admitted manifest has no P-core count")?
+            .to_string();
+        println!("bench: CPU baselines on 1 and {p_cores} P-cores");
+        report.insert(
+            "cpu_baselines".into(),
+            run_probe(&exe, &["--cpu-baselines", "--p-cores", &p_cores])?,
+        );
+    }
+    let watchdog_cap = match scope {
+        ProbeScope::WatchdogCapped(cap) => Some(Some(cap.to_string())),
+        ProbeScope::Full => Some(None),
+        ProbeScope::Quick | ProbeScope::Standard => None,
+    };
+    if let Some(cap) = watchdog_cap {
+        let mut args = vec!["--path", "wgpu-msl", "--watchdog"];
+        if let Some(cap) = cap.as_deref() {
+            args.extend(["--max-loops", cap]);
+        }
+        println!(
+            "bench: watchdog search on path-wgpu-msl ({})",
+            args.join(" ")
+        );
+        report.insert("watchdog".into(), run_probe(&exe, &args)?);
     }
 
     let bytes = ksci_wire::to_jcs(&Value::Object(report)).map_err(|e| format!("report: {e}"))?;
@@ -508,19 +607,20 @@ fn probe_metal(label: &str, quick: bool) -> Res<()> {
     Ok(())
 }
 
-/// Runs the probe binary once and parses the JSON it prints; a non-zero exit is an error that
-/// carries its stderr (a NOT EXACT kernel among them).
+/// Runs the probe binary once and parses the JSON it prints. Its stderr goes straight to the
+/// terminal (the watchdog search reports each trial there as it ends); a non-zero exit (a NOT
+/// EXACT kernel among them) is an error, and nothing is written.
 fn run_probe(exe: &Path, args: &[&str]) -> Res<Value> {
     let out = Command::new(exe)
         .args(args)
+        .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("run {}: {e}", exe.display()))?;
     if !out.status.success() {
         return Err(format!(
-            "{PROBE_CRATE} {}: {}: {}",
+            "{PROBE_CRATE} {}: {} (its stderr is above); no report written",
             args.join(" "),
             out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     serde_json::from_slice(&out.stdout)
@@ -704,6 +804,21 @@ mod tests {
         let displays = r#"{"SPDisplaysDataType":[{"_name":"Apple M3 Max","spdisplays_ndrvs":[{"_spdisplays_display-serial-number":"x"}],"sppci_cores":"30","sppci_device_type":"spdisplays_gpu","sppci_model":"Apple M3 Max"}]}"#;
         assert_eq!(parse_gpu(displays), (Some("Apple M3 Max".into()), Some(30)));
         assert_eq!(parse_gpu("{}"), (None, None));
+    }
+
+    #[test]
+    fn probe_scope_from_flags() {
+        use ProbeScope::*;
+        assert_eq!(ProbeScope::from_flags(true, false, None, false), Quick);
+        assert_eq!(ProbeScope::from_flags(false, false, None, false), Standard);
+        assert_eq!(
+            ProbeScope::from_flags(false, true, Some(65536), false),
+            WatchdogCapped(65536)
+        );
+        assert_eq!(ProbeScope::from_flags(false, true, None, false), Full);
+        assert_eq!(ProbeScope::from_flags(false, false, None, true), Full);
+        // --full searches to failure: a cap never narrows it.
+        assert_eq!(ProbeScope::from_flags(false, true, Some(8), true), Full);
     }
 
     #[test]
