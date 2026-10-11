@@ -8,6 +8,12 @@ rust-version = "1.99.0"
 license = "Apache-2.0"
 publish = false
 
+# The crates whose lib targets go into the R0 (wasm32-wasip2) component: the one declared list.
+# `cargo xtask check provenance` compiles exactly these for wasm32-wasip2 and judges what rustc
+# read. A plan that adds an R0 crate (ksci-ops) adds it here.
+[workspace.metadata.ksci]
+r0-crates = ["ksci-wire"]
+
 # Exact pins. serde and serde_json match klein-rs, so JCS input parsing matches Klein's own;
 # serde_json_canonicalizer and sha2 are the same crates and pins as klein-rs.
 [workspace.dependencies]

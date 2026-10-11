@@ -1,12 +1,13 @@
 // provenance: original
 //! The files rustc read, from cargo dep-info (review W3', operator decision 2026-10-11).
 //!
-//! [`compile_inputs`] runs one `cargo check --workspace --all-targets --all-features --locked`
-//! of the checkout with the pinned cargo, into a dedicated target directory, and reads the
-//! rustc dep-info (`.d`) file of every compiler artifact that compile reports, fresh or rebuilt,
-//! including dependencies, proc macros and build scripts. The union of their inputs is what
-//! rustc read: modules, `#[path]` modules, `include!`, `include_str!` and `include_bytes!` files,
-//! wherever they live and however they were reached.
+//! [`compile_inputs`] runs one `cargo check --all-features --locked` of the checkout with the
+//! pinned cargo, into a dedicated target directory, for one selection: [`HOST`] (the whole
+//! workspace, all targets, host cfg) or [`r0_selection`] (the R0 crates' libs for
+//! [`R0_TARGET`], wasm cfg). It reads the rustc dep-info (`.d`) file of every compiler artifact
+//! that compile reports, fresh or rebuilt, including dependencies, proc macros and build scripts.
+//! The union of their inputs is what rustc read: modules, `#[path]` modules, `include!`,
+//! `include_str!` and `include_bytes!` files, wherever they live and however they were reached.
 //!
 //! Only the artifacts of this compile are read, never a directory listing, so a stale `.d` file
 //! left in the target directory by an earlier compile is never judged.
@@ -19,7 +20,7 @@ use std::process::Stdio;
 use serde_json::Value;
 
 use crate::Res;
-use crate::host;
+use crate::{host, workspace};
 
 /// What one compile read.
 pub struct Compiled {
@@ -33,16 +34,41 @@ pub struct Compiled {
     pub dependency_out_dirs: Vec<PathBuf>,
 }
 
-/// Compiles the workspace at `root` into `target_dir` and returns what rustc read. A failed
-/// compile is an error.
-pub fn compile_inputs(root: &Path, target_dir: &Path) -> Res<Compiled> {
+/// The host compile: every workspace member, every target (libs, bins, tests, benches,
+/// examples), host cfg.
+pub const HOST: &[&str] = &["--workspace", "--all-targets"];
+
+/// The shipped WASM target: the R0 component (operator decision 2026-10-11).
+pub const R0_TARGET: &str = "wasm32-wasip2";
+
+/// The R0 compile: the lib target of every crate that goes into the R0 artifact, for
+/// [`R0_TARGET`], so code only the wasm cfg reads is judged too. The crates are the one declared
+/// list `[workspace.metadata.ksci] r0-crates` ([`workspace::r0_crates`]).
+pub fn r0_selection(root: &Path) -> Res<Vec<String>> {
+    let mut args: Vec<String> = ["--target", R0_TARGET, "--lib"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for name in workspace::r0_crates(root)? {
+        args.push("-p".to_owned());
+        args.push(name);
+    }
+    Ok(args)
+}
+
+/// Compiles `selection` of the workspace at `root` into `target_dir` and returns what rustc
+/// read. A failed compile is an error.
+pub fn compile_inputs<S: AsRef<str>>(
+    root: &Path,
+    target_dir: &Path,
+    selection: &[S],
+) -> Res<Compiled> {
     let cargo = host::cargo()?;
     let out = cargo
         .command()
+        .arg("check")
+        .args(selection.iter().map(AsRef::as_ref))
         .args([
-            "check",
-            "--workspace",
-            "--all-targets",
             "--all-features",
             "--locked",
             "--message-format=json-render-diagnostics",

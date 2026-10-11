@@ -16,7 +16,7 @@
 //! features), resolved to real paths ([`depinfo`], review W3'). On the Python side it walks
 //! `standin/` on disk, ignored files included, and refuses symbolic links there.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -301,7 +301,7 @@ fn provenance() -> Res<ExitCode> {
             .filter(|l| l.starts_with("Project: "))
             .count();
         println!(
-            "provenance ok, {rust} Rust sources rustc read and {} standin files judged in {}, \
+            "provenance ok, {rust} Rust sources rustc read (host, all targets; wasm32-wasip2, R0 libs) and {} standin files judged in {}, \
              {NOTICE_FILE} has {blocks} Project blocks",
             judged.len() - rust,
             root.display()
@@ -344,15 +344,24 @@ fn under_testdata(rel: &Path) -> bool {
 /// One real file read under several names is judged once, its other names noted.
 fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
     let target = root.join(PROVENANCE_TARGET);
-    let compiled = depinfo::compile_inputs(root, &target)?;
+    // Two compiles, judged under the same rules: the host compile of the whole workspace, and
+    // the R0 compile for wasm32-wasip2, so code behind a wasm-only cfg is read and judged too.
+    let r0 = depinfo::r0_selection(root)?;
+    let mut inputs = BTreeSet::new();
     let mut dependency_output = Vec::new();
-    for dir in &compiled.dependency_out_dirs {
-        dependency_output
-            .push(fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?);
+    for compiled in [
+        depinfo::compile_inputs(root, &target, depinfo::HOST)?,
+        depinfo::compile_inputs(root, &target, &r0)?,
+    ] {
+        inputs.extend(compiled.inputs);
+        for dir in &compiled.dependency_out_dirs {
+            dependency_output
+                .push(fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?);
+        }
     }
     let external = external_roots()?;
     let mut by_path: BTreeMap<String, Judged> = BTreeMap::new();
-    for input in compiled.inputs {
+    for input in inputs {
         let written = input.display().to_string();
         let abs = if input.is_absolute() {
             input
