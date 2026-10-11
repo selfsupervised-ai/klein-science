@@ -12,9 +12,37 @@
 //! `check provenance` (LIC-02, CLAUDE.md rule 2) makes every shipped source file name where it
 //! came from: original work, a port of an allowed project (tied to [`PORT_POLICY`] and to a
 //! `Project:` block in NOTICE), or a paper by DOI. On the Rust side it judges what rustc actually
-//! read: the inputs cargo dep-info records for a compile of the whole workspace (all targets, all
-//! features), resolved to real paths ([`depinfo`], review W3'). On the Python side it walks
+//! read: the inputs cargo dep-info records for two compiles, the host compile of the whole
+//! workspace (all targets, all features) and the wasm32-wasip2 compile of the declared R0 crates'
+//! libs, resolved to real paths ([`depinfo`], review W3'). On the Python side it walks
 //! `standin/` on disk, ignored files included, and refuses symbolic links there.
+//!
+//! # Threat model of `check provenance`
+//!
+//! **Guaranteed.** For the tree as compiled during the check, every file rustc reads in those two
+//! compiles is, by its content at the time it was judged (right after the compile that read it):
+//! - a regular `.rs` file in the repository whose first line is a valid provenance header
+//!   (`original`, `paper doi:…`, or a `port` of a project in [`PORT_POLICY`] with its SPDX and a
+//!   `Project:` block in NOTICE); or
+//! - non-Rust data under a `testdata/` directory of the repository; or
+//! - a gated dependency's file: registry sources, git checkouts, the pinned toolchain's sysroot,
+//!   or the `OUT_DIR` output of a registry or git package's build script, exactly as cargo
+//!   reported it, with no symbolic link from the repository down to it. Those dependencies' licences
+//!   are gated by cargo-deny, not by this check.
+//!
+//! Anything else (a headerless or malformed source, a file outside those places, workspace
+//! build-script output, an unresolvable input, an incomplete or unrecognised dep-info file, a
+//! failed compile) fails the check. Every `.py` file under `standin/` has a valid header, and
+//! `standin/` holds no symbolic link.
+//!
+//! **Out of scope.**
+//! - Doctests: `cargo check --all-targets` does not compile them, and they are never shipped.
+//! - `include!` of a file under `testdata/`: dep-info does not record which macro read a file,
+//!   and testdata inputs are data, not judged as source.
+//! - Python outside `standin/`: no compiler records what Python imports.
+//! - Targets and cfgs other than the host compile and the wasm32-wasip2 R0 compile.
+//! - A local actor changing files after a compile's inputs are judged, or between this check and
+//!   a later build: the check judges the tree as compiled during the check, nothing more.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

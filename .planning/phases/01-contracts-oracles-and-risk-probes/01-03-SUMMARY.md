@@ -478,4 +478,78 @@ The re-review of the dep-info rework (Codex gpt-6-astra) returned FAIL with 1 cr
 - **`include!` of a `testdata/` file** would compile unjudged code. dep-info does not record which macro read a file, and testdata inputs are allowed unjudged as data.
 - **Python outside `standin/`.** There is no dep-info equivalent for Python. A `.py` file outside `standin/`, imported through `sys.path` tricks, is not seen.
 
-**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 122 tests with 122 passing. `check provenance` reported `13 Rust sources rustc read (host, all targets; wasm32-wasip2, R0 libs) and 0 standin files judged`.
+**Tree after the third review.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 122 tests with 122 passing.
+
+### Operator decision (2026-10-11): the dependency OUT_DIR exemption
+
+The operator approved the narrow C1 exemption. The `OUT_DIR` output of a build script that cargo reports for a `registry+` or `git+` package is treated like that dependency's source, and cargo-deny gates the dependency's licence. Output from a workspace build script stays judged and fails closed. Review C1', below, makes the exemption root the `OUT_DIR` exactly as cargo reports it, never resolved through a link.
+
+### Fourth review: C1', W-A and W-B
+
+The third review (Codex gpt-6-astra) of ee9720e..ea79f76 returned FAIL with 1 critical and 2 warnings, all found by static reading. Each was reproduced first by a failing test.
+
+**Commits.**
+- RED: `292643d` (test). 7 tests failed on their assertions: 3 C1' unit, 3 W-B unit, 1 W-A integration. The commit extracted `dependency_roots` without changing its behaviour.
+- GREEN: C1' `c1bb56e`, W-B `6245815`, W-A `ddafb67`.
+- Threat model: see the docs commit.
+
+**C1' (critical): the exemption root was canonicalised through links** (`c1bb56e`).
+- `dependency_roots` now keeps each reported `OUT_DIR` exactly as cargo reported it.
+  - It must be a plain path (no `.` or `..`) strictly below `target/provenance`.
+  - Every component from the canonical repository root down to it must be a real directory. A symbolic link or a non-directory is an error naming that path.
+  - Under those conditions the reported path is its own real path, so it can exempt only that one directory.
+
+| Case | Before | After |
+|---|---|---|
+| Real tree: serde's `OUT_DIR` (`target/provenance/debug/build/serde-25eaa…/out`) replaced by a link to the repository root, `private.rs` copied to the root, and a headerless `crates/ksci-wire/src/unchecked.rs` added as a module | **rc 0**, `provenance ok, 0 Rust sources rustc read`: the whole repository was exempt | **rc 1**, `…/serde-25eaa7d6e34fd67c/out is a symbolic link; a dependency OUT_DIR and every directory above it up to the repository must be real directories` |
+| Unit `provenance_exemption_refuses_linked_out_dir` | Ok(repo root) (RED) | error naming `debug/build/dep-1/out` |
+| Unit `provenance_exemption_refuses_linked_ancestor` (`debug/build` is a link) | Ok(resolved path) (RED) | error naming `debug/build` |
+| Unit `provenance_exemption_refuses_out_dir_outside_target` (outside the target dir, and with `..`) | accepted (RED) | error |
+| Unit `provenance_exemption_root_is_cargo_out_dir` (guard) | pass | pass, returns the reported path |
+
+The real-tree mutation was reverted: link removed, `out` restored, `private.rs` and `unchecked.rs` deleted, `lib.rs` checked out. The clean tree gives rc 0.
+
+**W-A: both compiles ran before either was judged** (`ddafb67`).
+- `rust_compiles` runs the host compile, then classifies, reads and judges its inputs (`classify_inputs`, `violation_lines`). Only then does it start the wasm32-wasip2 compile, which is judged the same way.
+- Exemption roots are per compile. The violation lines from both compiles and `standin/` merge into one list sorted by path.
+- `rust_inputs` is removed; ast-grep finds no remaining reference.
+- Witness `provenance_judges_each_compile_before_the_next`: a headed `build.rs` writes a headerless `src/generated.rs` for the host and a headed one when `TARGET=wasm32-wasip2`. RED: exit 0. GREEN: exit 1, `crates/k/src/generated.rs: no provenance header`.
+
+**W-B: extra spaces were accepted** (`6245815`).
+- `split_words` now accepts exactly rustc's shape, `target: dep dep…` with single separators.
+
+| Test | Input | Before | After |
+|---|---|---|---|
+| `depinfo_rejects_leading_space` | `" a: src/lib.rs"` | accepted (RED) | error |
+| `depinfo_rejects_repeated_space` | `"a:  src/lib.rs"`, `"a: src/lib.rs  src/b.rs"` | accepted (RED) | error |
+| `depinfo_rejects_trailing_space` | `"a: src/lib.rs "`, `"src/lib.rs: "` | accepted (RED) | error |
+
+Every real dep-info file still parses: check provenance gives rc 0 on the real tree.
+
+## Threat model of `check provenance`
+
+This section is the scope that future reviews of the check are held to. The same text is the doc comment at the top of `xtask/src/check.rs`.
+
+**What the check guarantees.** It judges the tree as compiled during the check, in two compiles: the host compile of the whole workspace (all targets, all features) and the wasm32-wasip2 compile of the declared R0 crates' libs. Every file rustc reads in those compiles is judged by its content right after the compile that read it, and must be one of:
+- a regular `.rs` file in the repository whose first line is a valid provenance header: `original`, `paper doi:…`, or a `port` of a project in `PORT_POLICY` with the policy's SPDX and a `Project:` block in NOTICE;
+- non-Rust data under a `testdata/` directory of the repository;
+- a gated dependency's file: registry sources, git checkouts, the pinned toolchain's sysroot, or the `OUT_DIR` output of a registry or git package's build script, exactly as cargo reported it, with no symbolic link from the repository down to it. cargo-deny gates these dependencies' licences.
+
+Everything else fails the check. That includes:
+- a headerless or malformed source;
+- an input anywhere else;
+- workspace build-script output;
+- an input that cannot be resolved;
+- an incomplete or unrecognised dep-info file;
+- a failed compile.
+
+On the Python side, every `.py` file under `standin/` (ignored files included) has a valid header, and `standin/` holds no symbolic link.
+
+**What is out of scope.**
+- **Doctests.** `cargo check --all-targets` does not compile them, and they are never shipped (review W4, accepted).
+- **`include!` of a file under `testdata/`.** dep-info does not record which macro read a file, and testdata inputs are data that is not judged as source.
+- **Python outside `standin/`.** No compiler records what Python imports.
+- **Other targets and cfgs.** Targets and cfgs other than the host compile and the wasm32-wasip2 R0 compile are not judged, for example an R2 Linux-only cfg checked from the Mac.
+- **Changes after judging.** A local actor who changes files after a compile's inputs are judged, or between this check and a later build, is not detected. The check judges the tree as compiled during the check, nothing more.
+
+**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0. nextest ran 130 tests with 130 passing. `check provenance` reported `13 Rust sources rustc read (host, all targets; wasm32-wasip2, R0 libs) and 0 standin files judged`. rust-analyzer was unavailable throughout, so every-site claims rest on the clippy compile of all targets plus ast-grep.
