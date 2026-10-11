@@ -617,6 +617,11 @@ fn resolve_input(cache: &Cache, spec: &str) -> Res<(PathBuf, String)> {
 /// The outputs of one run: file name to the sha256 of its stored, canonical bytes.
 pub type Outputs = BTreeMap<String, String>;
 
+/// What `docker run` executes for a pinned platform.
+fn run_image(pin: &PlatformPin) -> &str {
+    &pin.reference
+}
+
 /// Runs `args.script` in the pinned image; on success, canonicalises and stores every output.
 /// Returns the exit code (the container's, when it failed) and the stored outputs.
 pub fn run_script(args: &RunArgs) -> Res<(ExitCode, Outputs)> {
@@ -710,7 +715,7 @@ pub fn run_script(args: &RunArgs) -> Res<(ExitCode, Outputs)> {
     let out = fresh_out_dir()?;
     let argv = run_argv(
         &args.platform,
-        &pinned.reference,
+        run_image(pinned),
         &mounts,
         &out,
         &env,
@@ -933,6 +938,37 @@ mod tests {
                 &[]
             )
             .is_err()
+        );
+    }
+
+    /// Review W1: what runs is the verified, content-addressed identity, never the mutable tag a
+    /// concurrent build could move between the check and the run.
+    #[test]
+    fn oracle_runs_the_pinned_identity_not_the_tag() {
+        let pin = PlatformPin {
+            reference: built_tag("sympy", "linux/arm64"),
+            identity: format!("sha256:{}", "a".repeat(64)),
+            emulated: false,
+            tar_sha256: None,
+        };
+        assert_eq!(run_image(&pin), pin.identity);
+        let argv = run_argv(
+            "linux/arm64",
+            run_image(&pin),
+            &[],
+            Path::new("/tmp/out"),
+            &[],
+            &["python3".to_owned()],
+        )
+        .unwrap();
+        assert!(
+            argv.iter()
+                .any(|a| a.to_str() == Some(pin.identity.as_str()))
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.to_str() == Some(pin.reference.as_str()))
         );
     }
 

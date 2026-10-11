@@ -1,0 +1,5 @@
+{"case_id": "abe29b00d8d415bf35ff136c0fc14329a4b888e0015264fc7a9331dc50c31aaa", "code": "import os, signal\nos.kill(os.getpid(), signal.SIGRTMIN + 2)\n"}
+{"case_id": "5231a540d48679f0b2b07ba104e70c841a758c48c950a0b4b4ab6a7031603be3", "code": "import os, time\nr, w = os.pipe()\nif os.fork() == 0:\n    os.setsid()\n    os.write(w, b'1')\n    time.sleep(3600)\n    os._exit(0)\nos.read(r, 1)\nraise ValueError('escaped')\n"}
+{"case_id": "42099a760be656bf40c0ff9d1e2b038d5a598e69da305aa84a0801aa24880c3c", "code": "import os, time\nr, w = os.pipe()\nif os.fork() == 0:\n    os.setsid()\n    with open('/tmp/ksci-stray.pid', 'w') as f:\n        f.write(str(os.getpid()))\n    os.write(w, b'1')\n    time.sleep(3600)\n    os._exit(0)\nos.read(r, 1)\nprint('spawned')\n"}
+{"case_id": "34fc6f017b2511fb7c4854b40805437b0406d1ea89a5af4f8fc32387b39dcc7a", "code": "import os\npid = open('/tmp/ksci-stray.pid').read()\nprint('stray alive' if os.path.exists('/proc/' + pid) else 'stray gone')\n"}
+{"case_id": "d2320929e926a2795564b45ce474d1379a36b32367d056bc565db30a6ba9a382", "code": "print(\"control\")\n"}
