@@ -102,6 +102,13 @@ pub fn read_response_frame(reader: &mut impl Read) -> Result<Option<(u8, Vec<u8>
 
 /// Write one response frame and flush. A payload above [`MAX_DOCUMENT_BYTES`] is refused, so every frame written
 /// can be read back.
+///
+/// Only the four defined tags can be written (review N1):
+///
+/// ```compile_fail,E0308
+/// let mut out = Vec::new();
+/// ksci_wire::frame::write_response_frame(&mut out, 4, b"").unwrap();
+/// ```
 pub fn write_response_frame(writer: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
     let len = frame_len(payload)?;
     writer.write_all(&[tag])?;
