@@ -21,6 +21,8 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+pub mod numeral;
+
 /// The `v` every document carries.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -329,6 +331,131 @@ pub(crate) fn check_version(value: Option<&Value>, path: &str) -> Result<(), Wir
     }
 }
 
+/// One step of a path into a JSON document.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Seg<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// The JSON pointer for `path`.
+fn pointer(path: &[Seg<'_>]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        out.push('/');
+        match seg {
+            Seg::Key(key) => out.push_str(key),
+            Seg::Index(i) => out.push_str(&i.to_string()),
+        }
+    }
+    out
+}
+
+/// Reject every JSON number in `value` whose position `allowed` refuses, and every number at an allowed position
+/// that is not an integer in `0..2^32`. The walk is iterative and in document order.
+pub(crate) fn check_json_numbers(
+    value: &Value,
+    allowed: &dyn Fn(&[Seg<'_>]) -> bool,
+) -> Result<(), WireError> {
+    let mut stack: Vec<(&Value, Vec<Seg<'_>>)> = vec![(value, Vec::new())];
+    while let Some((value, path)) = stack.pop() {
+        match value {
+            Value::Number(n) => {
+                let is_index = n.as_u64().is_some_and(|i| u32::try_from(i).is_ok());
+                if !(is_index && allowed(&path)) {
+                    return Err(WireError::JsonNumberNotAllowed {
+                        path: pointer(&path),
+                    });
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate().rev() {
+                    let mut child = path.clone();
+                    child.push(Seg::Index(i));
+                    stack.push((item, child));
+                }
+            }
+            Value::Object(map) => {
+                for (key, item) in map.iter().rev() {
+                    let mut child = path.clone();
+                    child.push(Seg::Key(key));
+                    stack.push((item, child));
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::String(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Where a node table document may carry a JSON number: `v`, `root`, and the child indices of Add, Mul, Pow and Fn.
+pub(crate) fn table_number_allowed(table: &Value, path: &[Seg<'_>]) -> bool {
+    match path {
+        [Seg::Key("v")] | [Seg::Key("root")] => true,
+        [Seg::Key("nodes"), Seg::Index(i), Seg::Index(j)] => {
+            let kind = table
+                .get("nodes")
+                .and_then(|nodes| nodes.get(*i))
+                .and_then(|node| node.get(0))
+                .and_then(Value::as_str);
+            match kind {
+                Some("Add" | "Mul" | "Pow") => *j >= 1,
+                Some("Fn") => *j >= 2,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// An assumption key: `[a-z][a-z_]*`.
+fn is_assumption_key(key: &str) -> bool {
+    match key.as_bytes() {
+        [first, rest @ ..] => {
+            first.is_ascii_lowercase() && rest.iter().all(|b| b.is_ascii_lowercase() || *b == b'_')
+        }
+        [] => false,
+    }
+}
+
+/// Check one node's numerals, names and arity.
+fn validate_node(i: usize, node: &Node) -> Result<(), WireError> {
+    let numeral = |j: usize| WireError::Numeral {
+        path: format!("/nodes/{i}/{j}"),
+    };
+    match node {
+        Node::Int(digits) if !numeral::is_int(digits) => Err(numeral(1)),
+        Node::Rat(p, _) if !numeral::is_rat_numerator(p) => Err(numeral(1)),
+        Node::Rat(_, q) if !numeral::is_rat_denominator(q) => Err(numeral(2)),
+        Node::Float { man, exp, prec } if !numeral::is_float(man, exp, prec) => {
+            let j = if !numeral::is_int(man) {
+                1
+            } else if !numeral::is_int(exp) {
+                2
+            } else {
+                3
+            };
+            Err(numeral(j))
+        }
+        Node::Sym { name, .. } | Node::Fn { name, .. } if name.is_empty() => Err(shape(
+            format!("/nodes/{i}/1"),
+            "a name is a non-empty string",
+        )),
+        Node::Sym { assumptions, .. } => match assumptions.keys().find(|k| !is_assumption_key(k)) {
+            Some(key) => Err(shape(
+                format!("/nodes/{i}/2/{key}"),
+                "an assumption key matches [a-z][a-z_]*",
+            )),
+            None => Ok(()),
+        },
+        Node::Add(children) | Node::Mul(children) if children.len() < 2 => Err(shape(
+            format!("/nodes/{i}"),
+            "Add and Mul take at least two children",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// An expression: a validated node table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
@@ -337,10 +464,14 @@ pub struct Table {
 }
 
 impl Table {
-    /// Build a table, checking every structural rule: a non-empty node list, indices in range and no cycles.
+    /// Build a table, checking every rule of the contract that does not depend on JSON: a non-empty node list, the
+    /// numeral grammar, non-empty names, assumption keys, arities, indices in range and no cycles.
     pub fn new(nodes: Vec<Node>, root: NodeId) -> Result<Table, WireError> {
         if nodes.is_empty() {
             return Err(shape("/nodes", "the node list is empty"));
+        }
+        for (i, node) in nodes.iter().enumerate() {
+            validate_node(i, node)?;
         }
         let len = nodes.len();
         if root.index() >= len {
@@ -378,13 +509,14 @@ impl Table {
         self.root
     }
 
-    /// Decode a node table document.
+    /// Decode a node table document. Documents above [`MAX_DOCUMENT_BYTES`] are rejected before parsing.
     pub fn from_slice(bytes: &[u8]) -> Result<Table, WireError> {
         Table::from_value(&parse_document(bytes)?)
     }
 
     /// Decode a parsed node table document.
     pub fn from_value(value: &Value) -> Result<Table, WireError> {
+        check_json_numbers(value, &|path| table_number_allowed(value, path))?;
         let obj = value
             .as_object()
             .ok_or_else(|| shape("", "a table is a JSON object"))?;
