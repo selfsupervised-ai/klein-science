@@ -1,0 +1,34 @@
+// provenance: original
+// The R0 tool world of klein-science (PLUG-02). Every argument and result is the JCS bytes of a
+// klein.science.expr.v1 document (schema/expr.v1.md). The world imports nothing (D-16): the
+// component is pure computation, and every effect goes through a Klein host capability.
+//
+// The `klein:` namespace is Klein's to assign. `klein:science@0.1.0` is provisional until Klein's
+// D2/D3 contracts name it; a rename means a rebuild and a re-sign.
+package klein:science@0.1.0;
+
+interface cas {
+  /// Why an operation produced no response. Mirrors ksci_ops::OpError one to one.
+  variant error {
+    /// The request is malformed, non-canonical, or its arguments do not fit the operation.
+    bad-request(string),
+    /// The request names an operation that is not in the registry.
+    unsupported-op(string),
+    /// The operation failed on a valid request.
+    internal(string),
+  }
+
+  /// Run a request and return the response's JCS bytes.
+  invoke: func(request-jcs: list<u8>) -> result<list<u8>, error>;
+  /// Split a request into pieces for `map`.
+  plan: func(request-jcs: list<u8>) -> result<list<list<u8>>, error>;
+  /// Run one piece. `map` is a WIT keyword (the map type), so the name is written escaped; the
+  /// exported function is named `map`.
+  %map: func(piece: list<u8>) -> result<list<u8>, error>;
+  /// Combine the outputs of the pieces of a request.
+  reduce: func(request-jcs: list<u8>, outputs: list<list<u8>>) -> result<list<u8>, error>;
+}
+
+world science-cas {
+  export cas;
+}

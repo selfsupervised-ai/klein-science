@@ -28,9 +28,10 @@
 //! **Guaranteed.** For the tree as compiled during the check, and given those dep-info records,
 //! every file rustc reads in those two compiles is, by its content at the time it was judged
 //! (right after the compile that read it):
-//! - a regular `.rs` file in the repository whose first line is a valid provenance header
-//!   (`original`, `paper doi:…`, or a `port` of a project in [`PORT_POLICY`] with its SPDX and a
-//!   `Project:` block in NOTICE); or
+//! - a regular source file ([`SOURCE_EXTENSIONS`]: Rust, and the WIT that `wit_bindgen::generate!`
+//!   compiles into the R0 component) in the repository whose first line is a valid provenance
+//!   header (`original`, `paper doi:…`, or a `port` of a project in [`PORT_POLICY`] with its SPDX
+//!   and a `Project:` block in NOTICE); or
 //! - non-Rust data under a `testdata/` directory of the repository; or
 //! - a gated dependency's file: registry sources, git checkouts, the pinned toolchain's sysroot,
 //!   or the `OUT_DIR` output of a registry or git package's build script, exactly as cargo
@@ -70,7 +71,7 @@ use crate::{depinfo, host, workspace};
 pub enum CheckCmd {
     /// Fail when a staged (index) blob or an untracked, non-ignored file looks like corpus bytes.
     NoCorpus,
-    /// Fail when a `.rs` file under `crates/` or a `.py` file under `standin/` lacks a valid
+    /// Fail when a source file rustc reads (`.rs`, `.wit`) or a `.py` file under `standin/` lacks a valid
     /// provenance header, or a port header is outside the licence policy or missing from NOTICE.
     Provenance,
 }
@@ -340,7 +341,7 @@ fn provenance() -> Res<ExitCode> {
             .filter(|l| l.starts_with("Project: "))
             .count();
         println!(
-            "provenance ok, {rust} Rust sources rustc read (host, all targets; wasm32-wasip2, R0 \
+            "provenance ok, {rust} sources rustc read (host, all targets; wasm32-wasip2, R0 \
              libs) and {} standin files judged in {}, {NOTICE_FILE} has {blocks} Project blocks",
             standin.len(),
             root.display()
@@ -349,7 +350,7 @@ fn provenance() -> Res<ExitCode> {
     } else {
         eprintln!(
             "error: provenance: {} violation(s); every file rustc reads inside the repository is a \
-             .rs file with a provenance header (or data under testdata/), every other input comes \
+             source file (.rs, .wit) with a provenance header (or data under testdata/), every other input comes \
              from the cargo registry, git checkouts or the toolchain, and every .py file under \
              standin/ has a header, with no symbolic link in standin/",
             found.len()
@@ -401,11 +402,24 @@ fn rust_compiles(root: &Path, notice: &str) -> Res<(usize, Vec<(String, String)>
     Ok((sources.len(), found))
 }
 
+/// The extensions of the compiler inputs judged as source by their `//` provenance header: Rust,
+/// and WIT, which `wit_bindgen::generate!` reads and compiles into the shipped R0 component.
+pub const SOURCE_EXTENSIONS: &[&str] = &["rs", "wit"];
+
+/// Whether a repository path is a source file judged by its header ([`SOURCE_EXTENSIONS`],
+/// matched case-insensitively).
+pub fn is_source(rel: &str) -> bool {
+    Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SOURCE_EXTENSIONS.iter().any(|s| e.eq_ignore_ascii_case(s)))
+}
+
 /// Classifies one compile's inputs, each resolved to its real path (links followed: rustc read
 /// the target), reading the bytes of every judged source now.
 ///
-/// - Inside the repository, a regular `.rs` file is judged by its header. A non-`.rs` input
-///   (`include_str!`/`include_bytes!` data) is allowed, unjudged, only under a `testdata/`
+/// - Inside the repository, a regular source file ([`is_source`]) is judged by its header. Any
+///   other input (`include_str!`/`include_bytes!` data) is allowed, unjudged, only under a `testdata/`
 ///   directory; anywhere else it is a violation. Nothing is exempt for lying in the provenance
 ///   target directory (review C1): a file there, including the `OUT_DIR` output of a workspace
 ///   build script, is judged like any other input; a headed build script does not vouch for the
@@ -446,7 +460,7 @@ fn classify_inputs(
                         Some(Entry::Refused(
                             "compiler input is not a regular file".to_owned(),
                         ))
-                    } else if rel.to_ascii_lowercase().ends_with(".rs") {
+                    } else if is_source(&rel) {
                         let bytes =
                             fs::read(&real).map_err(|e| format!("provenance: {rel}: {e}"))?;
                         Some(Entry::Bytes(bytes))
@@ -454,7 +468,7 @@ fn classify_inputs(
                         None
                     } else {
                         Some(Entry::Refused(
-                            "non-Rust compiler input outside testdata/; include_str! and \
+                            "non-source compiler input outside testdata/; include_str! and \
                              include_bytes! data lives under a testdata/ directory"
                                 .to_owned(),
                         ))
@@ -829,8 +843,27 @@ mod tests {
                 "# -*- coding: utf-8 -*-\n# provenance: original\n",
             ),
             ("crates/a/src/one.rs", "// provenance: original"),
+            (
+                "wit/world.wit",
+                "// provenance: original\npackage a:b@0.1.0;\n",
+            ),
         ];
         assert_eq!(judge(&tree, NOTICE_EMPTY), Vec::<String>::new());
+    }
+
+    #[test]
+    fn provenance_wit_is_source() {
+        for rel in ["crates/a/src/lib.rs", "wit/science-cas.wit", "wit/X.WIT"] {
+            assert!(is_source(rel), "{rel}");
+        }
+        for rel in [
+            "wit/notes.md",
+            "testdata/wire/requests.jsonl",
+            "crates/a/rs",
+            "wit",
+        ] {
+            assert!(!is_source(rel), "{rel}");
+        }
     }
 
     #[test]
@@ -842,6 +875,7 @@ mod tests {
             // The header on line 2 counts only after a shebang or coding cookie, and only in Python.
             ("crates/a/src/late.rs", "\n// provenance: original\n"),
             ("standin/late.py", "import x\n# provenance: original\n"),
+            ("wit/world.wit", "package a:b@0.1.0;\n"),
         ];
         assert_eq!(
             judge(&tree, NOTICE_EMPTY),
@@ -851,6 +885,7 @@ mod tests {
                 "crates/a/src/lib.rs: no provenance header",
                 "standin/empty.py: no provenance header",
                 "standin/late.py: no provenance header",
+                "wit/world.wit: no provenance header",
             ]
         );
     }
