@@ -330,3 +330,9 @@ status: complete
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+- All 8 created key files exist on disk.
+- Task commits `bfb62ef` and `8002345` are ancestors of HEAD.
+- STATE.md, ROADMAP.md and REQUIREMENTS.md were not touched (parallel worktree; the orchestrator owns them).
