@@ -21,11 +21,11 @@ provides:
 affects: [01-07 strata and extraction image, 01-10 goldens, 01-12 stand-in name table, 01-13 stand-in baseline, 01-17 census]
 
 actuals:
-  tokens: 21800
+  tokens: 27400
   tasks: 3
-  commits: 7
+  commits: 10
 plan_head_before: 46c5bc6e6e4a686f4fa0ee7726e84e465f0112d7
-plan_head_after: 497c00ddd6480b26137baa5ee4202b2f8f63e960
+plan_head_after: 2c5ed903a990a0d8950385bf50843c19b2955f33
 
 tech-stack:
   added: [docker 28.3.3 (pinned system tool), docker buildx, "python:3.13-slim-trixie@sha256:70729b46…", sympy 1.14.0 (oracle image only), mpmath 1.3.0 (oracle image only)]
@@ -48,6 +48,10 @@ key-files:
     - testdata/programs/smoke.jsonl
     - testdata/programs/review.jsonl
     - testdata/programs/review-concurrency.jsonl
+    - testdata/programs/review-r1-parent.jsonl
+    - testdata/programs/review-r1-sibling.jsonl
+    - testdata/programs/review-r2.jsonl
+    - conformance/oracles/launch.py
     - xtask/tests/oracle_review.rs
   modified:
     - xtask/src/main.rs
@@ -63,6 +67,9 @@ key-decisions:
   - "Review W1: docker run executes the pinned content-addressed image ID, never the tag; pins carry identity (image ID) and manifest (per-platform manifest digest)"
   - "Review W3: containment by two-level PR_SET_CHILD_SUBREAPER plus sweep; PID/user namespaces are EPERM in the hardened container (measured), so not used"
   - "Review W2: per-case harness failures are recorded as HarnessError; batch-fatal only for invalid input (2), unmet env (3), no subreaper (4), unwritable outputs"
+  - "Review R1 (operator decision 2026-10-11): distinct uid per case. The container starts as root with exactly CAP_SETUID, CAP_SETGID and CAP_KILL; launch.py drops in-process to uid 65534, keeping them; each case runs as 100000 + a case_id-derived offset with no groups and no capabilities"
+  - "Review R1: CAP_KILL is added because signalling another uid needs it; /proc hidepid=2 is not possible without CAP_SYS_ADMIN (measured EPERM), so it is not done"
+  - "Review R2: ok needs a completion marker on a token- and pid-stamped status channel; the exception type is read through type's own descriptors, and the message is untrusted with deterministic placeholders"
 
 patterns-established:
   - "Witness by probe: own-authored adversarial programs (network, rootfs, mounts, limits, symlink in /out) run through the real runner, kept out of git"
@@ -306,7 +313,9 @@ The re-pin rebuilt sympy. Buildx reused cached layers, so the identities are unc
 
 | Flag | File | Description |
 |---|---|---|
-| threat_flag: shared-uid /out | xtask/src/oracle.rs, conformance/oracles/run_programs.py | Cases run as the same uid as `run_programs.py`, so a program can write into the writable `/out` bind mount. Each file is capped by RLIMIT_FSIZE (64 MiB), but the total is not bounded by the container. xtask admits only regular files and re-encodes JSON. A program could also add or alter files in `/out`; record integrity against an adversarial program is not in T-01-13, which protects the host. Closing it fully needs per-case uid separation or Landlock. |
+| threat_flag: shared-uid /out (RESOLVED by review R1, `2c5ed90`) | xtask/src/oracle.rs, conformance/oracles/run_programs.py | Originally, cases ran as the same uid as `run_programs.py` and could write into the writable `/out` mount. Now each case has its own uid, and the output mount is `/harness/out` inside the harness's 0700 tmpfs: a case gets EACCES even traversing `/harness` (measured). |
+| threat_flag: root start with three capabilities | xtask/src/oracle.rs, conformance/oracles/launch.py | The container now starts as uid 0 holding CAP_KILL, CAP_SETGID and CAP_SETUID (`--cap-add`; no-new-privileges kept), instead of `--user 65534:65534`. launch.py drops to 65534 before any script code runs and verifies Uid, Gid, Groups and the capability sets, or exits 4. The harness keeps those three capabilities for its whole run. They are the operator-approved surface for R1. |
+| threat_flag: /proc enumerable | conformance/oracles/run_programs.py | Cases can list other pids, read their argv and /proc/<pid>/stat. `hidepid=2` needs CAP_SYS_ADMIN (EPERM, measured). Signalling, ptrace and reading environ/fd/mem of other uids are denied. |
 
 ## Issues Encountered
 
@@ -407,6 +416,79 @@ Each fix went test-first. The RED witnesses were committed first in `2969217`, f
 - **What it cannot guarantee.** Raw `stdout` and exception messages are recorded verbatim, so a program that prints object addresses (`<… at 0x7f…>`), times, pids, random draws or hash-ordered containers under a varied seed gives different bytes on every run. Records are byte-stable only for programs that are deterministic themselves.
 - **Admission policy for later plans (open item for 01-07 and 01-10).** Plans 01-07 and 01-10 must admit a case as a golden only after the same records come out on two or more independent runs, at least across two seeds and both architectures (Pitfall J). A disagreeing case is adjudicated or excluded, never normalised silently. Any normalisation (for example `0x…` addresses) must be an explicit, versioned rule applied in the scorer, not in the runner.
 
+## Review fixes, round 2 (re-review: Codex gpt-6-astra; W1 and W2 closed, R1 and R2 must-fix)
+
+| Commit | What |
+|---|---|
+| `f8307c4` | test(01-05): RED witnesses for R1 and R2 (3 new ignored docker tests, 3 own-authored fixtures) |
+| `2c5ed90` | fix(01-05): a distinct uid per case and positive completion evidence (R1, R2) |
+
+**Operator decision (2026-10-11, relayed by the orchestrator): a distinct uid per case.** The harness keeps only CAP_SETUID and CAP_SETGID, plus CAP_KILL if signalling other uids needs it. Each case runs as its own unprivileged uid with supplementary groups cleared, before any program code runs.
+
+### R1: cases could signal the harness and sibling cases
+
+- **Finding.** All processes shared uid 65534 and the pid namespace:
+  - `os.kill(os.getppid(), SIGKILL)` killed the harness, and the batch was lost;
+  - a case could SIGSTOP or SIGKILL sibling wrappers it found through /proc.
+- **Measured before designing:**
+  - With `--user 65534 --cap-add=…`, the capabilities exist only in the bounding set (CapEff and CapPrm 0). Docker sets no ambient capabilities for a non-root user. So the container must start as root to hold them.
+  - In-process `PR_SET_KEEPCAPS` + `setresuid` + `capset` leaves uid/gid 65534 with no groups, CapEff = CapPrm = `0xe0` (KILL, SETGID, SETUID), and nothing inheritable or ambient.
+  - A case started with `user=`/`group=`/`extra_groups=[]` holds no capabilities and no groups after its exec.
+  - The case gets EPERM killing its parent, EACCES reading the parent's `/proc/<pid>/environ`, and EACCES on `/harness/out` and `/harness/in`.
+  - The harness can SIGKILL a process of another uid only because it holds CAP_KILL.
+  - Remounting `/proc` with `hidepid=2` gives EPERM (it needs CAP_SYS_ADMIN).
+- **Fix.**
+  - **Container:** `--user 0:0 --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=KILL`, with no-new-privileges kept. A new `--tmpfs /harness:rw,size=1m,mode=0700,uid=65534,gid=65534` holds `/harness/in/<name>` (inputs, read-only) and `/harness/out` (the only writable mount).
+  - **Launcher:** every container enters through `conformance/oracles/launch.py`. It drops in-process to the harness identity keeping exactly those three capabilities, verifies all of it from `/proc/self/status` (or exits 4), then runs the script with `runpy`. `run_programs.py` checks the identity again (exit 4).
+  - **Case uids:** each case runs as uid and gid `100000 + (first 32 bits of case_id mod 2^24)`, collisions probed in case_id order. That makes the uid unique within the batch, never the harness's, and the same on every run.
+    - The first attempt used a worker-slot uid (`70000 + slot`). The boundary probe that prints `os.getuid()` then printed `70003`, which depends on scheduling, so a program printing its uid would have broken byte-stable records. The case_id-derived uid fixed that: the probe set's records `47f0ddcb…` were identical across three runs, including `--jobs 1`.
+  - **Pid budget:** RLIMIT_NPROC per case uid is `max(16, 448 // jobs)`, so one case cannot take the container's whole pid budget.
+- **Not done, and why:**
+  - `/proc` hidepid needs CAP_SYS_ADMIN, which would weaken the sandbox.
+  - `/tmp` stays shared (mode 1777, sticky): a case cannot change or remove another case's files there, but can read world-readable ones. That is a cross-case channel, an open item for the admission policy below.
+- **Re-pin:** not needed. The Containerfile did not change, and `--user 0:0` overrides the image's `USER`. The images, `images.json` and the introspection table (`011f497f…`) are unchanged.
+
+### R2: a hidden exception could still become ok
+
+- **Finding.** The reporter ran inside the untrusted process. `__str__` calling `os._exit(0)` during reporting left both channels at EOF with exit 0, so the case was recorded `ok`. Reading `type(e).__name__` through a metaclass property ran user code too.
+- **Fix (positive evidence).**
+  - The wrapper writes JSON lines on its status channel, each stamped with a per-case random token (sent on the code pipe, not in argv) and the wrapper's pid. Forked children and stray writes are ignored.
+  - `ok` is written only after `exec` returned normally, or after SystemExit with code None, False or exactly int 0.
+  - For an exception the wrapper writes, in order:
+    1. `raised`, after flushing stdout;
+    2. `type`, with qualname and module read through `type.__dict__['__qualname__'/'__module__']`, so no user code runs;
+    3. `message`, the untrusted `str()`: exact `str` only, capped at 64 KiB, or `unprintable` if it fails;
+    4. `end`.
+  - The builtins and `json.dumps` it relies on are captured before the program runs.
+- **Classification.**
+  - With `raised` and `type`: error with that type. The message is `<message unavailable>` if the report was cut short, `<unprintable>` if `str()` failed.
+  - Without them: timeout as before; then Signal or ExitCode; then `ok` only with the marker. A clean exit without it is `IncompleteExit` ("exit status 0 without the completion marker").
+- **Residual.** A program that deliberately forges token- and pid-stamped lines (by introspecting the wrapper's frame) can still misreport its own outcome, because it runs in the same process as the reporter. That is outside the threat model.
+
+### Per case, before and after
+
+| Case | Before | After |
+|---|---|---|
+| R1a `91b6193b` kills its parent (`review-r1-parent`) | container exit 137, batch lost, nothing stored | error `PermissionError "[Errno 1] Operation not permitted"`; control `0a656940` ok `after the parent kill` (records `0c714181…`) |
+| R1b attacker `888f20c2` SIGSTOP+SIGKILL siblings via /proc | `signalled 6`; victims `0b8e3065`, `ac24f984`, `81ec346c` error `Signal SIGKILL` (records `7474f3c2…`) | `signalled 0`; all three victims ok `victim N` (records `57af1684…`) |
+| R2 Hidden `7928b045` (`__str__` → `os._exit(0)`) | ok, null | error `Hidden "<message unavailable>"` |
+| R2 Raising `073edf41` (`__str__` raises) | error `Raising "<unprintable Raising>"` | error `Raising "<unprintable>"` |
+| R2 Looping `5c5550ac` (`__str__` never returns) | timeout | error `Looping "<message unavailable>"` |
+| R2 Sneaky `2406d85e` (metaclass `__name__` → `os._exit(0)`) | ok, null | error `Sneaky "x"` |
+| R2 early exit `90d0272c` (`os._exit(0)` midway) | ok `a\n` | error `IncompleteExit`, stdout `a\n` |
+| R2 control `b894d728` | ok | ok (records `0c492ba8…` became `ca7d81b8…`) |
+| smoke (base and sympy) | records `13992589…5c90` | records `13992589…5c90` (unchanged); `run.json` changed (`0750a3b9…` became `3a9c19ad…` base, `90b24ba6…` became `3964832a…` sympy), because it now records `nproc_per_case` |
+| boundary probes | `923d797a…` (`ids` printed `65534`) | `47f0ddcb…` (`ids` prints its case uid `7562030`), identical across runs and worker counts; all other outcomes unchanged |
+| W2/W3 probes | — | `d39e402a…` and `5605d7fb…`, unchanged |
+
+### Gates after round 2
+
+- `cargo fmt --all --check` and `cargo clippy -p xtask --all-targets --locked -- -D warnings` are clean.
+- `cargo test -p xtask` passes (31 unit, 15 integration, 5 ignored).
+- `cargo test -p xtask --test oracle_review -- --ignored` passes 5 of 5.
+- `cargo xtask check no-corpus` reports no violations, and `cargo xtask ci` reports "all 6 steps passed".
+- rust-analyzer was unavailable again. Every-site checks used ast-grep plus compiler enumeration.
+
 ## Next Phase Readiness
 
 - **01-07, 01-10, 01-13 and 01-17** run untrusted programs only through `cargo xtask oracle run`. They pass `--image sympy --require-sympy-env`, get records by digest, and should use `--seed` sweeps for adjudication.
@@ -421,11 +503,11 @@ Each fix went test-first. The RED witnesses were committed first in `2969217`, f
 
 ## Self-Check: PASSED
 
-- All 11 created key files exist on disk.
-- The task commits `bfb62ef` and `8002345`, and the review commits `2969217`, `f67bf6c` and `497c00d`, are ancestors of HEAD.
-- After the review fixes:
-  - `cargo test -p xtask` passes (31 unit, 15 integration, 2 ignored docker witnesses);
-  - both docker witnesses pass with `-- --ignored`;
+- All 15 created key files exist on disk.
+- The task commits `bfb62ef` and `8002345`, and the review commits `2969217`, `f67bf6c`, `497c00d`, `f8307c4` and `2c5ed90`, are ancestors of HEAD.
+- After both review rounds:
+  - `cargo test -p xtask` passes (31 unit, 15 integration, 5 ignored docker witnesses);
+  - all 5 docker witnesses pass with `-- --ignored`;
   - clippy `-D warnings`, fmt and `check no-corpus` are clean;
   - `cargo xtask ci` reports "all 6 steps passed".
 - STATE.md, ROADMAP.md and REQUIREMENTS.md were not touched (parallel worktree; the orchestrator owns them).
