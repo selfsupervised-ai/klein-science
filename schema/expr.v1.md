@@ -150,7 +150,12 @@ digests with provenance, which is never inside the hashed bytes.
 
 - `args` maps argument names to node tables (the shape above), for example `{"expr":<table>}`.
 - `budget.steps` is the logical step budget, a step-budget numeral string (`0` to `18446744073709551615`). A JSON
-  number here is rejected.
+  number here is rejected. An operation charges one step per unit of logical work, and when a charge finds no
+  step left the response is `fuel_exhausted`. The count depends only on the request bytes, never on the host, so
+  every implementation stops at the same point. `science.cas.canonicalize` charges one step each time the walk
+  of the canonical form first enters a reachable input node: `x**2 + 1` (5 reachable nodes) is `exact` with
+  `"5"` steps and `fuel_exhausted` with `"4"`. Structurally equal nodes at different indices are each entered,
+  an index referenced twice is entered once, and unreachable nodes are never entered.
 - `op` names the operation, for example `science.cas.canonicalize`.
 - `v` is exactly `1`. Unknown keys are rejected at every level.
 
@@ -207,3 +212,23 @@ canonical byte string, and that string is what a record hashes.
 Only request bytes and response bytes are hashed. Provenance lives only in the record, and the request and response
 schemas reject a `provenance` key, so implementation, backend, device, driver and wall time can never change a
 digest.
+
+### Errors
+
+A request that yields no response yields an error instead. Its kind is one of:
+
+- `bad-request`: the request is malformed or non-canonical, or its arguments do not fit the operation;
+- `unsupported-op`: the operation is not in the plugin's registry;
+- `internal`: the plugin failed on a valid request.
+
+The kind travels as the WIT error variant (R0) or the response frame tag (R2). The message travels with it, as UTF-8
+text. An error is not a response: it has no identity, and it is never hashed.
+
+A message is at most **1024 bytes** (`ksci_ops::MAX_ERROR_MESSAGE_BYTES`). Messages can quote the request, such as a
+JSON pointer to a key or the name of an unknown operation, and a request may be 64 MiB. So a longer text is cut:
+
+1. Keep its longest prefix that ends on a UTF-8 character boundary and is at most 1012 bytes long.
+2. Append `" [truncated]"` (12 bytes).
+
+The cut depends only on the text, so one request gives the same error bytes on every implementation, and an error
+always fits in a frame.

@@ -9,7 +9,8 @@
 //!   merged, unreachable nodes dropped, argument order preserved;
 //! - the only Rust JCS encoder ([`to_jcs`], a wrapper over `serde_json_canonicalizer`);
 //! - the only digest helper ([`sha256_hex`]);
-//! - expression identity ([`Table::identity`]) = lowercase-hex SHA-256 of the JCS bytes of the canonical table.
+//! - expression identity ([`Table::identity`]) = lowercase-hex SHA-256 of the JCS bytes of the canonical table;
+//! - the stdio frame codec between a host and a native worker ([`frame`]).
 //!
 //! The contract text is `schema/expr.v1.md`.
 
@@ -23,6 +24,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub mod envelope;
+pub mod frame;
 pub mod numeral;
 
 pub use envelope::{Budget, Provenance, Record, Request, Response, Status};

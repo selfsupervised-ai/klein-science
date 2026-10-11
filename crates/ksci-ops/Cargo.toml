@@ -1,0 +1,15 @@
+[package]
+name = "ksci-ops"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The klein-science op layer: the operation registry, the logical step budget and invoke/plan/map/reduce"
+
+[lints]
+workspace = true
+
+[dependencies]
+ksci-wire = { path = "../ksci-wire" }
+thiserror = { workspace = true }
