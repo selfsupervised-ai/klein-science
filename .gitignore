@@ -2,3 +2,5 @@
 .planning/research/.cache/
 /target
 /.venv
+# Bytecode written when the conformance unit tests run on the host
+__pycache__/
