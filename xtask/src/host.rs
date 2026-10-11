@@ -17,9 +17,9 @@
 //! toolchain's directory, and xtask runs it by that absolute path. It must report that
 //! toolchain's version.
 //!
-//! Every cargo that xtask starts is [`cargo`]: the cargo that invoked xtask (`$CARGO`), else the
-//! pinned toolchain's cargo resolved through rustup. It must be an absolute path and report the
-//! pinned toolchain's version. No pinned binary is ever found by a `PATH` lookup.
+//! Every cargo that xtask starts is [`cargo`]: the pinned toolchain's cargo resolved through
+//! rustup. A `$CARGO` that names any other file is refused, and the cargo must report the pinned
+//! toolchain's version. No pinned binary is ever found by a `PATH` lookup.
 //!
 //! `git`, which the repository guards depend on, is a system tool in the same table
 //! ([`Install::System`]): xtask does not install it, but runs it only from a fixed list of
@@ -518,22 +518,19 @@ impl Cargo {
     }
 }
 
-/// The cargo every xtask child runs: the cargo that invoked xtask (`$CARGO`, set by cargo for
-/// `cargo run` and aliases such as `cargo xtask`), else the pinned toolchain's cargo resolved
-/// through rustup. It must be an absolute path and report the pinned toolchain's version, so a
-/// `cargo` earlier on `PATH`, or a cargo of another toolchain, never stands in for it.
+/// The cargo every xtask child runs: the pinned toolchain's cargo, resolved through rustup
+/// ([`toolchain_bin`]). `$CARGO` (set by cargo for `cargo run` and aliases such as `cargo xtask`)
+/// is checked when set: it must be an absolute path that canonicalises to that same file
+/// ([`check_cargo_env`]). So neither a `cargo` earlier on `PATH`, nor a stale `$CARGO` of another
+/// toolchain, nor a stand-in that prints the pinned version, ever runs. The cargo must also
+/// report the pinned toolchain's version.
 pub fn cargo() -> Res<Cargo> {
     let channel = toolchain_channel()?;
+    let pinned = toolchain_bin("cargo")?;
     let path = match env::var_os("CARGO") {
-        Some(c) => PathBuf::from(c),
-        None => toolchain_bin("cargo")?,
+        Some(c) => check_cargo_env(Path::new(&c), &pinned)?,
+        None => pinned,
     };
-    if !path.is_absolute() {
-        return Err(format!(
-            "CARGO={} is not an absolute path; xtask never looks cargo up on PATH",
-            path.display()
-        ));
-    }
     let out = Command::new(&path)
         .arg("--version")
         .output()
@@ -548,6 +545,28 @@ pub fn cargo() -> Res<Cargo> {
         ));
     }
     Ok(Cargo { path, channel })
+}
+
+/// The pinned cargo, once `$CARGO` (given as `cargo`) is an absolute path that canonicalises to
+/// `pinned`, the canonical path of the pinned toolchain's cargo. The error names both files.
+fn check_cargo_env(cargo: &Path, pinned: &Path) -> Res<PathBuf> {
+    if !cargo.is_absolute() {
+        return Err(format!(
+            "CARGO={} is not an absolute path; xtask never looks cargo up on PATH",
+            cargo.display()
+        ));
+    }
+    let real = fs::canonicalize(cargo).map_err(|e| format!("CARGO={}: {e}", cargo.display()))?;
+    if real != pinned {
+        return Err(format!(
+            "CARGO={} is {}, not the pinned toolchain's cargo {}; run xtask through \
+             `cargo xtask` with the pinned toolchain, or unset CARGO",
+            cargo.display(),
+            real.display(),
+            pinned.display()
+        ));
+    }
+    Ok(real)
 }
 
 fn install() -> Res<()> {
@@ -836,6 +855,33 @@ mod tests {
                 Some(std::ffi::OsStr::new(channel.as_str()))
             )]
         );
+    }
+
+    #[test]
+    fn tools_cargo_env_must_be_the_pinned_file() {
+        let pinned = toolchain_bin("cargo").unwrap();
+        assert_eq!(check_cargo_env(&pinned, &pinned).unwrap(), pinned);
+        let dir = env::temp_dir().join(format!("ksci-xtask-cargo-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A link to the pinned cargo names the same file.
+        #[cfg(unix)]
+        {
+            let link = dir.join("cargo-link");
+            std::os::unix::fs::symlink(&pinned, &link).unwrap();
+            assert_eq!(check_cargo_env(&link, &pinned).unwrap(), pinned);
+        }
+        // Another file is refused whatever it prints, and the error names both files.
+        let stub = dir.join("cargo");
+        fs::write(&stub, "#!/bin/sh\necho 'cargo 1.99.0'\n").unwrap();
+        let err = check_cargo_env(&stub, &pinned).unwrap_err();
+        let stub_real = fs::canonicalize(&stub).unwrap();
+        assert!(err.contains(&stub_real.display().to_string()), "{err}");
+        assert!(err.contains(&pinned.display().to_string()), "{err}");
+        assert!(check_cargo_env(&dir.join("missing"), &pinned).is_err());
+        let err = check_cargo_env(Path::new("cargo"), &pinned).unwrap_err();
+        assert!(err.contains("not an absolute path"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
