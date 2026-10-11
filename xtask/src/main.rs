@@ -6,6 +6,7 @@
 mod check;
 mod ci;
 mod host;
+mod oracle;
 mod store;
 mod workspace;
 
@@ -36,6 +37,9 @@ enum Cmd {
     Check(check::CheckCmd),
     /// Run the CI steps in order under the heavy-job guard.
     Ci,
+    /// Offline oracle images and the one hardened container runner.
+    #[command(subcommand)]
+    Oracle(oracle::OracleCmd),
 }
 
 fn main() -> ExitCode {
@@ -44,6 +48,7 @@ fn main() -> ExitCode {
         Cmd::Tools(cmd) => host::run(cmd),
         Cmd::Check(cmd) => check::run(cmd),
         Cmd::Ci => ci::run(),
+        Cmd::Oracle(cmd) => oracle::run(cmd),
     };
     match result {
         Ok(code) => code,

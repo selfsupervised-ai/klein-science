@@ -1,0 +1,1 @@
+{"images":{"base":{"platforms":{"linux/arm64":{"emulated":false,"identity":"sha256:cf97c3b79da1c706532c7042f851654d97d3b88c8ca6520acda9cf4479ea9b14"}},"reference":"python:3.13-slim-trixie@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f"}},"schema":"ksci.oracle-images.v1"}
