@@ -66,6 +66,37 @@ fn ops_budget_exhausted() {
     assert_eq!(zero, FUEL_EXHAUSTED);
 }
 
+/// The step counting rules of schema/expr.v1.md (Request): one step per input node first entered.
+#[test]
+fn ops_budget_counts_entered_nodes() {
+    let fewest_steps = |table: &str| {
+        let args = format!(r#"{{"expr":{table}}}"#);
+        (0..=10u32)
+            .find(|steps| {
+                let request = request_with("science.cas.canonicalize", &args, &steps.to_string());
+                status(&invoke(&request).unwrap()) == Status::Exact
+            })
+            .expect("at most 10 steps")
+    };
+    // Structurally equal nodes at different indices are each entered.
+    assert_eq!(
+        fewest_steps(r#"{"nodes":[["Sym","x",{}],["Sym","x",{}],["Mul",0,1]],"root":2,"v":1}"#),
+        3
+    );
+    // An index referenced twice is entered once.
+    assert_eq!(
+        fewest_steps(r#"{"nodes":[["Sym","x",{}],["Mul",0,0]],"root":1,"v":1}"#),
+        2
+    );
+    // Unreachable nodes are never entered.
+    assert_eq!(
+        fewest_steps(
+            r#"{"nodes":[["Int","7"],["Sym","y",{}],["Int","3"],["Add",1,2]],"root":3,"v":1}"#
+        ),
+        3
+    );
+}
+
 #[test]
 fn ops_errors() {
     // Non-canonical: a space after the first colon, and the keys out of order.

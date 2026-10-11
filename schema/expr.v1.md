@@ -150,7 +150,12 @@ digests with provenance, which is never inside the hashed bytes.
 
 - `args` maps argument names to node tables (the shape above), for example `{"expr":<table>}`.
 - `budget.steps` is the logical step budget, a step-budget numeral string (`0` to `18446744073709551615`). A JSON
-  number here is rejected.
+  number here is rejected. An operation charges one step per unit of logical work, and when a charge finds no
+  step left the response is `fuel_exhausted`. The count depends only on the request bytes, never on the host, so
+  every implementation stops at the same point. `science.cas.canonicalize` charges one step each time the walk
+  of the canonical form first enters a reachable input node: `x**2 + 1` (5 reachable nodes) is `exact` with
+  `"5"` steps and `fuel_exhausted` with `"4"`. Structurally equal nodes at different indices are each entered,
+  an index referenced twice is entered once, and unreachable nodes are never entered.
 - `op` names the operation, for example `science.cas.canonicalize`.
 - `v` is exactly `1`. Unknown keys are rejected at every level.
 

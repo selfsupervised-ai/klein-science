@@ -102,19 +102,33 @@ pub fn invoke(request_jcs: &[u8]) -> Result<Vec<u8>, OpError> {
     Ok(response)
 }
 
-/// Split a request into pieces. Not yet implemented.
-pub fn plan(_request_jcs: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
-    Err(OpError::Internal("plan is not implemented".into()))
+/// Split a request into pieces for `map`. Phase 1 operations do not split: the one piece is the request itself.
+///
+/// The request is checked as [`invoke`] checks it (canonical form, a known operation), so a bad request fails here
+/// rather than in every piece.
+pub fn plan(request_jcs: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
+    lookup(decode(request_jcs)?.op())?;
+    Ok(vec![request_jcs.to_vec()])
 }
 
-/// Run one piece. Not yet implemented.
-pub fn map(_piece: &[u8]) -> Result<Vec<u8>, OpError> {
-    Err(OpError::Internal("map is not implemented".into()))
+/// Run one piece. A piece is a request, so this is [`invoke`].
+pub fn map(piece: &[u8]) -> Result<Vec<u8>, OpError> {
+    invoke(piece)
 }
 
-/// Combine the outputs of the pieces. Not yet implemented.
-pub fn reduce(_request_jcs: &[u8], _outputs: &[Vec<u8>]) -> Result<Vec<u8>, OpError> {
-    Err(OpError::Internal("reduce is not implemented".into()))
+/// Combine the outputs of the pieces of `request_jcs`. [`plan`] makes exactly one piece, so there must be exactly
+/// one output, a valid response, and it is the result.
+pub fn reduce(request_jcs: &[u8], outputs: &[Vec<u8>]) -> Result<Vec<u8>, OpError> {
+    decode(request_jcs)?;
+    let [output] = outputs else {
+        return Err(OpError::BadRequest(format!(
+            "reduce takes exactly one output, got {}",
+            outputs.len()
+        )));
+    };
+    Response::from_slice(output)
+        .map_err(|e| OpError::BadRequest(format!("the output is not a response: {e}")))?;
+    Ok(output.clone())
 }
 
 /// `science.cas.canonicalize`: the canonical table of `args.expr` and its identity.
