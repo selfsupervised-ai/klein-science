@@ -383,7 +383,7 @@ The operator ruled on 2026-10-11 that the check must judge what rustc actually r
   - Inside the repository, a regular `.rs` file is judged with the same header parser, `PORT_POLICY` and NOTICE cross-check as before.
   - Outside the repository, an input is allowed only under `$CARGO_HOME/registry/src`, `$CARGO_HOME/git/checkouts` or the pinned toolchain's sysroot. Anything else is a violation that names the absolute path.
 - **The rule for non-`.rs` inputs in the repository (decided here).** Data read through `include_str!` or `include_bytes!` is allowed, and not judged as source, only under a `testdata/` directory. That matches the existing no-corpus convention. A non-`.rs` input anywhere else in the repository is a violation: `non-Rust compiler input outside testdata/`.
-  - Build-script output under the provenance target directory (`OUT_DIR`) is allowed. The build script that wrote it is itself a judged input.
+  - ~~Build-script output under the provenance target directory (`OUT_DIR`) is allowed.~~ Superseded by review C1, below: only the `OUT_DIR` of a registry or git dependency is allowed. Everything else under `target/provenance` is judged.
 - **Reporting.** A violation names the real file and the names rustc used for it, for example `review-fixture/witness.rs: no provenance header (rustc read it as crates/ksci-wire/src/review-link/witness.rs)`. Output is sorted by path.
 - **Python side.** It now walks `standin/` on disk, so ignored files are included and there is no git listing. Symbolic links anywhere in `standin/`, the root included, are still refused. The header rules are unchanged.
 - **One mechanism.** The git-listing path for `.rs` files was removed, together with `provenance_in_scope`, `in_checked_tree`, `CHECKED_TREES`, `Entry::Symlink` and their unit tests.
@@ -418,9 +418,64 @@ The operator ruled on 2026-10-11 that the check must judge what rustc actually r
   - All mutations were reverted and the clean tree's rc was 0.
   - The real-tree "before" numbers come from the RED tests above, which run the same constructions against the old binary. I did not rebuild the old binary separately.
 
-**Residual risks, recorded rather than hidden.**
-- **Host cfg only.** The dep-info compile covers only the host target's cfg. A module behind, for example, `#[cfg(target_arch = "wasm32")]` is not read by the host compile, so it is not judged. A second compile for `wasm32-wasip2` (shipped crates only) would close this for R0. It is not done here, because test-only crates such as proptest and rusty-fork are not known to build for wasip2.
-- **testdata/ inputs are not judged.** An `include!` (not `include_str!`) of a file under `testdata/` would compile unjudged code. dep-info does not say which macro read a file.
-- **The Python side has no dep-info equivalent.** A `.py` file outside `standin/`, imported through `sys.path` tricks, is not seen.
+**Tree after W3'.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 107 tests with 107 passing. The residual risks recorded at this point are superseded by the list at the end of the third review below.
 
-**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0. nextest ran 107 tests with 107 passing. `check provenance` reported `13 Rust sources rustc read and 0 standin files judged`. It runs last in ci, with its own compile into `target/provenance`, which took about 4 s on a warm cache. rust-analyzer was unavailable, so every-site claims rest on the clippy and compile enumeration plus ast-grep.
+### Third review: C1, W2, W3, W5 and the wasip2 compile
+
+The re-review of the dep-info rework (Codex gpt-6-astra) returned FAIL with 1 critical and 4 warnings. The orchestrator had confirmed that (a), (a') and (b) give rc 1. The operator also decided to add a second compile for the shipped WASM target.
+
+**Commits.**
+- RED: `1cbfcce` (test). It holds every witness below. 12 failed on their assertions (5 integration, 7 unit), and 3 parser shapes were already rejected.
+- GREEN, one commit per fix: W2 `8e261e5`, W3 `3647dc4`, W5 `c1c1065`, C1 `095b924`, wasip2 `b269beb`.
+
+**C1 (critical): a blanket exemption for the provenance target dir** (`095b924`).
+- The bug: every input under `target/provenance` was skipped before classification.
+- Fix: nothing is exempt for lying there. A file under `target/provenance` is judged like any repository input, and so is the `OUT_DIR` output of a workspace build script, because a headed build script does not vouch for the bytes it generates.
+- The only allowance is cargo's own report. A `build-script-executed` message whose `package_id` starts with `registry+` or `git+` names that dependency's `OUT_DIR`, and its generated code is treated as the dependency's own output, trusted as its source is.
+  - This is needed today: serde, serde_core and thiserror `include!` their generated `out/private.rs`.
+  - It does not extend to any workspace (path) package. No shipped crate has a build script, so the rule fails closed. A shipped crate that needs generated code later is a separate operator decision.
+- Witnesses (RED at 1cbfcce, then GREEN):
+  - `provenance_judges_files_in_its_own_target_dir`: exit 0, then exit 1, `target/provenance/unchecked.rs: no provenance header`.
+  - `provenance_judges_workspace_build_script_output`: a headed `build.rs` writes a headerless `gen.rs` into `OUT_DIR`. Exit 0, then exit 1 naming `target/provenance/debug/build/k-…/out/gen.rs`.
+- Real-tree oracle (headerless `target/provenance/unchecked.rs`, `include!`d from ksci-wire): the orchestrator reproduced rc 0 before. After the fix it gives **rc 1**, with `target/provenance/unchecked.rs: no provenance header (rustc read it as crates/ksci-wire/src/../../../target/provenance/unchecked.rs)`. Reverted; clean tree rc 0.
+
+**W5: the testdata exemption matched the file name** (`c1c1065`).
+- Fix: `under_testdata` looks at ancestor directories only.
+- Witness `provenance_testdata_rule_needs_a_testdata_directory` (`include_bytes!("testdata")` reading the file `crates/k/src/testdata`): exit 0, then exit 1, `outside testdata/`.
+
+**W3: an empty or partial `.d` gave no inputs silently** (`3647dc4`).
+- Fix: `compile_inputs` keeps cargo's `target.src_path` for each artifact. `require_source` requires that artifact's dep-info to list it, comparing real paths, or it errors naming the `.d` file.
+- Witness: the unit test `depinfo_requires_the_artifact_source` covers an empty list and a different source. RED against the stub, which accepted anything; GREEN after. The real tree and every scratch workspace still pass.
+
+**W2: the parser accepted shapes it did not understand** (`8e261e5`).
+- rustc's dep-info escapes only spaces, so the parser accepts only rustc's subset: empty lines, `#` comments, and single-target rules with space-separated words and the `\ ` escape. Anything else is an error naming the line.
+- One test per rejected shape:
+
+| Shape | Test | Before | After |
+|---|---|---|---|
+| second `:` word (`a: b: c`) | `depinfo_rejects_second_colon_word` | accepted (RED) | error |
+| continuation backslash | `depinfo_rejects_continuation_backslash` | accepted (RED) | error |
+| other escape (`\#`) | `depinfo_rejects_unknown_escape` | accepted (RED) | error |
+| escaped backslash (`\\`) | `depinfo_rejects_escaped_backslash` | accepted (RED) | error |
+| tab separator | `depinfo_rejects_tab_separator` | accepted (RED) | error |
+| empty target (`: b`) | `depinfo_rejects_empty_target` | accepted (RED) | error |
+| multi-target rule (`a b: c`) | `depinfo_rejects_multi_target_rule` | error (already) | error |
+| recipe line (tab-indented) | `depinfo_rejects_recipe_line` | error (already) | error |
+| no rule | `depinfo_rejects_line_without_rule` | error (already) | error |
+
+**Operator decision: the wasm32-wasip2 compile** (`b269beb`).
+- `check provenance` runs a second `cargo check --target wasm32-wasip2 --lib --all-features --locked`, with the pinned cargo and the same `target/provenance`, over the R0 crates. Its dep-info is judged under the same rules; the sysroot root covers the wasm target's sysroot.
+- The R0 crate set is one declared list, `[workspace.metadata.ksci] r0-crates` in the workspace `Cargo.toml`, read by `workspace::r0_crates`. Today it holds `ksci-wire`. ksci-ops is not in this branch, so the plan that adds it must add it to this list. A missing or empty list is an error.
+- Witnesses (RED at 1cbfcce, then GREEN):
+  - `provenance_judges_the_wasm_build`, a `#[cfg(target_arch = "wasm32")]` module with a headerless file: exit 0, then exit 1.
+  - `provenance_requires_declared_r0_crates`: exit 0, then exit 1 with an `r0-crates` error.
+- Real-tree oracle (`#[cfg(target_arch = "wasm32")] pub mod wasm_only;` plus a headerless `wasm_only.rs` in ksci-wire): **rc 1** after, `crates/ksci-wire/src/wasm_only.rs: no provenance header`. The "before" is the RED test, because the host-only compile never reads that module. Reverted.
+
+**Every-site evidence** for the `compile_inputs` signature change and the new `r0_crates` / `r0_selection`: ast-grep finds the two `depinfo::compile_inputs` calls in `check::rust_inputs` (HOST and R0), one `workspace::r0_crates` call and one `depinfo::r0_selection` call. The workspace clippy compile is clean. rust-analyzer was still unavailable.
+
+**Accepted known gaps.** These are recorded and not implemented. The host-cfg-only gap is closed by the wasip2 compile and has been removed from this list.
+- **Doctests are not enumerated (review W4, accepted).** `cargo check --all-targets` does not compile doctests, so a file read only by a doctest (`include!` in a doc example) is not judged. Doctests are never shipped.
+- **`include!` of a `testdata/` file** would compile unjudged code. dep-info does not record which macro read a file, and testdata inputs are allowed unjudged as data.
+- **Python outside `standin/`.** There is no dep-info equivalent for Python. A `.py` file outside `standin/`, imported through `sys.path` tricks, is not seen.
+
+**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 122 tests with 122 passing. `check provenance` reported `13 Rust sources rustc read (host, all targets; wasm32-wasip2, R0 libs) and 0 standin files judged`.
