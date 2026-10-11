@@ -2,3 +2,4 @@
 .planning/research/.cache/
 /target
 /.venv
+__pycache__/
