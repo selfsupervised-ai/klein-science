@@ -288,12 +288,13 @@ fn provenance() -> Res<ExitCode> {
     let root = fs::canonicalize(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     let notice = fs::read_to_string(root.join(NOTICE_FILE))
         .map_err(|e| format!("provenance: {NOTICE_FILE}: {e}"))?;
-    let mut judged = rust_inputs(&root)?;
-    let rust = judged.len();
-    judged.extend(standin_files(&root)?);
-    let found = provenance_violations(&judged, &notice);
-    for v in &found {
-        println!("{v}");
+    let (rust, mut found) = rust_compiles(&root, &notice)?;
+    let standin = standin_files(&root)?;
+    found.extend(violation_lines(&standin, &notice));
+    found.sort();
+    found.dedup();
+    for (_, line) in &found {
+        println!("{line}");
     }
     if found.is_empty() {
         let blocks = notice
@@ -301,9 +302,9 @@ fn provenance() -> Res<ExitCode> {
             .filter(|l| l.starts_with("Project: "))
             .count();
         println!(
-            "provenance ok, {rust} Rust sources rustc read (host, all targets; wasm32-wasip2, R0 libs) and {} standin files judged in {}, \
-             {NOTICE_FILE} has {blocks} Project blocks",
-            judged.len() - rust,
+            "provenance ok, {rust} Rust sources rustc read (host, all targets; wasm32-wasip2, R0 \
+             libs) and {} standin files judged in {}, {NOTICE_FILE} has {blocks} Project blocks",
+            standin.len(),
             root.display()
         );
         Ok(ExitCode::SUCCESS)
@@ -319,6 +320,19 @@ fn provenance() -> Res<ExitCode> {
     }
 }
 
+/// Each judged path's violations as `(path, line)` pairs, so lines from several compiles merge
+/// into one list sorted by path.
+fn violation_lines(judged: &[Judged], notice: &str) -> Vec<(String, String)> {
+    judged
+        .iter()
+        .flat_map(|j| {
+            provenance_violations(std::slice::from_ref(j), notice)
+                .into_iter()
+                .map(|line| (j.path.clone(), line))
+        })
+        .collect()
+}
+
 /// Whether `rel` lies under a directory named exactly `testdata` (review W5): only ancestor
 /// directories count, never the file name itself.
 fn under_testdata(rel: &Path) -> bool {
@@ -326,8 +340,31 @@ fn under_testdata(rel: &Path) -> bool {
         .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "testdata"))
 }
 
-/// The Rust side: every input of the workspace compile ([`depinfo::compile_inputs`]), resolved
-/// to its real path (links followed: rustc read the target), and classified.
+/// The Rust side: two compiles, the host compile of the whole workspace ([`depinfo::HOST`]) and
+/// the R0 compile for wasm32-wasip2 ([`depinfo::r0_selection`]), so code behind a wasm-only cfg
+/// is read and judged too. Each compile's inputs are classified, read and judged immediately
+/// after that compile and before the next one starts (review W-A): a build script that rewrites
+/// a source between the two compiles cannot have one compile's bytes judged in place of the
+/// other's. Returns the number of distinct Rust sources judged and the violation lines.
+fn rust_compiles(root: &Path, notice: &str) -> Res<(usize, Vec<(String, String)>)> {
+    let target = root.join(PROVENANCE_TARGET);
+    let external = external_roots()?;
+    let host: Vec<String> = depinfo::HOST.iter().map(|s| (*s).to_owned()).collect();
+    let r0 = depinfo::r0_selection(root)?;
+    let mut sources = BTreeSet::new();
+    let mut found = Vec::new();
+    for selection in [host, r0] {
+        let compiled = depinfo::compile_inputs(root, &target, &selection)?;
+        let exempt = dependency_roots(root, &target, &compiled.dependency_out_dirs)?;
+        let judged = classify_inputs(root, &compiled.inputs, &exempt, &external)?;
+        found.extend(violation_lines(&judged, notice));
+        sources.extend(judged.into_iter().map(|j| j.path));
+    }
+    Ok((sources.len(), found))
+}
+
+/// Classifies one compile's inputs, each resolved to its real path (links followed: rustc read
+/// the target), reading the bytes of every judged source now.
 ///
 /// - Inside the repository, a regular `.rs` file is judged by its header. A non-`.rs` input
 ///   (`include_str!`/`include_bytes!` data) is allowed, unjudged, only under a `testdata/`
@@ -335,39 +372,26 @@ fn under_testdata(rel: &Path) -> bool {
 ///   target directory (review C1): a file there, including the `OUT_DIR` output of a workspace
 ///   build script, is judged like any other input; a headed build script does not vouch for the
 ///   bytes it generates.
-/// - The `OUT_DIR` output of a registry or git dependency's build script
-///   ([`depinfo::Compiled::dependency_out_dirs`]) is that dependency's own output and is allowed,
-///   as its source is.
+/// - The `OUT_DIR` output of a registry or git dependency's build script (`exempt`, from
+///   [`dependency_roots`]) is that dependency's own output and is allowed, as its source is
+///   (operator decision 2026-10-11).
 /// - Outside the repository, an input is allowed only under the cargo registry sources, the cargo
-///   git checkouts or the pinned toolchain's sysroot; anything else is a violation.
+///   git checkouts or the pinned toolchain's sysroot (`external`); anything else is a violation.
 ///
 /// One real file read under several names is judged once, its other names noted.
-fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
-    let target = root.join(PROVENANCE_TARGET);
-    // Two compiles, judged under the same rules: the host compile of the whole workspace, and
-    // the R0 compile for wasm32-wasip2, so code behind a wasm-only cfg is read and judged too.
-    let r0 = depinfo::r0_selection(root)?;
-    let mut inputs = BTreeSet::new();
-    let mut dependency_output = Vec::new();
-    for compiled in [
-        depinfo::compile_inputs(root, &target, depinfo::HOST)?,
-        depinfo::compile_inputs(root, &target, &r0)?,
-    ] {
-        inputs.extend(compiled.inputs);
-        dependency_output.extend(dependency_roots(
-            root,
-            &target,
-            &compiled.dependency_out_dirs,
-        )?);
-    }
-    let external = external_roots()?;
+fn classify_inputs(
+    root: &Path,
+    inputs: &[PathBuf],
+    exempt: &[PathBuf],
+    external: &[PathBuf],
+) -> Res<Vec<Judged>> {
     let mut by_path: BTreeMap<String, Judged> = BTreeMap::new();
     for input in inputs {
         let written = input.display().to_string();
         let abs = if input.is_absolute() {
-            input
+            input.clone()
         } else {
-            root.join(&input)
+            root.join(input)
         };
         let (path, entry) = match fs::canonicalize(&abs) {
             Err(e) => (
@@ -376,7 +400,7 @@ fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
                     "compiler input cannot be resolved: {e}"
                 ))),
             ),
-            Ok(real) if dependency_output.iter().any(|d| real.starts_with(d)) => continue,
+            Ok(real) if exempt.iter().any(|d| real.starts_with(d)) => continue,
             Ok(real) => match real.strip_prefix(root) {
                 Ok(rel) => {
                     let rel = rel.display().to_string();
