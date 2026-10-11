@@ -121,36 +121,58 @@ pub fn dep_info_path(artifact: &Path) -> Res<PathBuf> {
     }
 }
 
-/// Every prerequisite path of a rustc dep-info file (Makefile rules `<target>: <input>...`, with
-/// spaces in paths written `\ `; `#` lines are comments such as `# env-dep:`).
+/// Every prerequisite path of a rustc dep-info file.
+///
+/// rustc writes a small, fixed subset of Makefile syntax, and only that subset is accepted (review
+/// W2): empty lines, `#` comment lines (`# env-dep:`, `# checksum:`), and single-target rules
+/// `<target>: <input> <input>...` whose words are separated by single spaces, with a space inside
+/// a path written `\ ` (the only escape rustc emits). Anything else is an error rather than a
+/// guess: a second target or any other `:` in a word, a continuation backslash, any other `\`
+/// escape, a tab (recipe lines, tab separators) or a carriage return.
 pub fn parse_dep_info(text: &str) -> Res<Vec<PathBuf>> {
     let mut inputs = Vec::new();
-    for line in text.lines() {
+    for line in text.split('\n') {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut words = split_words(line).into_iter();
-        let target = words.next().unwrap_or_default();
-        if !target.ends_with(':') {
-            return Err(format!("malformed dep-info rule {line:?}"));
+        let bad = |why: &str| Err(format!("unrecognised dep-info line {line:?}: {why}"));
+        if line.contains(['\t', '\r']) {
+            return bad("tab or carriage return");
         }
-        inputs.extend(words.map(PathBuf::from));
+        if line.ends_with('\\') {
+            return bad("continuation backslash");
+        }
+        let mut words = split_words(line)
+            .map_err(|why| format!("unrecognised dep-info line {line:?}: {why}"))?
+            .into_iter();
+        let target = words.next().unwrap_or_default();
+        match target.strip_suffix(':') {
+            Some(name) if !name.is_empty() && !name.contains(':') => {}
+            _ => return bad("not a single-target rule `<target>: <inputs>`"),
+        }
+        for word in words {
+            if word.contains(':') {
+                return bad("a second `:` (multi-target rule or a path with a colon)");
+            }
+            inputs.push(PathBuf::from(word));
+        }
     }
     Ok(inputs)
 }
 
-/// Splits a dep-info line at unescaped spaces; `\ ` is a space inside a path.
-fn split_words(line: &str) -> Vec<String> {
+/// Splits a dep-info line at spaces; `\ ` is a space inside a path, and any other backslash is
+/// an error.
+fn split_words(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
-    let mut chars = line.chars().peekable();
+    let mut chars = line.chars();
     while let Some(c) = chars.next() {
         match c {
-            '\\' if chars.peek() == Some(&' ') => {
-                word.push(' ');
-                chars.next();
-            }
-            ' ' | '\t' => {
+            '\\' => match chars.next() {
+                Some(' ') => word.push(' '),
+                other => return Err(format!("unrecognised escape `\\{}`", other.unwrap_or(' '))),
+            },
+            ' ' => {
                 if !word.is_empty() {
                     words.push(std::mem::take(&mut word));
                 }
@@ -161,7 +183,7 @@ fn split_words(line: &str) -> Vec<String> {
     if !word.is_empty() {
         words.push(word);
     }
-    words
+    Ok(words)
 }
 
 /// Checks that one artifact's dep-info inputs (as written, relative to `root`) include the
