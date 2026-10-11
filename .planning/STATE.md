@@ -4,15 +4,15 @@ current_phase: 01
 current_phase_name: Contracts, Oracles and Risk Probes
 status: executing
 stopped_at: Phase 1 context gathered
-last_updated: "2026-10-11T22:14:56.526Z"
+last_updated: "2026-10-11T23:34:40.651Z"
 last_activity: 2026-10-11
 last_activity_desc: Phase 01 execution resumed (wave continue)
-state_head: 864320585cf98895bcaf3ad0b47445812e3d2824
+state_head: e5c5dc2159ad0e82efb0bd58217d5910cef796d4
 progress:
   total_phases: 6
   completed_phases: 0
   total_plans: 18
-  completed_plans: 8
+  completed_plans: 10
   percent: 0
 ---
 
@@ -69,6 +69,7 @@ Recent decisions affecting current work:
   lands here, before the first `certifiable=true` result.
 - Phase 5: `lambdify` sits with `science.numerics`. `fuel_exhausted` comes only from the logical step budget (fixed in
   Phase 1).
+- [Phase 01]: CubeCL persistence (01-11): accept the probe's runtime guard (caches off in CubeCL runtime config, scratch root, exit 1 on any write) because cubecl-wgpu -> cubecl-cpp default features force the feature on; revisit at the dependency level (feature pin/patch) in 01-15. Operator-delegated recommended option, 2026-10-12.
 
 ### Pending Todos
 
