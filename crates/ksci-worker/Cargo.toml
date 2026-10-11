@@ -1,0 +1,15 @@
+[package]
+name = "ksci-worker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The R2 native worker: stdio frames in, ksci-ops, stdio frames out"
+
+[lints]
+workspace = true
+
+[dependencies]
+ksci-wire = { path = "../ksci-wire" }
+ksci-ops = { path = "../ksci-ops" }

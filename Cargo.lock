@@ -270,6 +270,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "ksci-ops"
+version = "0.1.0"
+dependencies = [
+ "ksci-wire",
+ "thiserror",
+]
+
+[[package]]
 name = "ksci-wire"
 version = "0.1.0"
 dependencies = [
@@ -280,6 +288,14 @@ dependencies = [
  "sha2",
  "static_assertions",
  "thiserror",
+]
+
+[[package]]
+name = "ksci-worker"
+version = "0.1.0"
+dependencies = [
+ "ksci-ops",
+ "ksci-wire",
 ]
 
 [[package]]
