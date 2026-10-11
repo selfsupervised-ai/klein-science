@@ -8,32 +8,114 @@
 //! The logical step budget ([`StepBudget`]) is the only source of a `fuel_exhausted` response. Host limits (Wasmtime
 //! fuel, memory, wall time) are host errors and never decide a result status.
 
+use std::fmt::{self, Write as _};
 use std::ops::ControlFlow;
 
 use ksci_wire::{MAX_DOCUMENT_BYTES, Request, Response};
 
-/// The longest error message, in bytes. Not yet enforced.
+/// The longest error message, in bytes (schema/expr.v1.md, Errors).
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// What a cut message ends with.
+const TRUNCATED: &str = " [truncated]";
+
+/// An error message of at most [`MAX_ERROR_MESSAGE_BYTES`] bytes (review W1).
+///
+/// Error text can quote the request (a JSON pointer names a key, an unknown op is named), and a request may be
+/// 64 MiB. So a text longer than the bound keeps its longest prefix that ends on a character boundary and leaves room
+/// for `" [truncated]"`, which is appended. The cut depends only on the text, so one request always gives one error
+/// byte string. The text is cut while it is formatted, so an oversized echo is never built. The field is private:
+/// every message is bounded by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message(String);
+
+impl Message {
+    /// The bounded message for `text`.
+    pub fn new(text: impl fmt::Display) -> Message {
+        let mut out = Bounded {
+            text: String::new(),
+            cut: false,
+        };
+        write!(out, "{text}").expect("Bounded never fails");
+        if out.cut {
+            let keep = out
+                .text
+                .floor_char_boundary(MAX_ERROR_MESSAGE_BYTES - TRUNCATED.len());
+            out.text.truncate(keep);
+            out.text.push_str(TRUNCATED);
+        }
+        Message(out.text)
+    }
+
+    /// The message text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for Message {
+    fn from(text: &str) -> Message {
+        Message::new(text)
+    }
+}
+
+impl From<String> for Message {
+    fn from(text: String) -> Message {
+        Message::new(text)
+    }
+}
+
+/// A formatter sink that keeps at most [`MAX_ERROR_MESSAGE_BYTES`] bytes, cut on a character boundary, and records
+/// whether anything was dropped.
+struct Bounded {
+    text: String,
+    cut: bool,
+}
+
+impl fmt::Write for Bounded {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.cut {
+            // Nothing after a cut reaches the message: Message::new keeps at most MAX - " [truncated]" bytes, and a
+            // cut leaves at least MAX - 3. Stop early so the kept text is plainly a prefix.
+            return Ok(());
+        }
+        let room = MAX_ERROR_MESSAGE_BYTES - self.text.len();
+        if s.len() <= room {
+            self.text.push_str(s);
+        } else {
+            self.text.push_str(&s[..s.floor_char_boundary(room)]);
+            self.cut = true;
+        }
+        Ok(())
+    }
+}
 
 /// Why an operation produced no response.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OpError {
     /// The request is malformed, non-canonical, or its arguments do not fit the operation.
     #[error("bad request: {0}")]
-    BadRequest(String),
+    BadRequest(Message),
     /// The request names an operation that is not in the registry.
     #[error("unsupported op: {0}")]
-    UnsupportedOp(String),
+    UnsupportedOp(Message),
     /// The operation failed on a valid request.
     #[error("internal error: {0}")]
-    Internal(String),
+    Internal(Message),
 }
 
 impl OpError {
-    /// The message without its kind, for a shell that carries the kind separately (a frame tag, a WIT variant).
+    /// The message without its kind, for a shell that carries the kind separately (a frame tag, a WIT variant). At
+    /// most [`MAX_ERROR_MESSAGE_BYTES`] bytes.
     pub fn message(&self) -> &str {
         match self {
-            OpError::BadRequest(m) | OpError::UnsupportedOp(m) | OpError::Internal(m) => m,
+            OpError::BadRequest(m) | OpError::UnsupportedOp(m) | OpError::Internal(m) => m.as_str(),
         }
     }
 }
@@ -81,12 +163,12 @@ fn lookup(name: &str) -> Result<Op, OpError> {
     OPS.iter()
         .find(|(n, _)| *n == name)
         .map(|(_, op)| *op)
-        .ok_or_else(|| OpError::UnsupportedOp(name.to_owned()))
+        .ok_or_else(|| OpError::UnsupportedOp(Message::new(name)))
 }
 
 /// Decode a request, which must be in canonical form, so that one request has one byte string and one digest.
 fn decode(request_jcs: &[u8]) -> Result<Request, OpError> {
-    Request::from_canonical_slice(request_jcs).map_err(|e| OpError::BadRequest(e.to_string()))
+    Request::from_canonical_slice(request_jcs).map_err(|e| OpError::BadRequest(Message::new(e)))
 }
 
 /// Run a request: decode it, look up its operation, run it within the request's step budget and return the
@@ -97,10 +179,10 @@ pub fn invoke(request_jcs: &[u8]) -> Result<Vec<u8>, OpError> {
     let mut budget = StepBudget::new(request.budget().steps());
     let response = op(&request, &mut budget)?.to_jcs();
     if response.len() > MAX_DOCUMENT_BYTES {
-        return Err(OpError::Internal(format!(
+        return Err(OpError::Internal(Message::new(format_args!(
             "the response is {} bytes, above the {MAX_DOCUMENT_BYTES}-byte cap",
             response.len()
-        )));
+        ))));
     }
     Ok(response)
 }
@@ -124,13 +206,16 @@ pub fn map(piece: &[u8]) -> Result<Vec<u8>, OpError> {
 pub fn reduce(request_jcs: &[u8], outputs: &[Vec<u8>]) -> Result<Vec<u8>, OpError> {
     decode(request_jcs)?;
     let [output] = outputs else {
-        return Err(OpError::BadRequest(format!(
+        return Err(OpError::BadRequest(Message::new(format_args!(
             "reduce takes exactly one output, got {}",
             outputs.len()
-        )));
+        ))));
     };
-    Response::from_slice(output)
-        .map_err(|e| OpError::BadRequest(format!("the output is not a response: {e}")))?;
+    Response::from_slice(output).map_err(|e| {
+        OpError::BadRequest(Message::new(format_args!(
+            "the output is not a response: {e}"
+        )))
+    })?;
     Ok(output.clone())
 }
 

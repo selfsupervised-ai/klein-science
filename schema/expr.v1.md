@@ -212,3 +212,23 @@ canonical byte string, and that string is what a record hashes.
 Only request bytes and response bytes are hashed. Provenance lives only in the record, and the request and response
 schemas reject a `provenance` key, so implementation, backend, device, driver and wall time can never change a
 digest.
+
+### Errors
+
+A request that yields no response yields an error instead. Its kind is one of:
+
+- `bad-request`: the request is malformed or non-canonical, or its arguments do not fit the operation;
+- `unsupported-op`: the operation is not in the plugin's registry;
+- `internal`: the plugin failed on a valid request.
+
+The kind travels as the WIT error variant (R0) or the response frame tag (R2). The message travels with it, as UTF-8
+text. An error is not a response: it has no identity, and it is never hashed.
+
+A message is at most **1024 bytes** (`ksci_ops::MAX_ERROR_MESSAGE_BYTES`). Messages can quote the request, such as a
+JSON pointer to a key or the name of an unknown operation, and a request may be 64 MiB. So a longer text is cut:
+
+1. Keep its longest prefix that ends on a UTF-8 character boundary and is at most 1012 bytes long.
+2. Append `" [truncated]"` (12 bytes).
+
+The cut depends only on the text, so one request gives the same error bytes on every implementation, and an error
+always fits in a frame.
