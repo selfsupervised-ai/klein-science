@@ -547,6 +547,18 @@ fn pinned_tool(name: &str) -> Res<PathBuf> {
     }
 }
 
+/// The shipped worker of the checkout at `root` for the pinned toolchain's host triple:
+/// `target/dist/<host-triple>/ksci-worker`, as `dist` lays it out. It may not exist yet.
+pub fn shipped_worker(root: &Path) -> Res<PathBuf> {
+    let rustc = host::toolchain_bin("rustc")?;
+    let rustc_vv = output_text(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
+    Ok(root
+        .join("target")
+        .join("dist")
+        .join(host_triple(&rustc_vv)?)
+        .join(format!("{WORKER}{}", std::env::consts::EXE_SUFFIX)))
+}
+
 /// The `host:` line of `rustc -vV`.
 fn host_triple(rustc_vv: &str) -> Res<String> {
     rustc_vv

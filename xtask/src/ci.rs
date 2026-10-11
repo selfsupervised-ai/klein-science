@@ -5,7 +5,9 @@
 //! Every Rust step is a cargo command, run by the absolute path [`host::cargo`] resolves and
 //! version-checks once before the first step: never a `cargo` found on `PATH`. The Python suites
 //! run on the dev venv's own interpreter (`.venv/bin/python` of the checkout), which the
-//! `tools venv` step creates and syncs to the hash-locked dev.lock just before them.
+//! `tools venv` step creates and syncs to the hash-locked dev.lock just before them. They run
+//! against the shipped worker (`KSCI_WORKER`, [`release::shipped_worker`]): the bytes the
+//! `release dist` step has just built twice and gated.
 //!
 //! `ci` holds the heavy-job lock for the whole run, and tells each step so
 //! ([`host::HEAVY_JOB_HELD`]): a step that takes the guard itself (`release dist`) then runs
@@ -15,7 +17,7 @@ use std::process::{Command, ExitCode};
 
 use crate::Res;
 use crate::host::{self, heavy_job};
-use crate::workspace;
+use crate::{release, workspace};
 
 /// What a step runs.
 pub enum Program {
@@ -124,12 +126,17 @@ pub fn run() -> Res<ExitCode> {
     let root = workspace::root()?;
     let cargo = host::cargo()?;
     let python = root.join(".venv").join("bin").join("python");
+    let worker = release::shipped_worker(&root)?;
     println!("ci: cargo is {}", cargo.path.display());
     let _held = heavy_job()?;
     for step in STEPS {
         let mut cmd = match step.program {
             Program::Cargo => cargo.command(),
-            Program::VenvPython => Command::new(&python),
+            Program::VenvPython => {
+                let mut cmd = Command::new(&python);
+                cmd.env("KSCI_WORKER", &worker);
+                cmd
+            }
         };
         cmd.args(step.args)
             .envs(step.env.iter().copied())
