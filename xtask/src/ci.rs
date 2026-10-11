@@ -29,6 +29,20 @@ pub const STEPS: &[(&str, &[&str])] = &[
             "warnings",
         ],
     ),
+    // LIC-01, DET-08: licences, banned crates, advisories and sources of the shipped graph
+    // (deny.toml).
+    (
+        "deny",
+        &[
+            "cargo",
+            "deny",
+            "check",
+            "advisories",
+            "bans",
+            "licenses",
+            "sources",
+        ],
+    ),
     (
         "store fetch rfc8785",
         &[
@@ -44,6 +58,13 @@ pub const STEPS: &[(&str, &[&str])] = &[
         &["cargo", "nextest", "run", "--workspace", "--locked"],
     ),
     ("check no-corpus", &["cargo", "xtask", "check", "no-corpus"]),
+    // LIC-02: provenance headers against the licence policy and NOTICE, on the files rustc
+    // read. It runs its own all-targets, all-features `cargo check` into target/provenance, so
+    // it depends on no earlier step's build; it runs last, after the cheaper guards.
+    (
+        "check provenance",
+        &["cargo", "xtask", "check", "provenance"],
+    ),
 ];
 
 /// Runs every step from the workspace root and stops at the first failure.

@@ -28,7 +28,7 @@ v1 = milestones M0–M5 (roadmap phases 1–6). M6, the parity long tail, is v2.
       driver, and audit replay serves the recorded value.
 - [ ] **DET-07**: Multiprecision `evalf` (the mpmath port) is deterministic-approximate: tagged approximate but
       conformance-gated byte-identical across R0/R1/R2 like exact results.
-- [ ] **DET-08**: Maths crates contain no randomly seeded hash map iteration, no ordering by interning id, and no
+- [x] **DET-08**: Maths crates contain no randomly seeded hash map iteration, no ordering by interning id, and no
       randomness not seeded from the request digest (enforced by lint and `cargo-deny`).
 
 ### Conformance and oracles (CONF)
@@ -48,7 +48,7 @@ v1 = milestones M0–M5 (roadmap phases 1–6). M6, the parity long tail, is v2.
 
 ### Licence and provenance (LIC)
 
-- [ ] **LIC-01**: `cargo-deny` rejects GPL/LGPL and banned crates (`rug`, `gmp-mpfr-sys`, `malachite*`, `flint-sys`,
+- [x] **LIC-01**: `cargo-deny` rejects GPL/LGPL and banned crates (`rug`, `gmp-mpfr-sys`, `malachite*`, `flint-sys`,
       `algebraeon`, `symbolica`) and has been seen RED on a deliberate violation.
 - [ ] **LIC-02**: Every ported algorithm module carries a provenance header naming its permissive source, and `NOTICE`
       carries the upstream notices.
@@ -261,14 +261,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DET-05 | Phase 2 | Pending |
 | DET-06 | Phase 5 | Pending |
 | DET-07 | Phase 2 | Pending |
-| DET-08 | Phase 1 | Pending |
+| DET-08 | Phase 1 | Complete |
 | CONF-01 | Phase 1 | Pending |
 | CONF-02 | Phase 1 | Pending |
 | CONF-03 | Phase 1 | Pending |
 | CONF-04 | Phase 3 | Pending |
 | CONF-05 | Phase 4 | Pending |
 | CONF-06 | Phase 1 | Pending |
-| LIC-01 | Phase 1 | Pending |
+| LIC-01 | Phase 1 | Complete |
 | LIC-02 | Phase 1 | Pending |
 | DEP-01 | Phase 1 | Pending |
 | DEP-02 | Phase 1 | Pending |

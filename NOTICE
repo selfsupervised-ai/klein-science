@@ -1,0 +1,24 @@
+klein-science
+Copyright 2026 Arijit Das and contributors
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+Ported code notices
+===================
+
+Some source files are ported from other projects. Each such file starts with a provenance header
+of the form
+
+    provenance: port <project>@<tag>:<upstream-path> (<SPDX>)
+
+and `cargo xtask check provenance` accepts it only when <project> is in the licence policy
+(SymPy, mpmath, Diofant and FriCAS under BSD-3-Clause; SymEngine under MIT) and this file has a
+block for it.
+
+Each block starts with a line that is exactly `Project: {name}`, where {name} is the project name
+used in the provenance headers (for example `Project: sympy`). The block then carries that
+project's copyright and licence notice verbatim, as the upstream licence requires. A block is added
+by the plan that lands the first port from that project.
+
+There are no ported files yet, so there are no blocks below.

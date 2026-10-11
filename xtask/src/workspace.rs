@@ -62,6 +62,37 @@ pub fn check_workspace(dir: &Path) -> Res<()> {
     }
 }
 
+/// The crates that go into the R0 (WASM) artifact: the one declared list
+/// `[workspace.metadata.ksci] r0-crates` in the workspace `Cargo.toml` at `root`. A missing,
+/// empty or malformed list is an error, never an empty selection.
+pub fn r0_crates(root: &Path) -> Res<Vec<String>> {
+    let path = root.join("Cargo.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let missing = || {
+        format!(
+            "{}: no non-empty `[workspace.metadata.ksci] r0-crates` list of package names; the \
+             R0 (wasm32-wasip2) crates must be declared there",
+            path.display()
+        )
+    };
+    let list = doc
+        .get("workspace")
+        .and_then(|w| w.get("metadata"))
+        .and_then(|m| m.get("ksci"))
+        .and_then(|k| k.get("r0-crates"))
+        .and_then(|l| l.as_array())
+        .ok_or_else(missing)?;
+    let names: Vec<String> = list
+        .iter()
+        .map(|v| v.as_str().map(str::to_owned).ok_or_else(missing))
+        .collect::<Res<_>>()?;
+    if names.is_empty() {
+        return Err(missing());
+    }
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
