@@ -21,11 +21,11 @@ provides:
 affects: [01-07 strata and extraction image, 01-10 goldens, 01-12 stand-in name table, 01-13 stand-in baseline, 01-17 census]
 
 actuals:
-  tokens: 27400
+  tokens: 31900
   tasks: 3
-  commits: 10
+  commits: 13
 plan_head_before: 46c5bc6e6e4a686f4fa0ee7726e84e465f0112d7
-plan_head_after: 2c5ed903a990a0d8950385bf50843c19b2955f33
+plan_head_after: 4904a85709a2b8eb9fb0732ba9aadc6debfa8454
 
 tech-stack:
   added: [docker 28.3.3 (pinned system tool), docker buildx, "python:3.13-slim-trixie@sha256:70729b46…", sympy 1.14.0 (oracle image only), mpmath 1.3.0 (oracle image only)]
@@ -51,6 +51,7 @@ key-files:
     - testdata/programs/review-r1-parent.jsonl
     - testdata/programs/review-r1-sibling.jsonl
     - testdata/programs/review-r2.jsonl
+    - testdata/programs/review-pids.jsonl
     - conformance/oracles/launch.py
     - xtask/tests/oracle_review.rs
   modified:
@@ -70,6 +71,7 @@ key-decisions:
   - "Review R1 (operator decision 2026-10-11): distinct uid per case. The container starts as root with exactly CAP_SETUID, CAP_SETGID and CAP_KILL; launch.py drops in-process to uid 65534, keeping them; each case runs as 100000 + a case_id-derived offset with no groups and no capabilities"
   - "Review R1: CAP_KILL is added because signalling another uid needs it; /proc hidepid=2 is not possible without CAP_SYS_ADMIN (measured EPERM), so it is not done"
   - "Review R2: ok needs a completion marker on a token- and pid-stamped status channel; the exception type is read through type's own descriptors, and the message is untrusted with deterministic placeholders"
+  - "Review round 3: the container task budget is an invariant. xtask's PIDS_LIMIT is the one source (--pids-limit and KSCI_PIDS_LIMIT); RLIMIT_NPROC per case is a fixed 64, so records never depend on --jobs; --jobs is clamped deterministically so 8 + jobs * (3 + 64) <= limit"
 
 patterns-established:
   - "Witness by probe: own-authored adversarial programs (network, rootfs, mounts, limits, symlink in /out) run through the real runner, kept out of git"
@@ -489,6 +491,56 @@ Each fix went test-first. The RED witnesses were committed first in `2969217`, f
 - `cargo xtask check no-corpus` reports no violations, and `cargo xtask ci` reports "all 6 steps passed".
 - rust-analyzer was unavailable again. Every-site checks used ast-grep plus compiler enumeration.
 
+## Review fixes, round 3 (Codex gpt-6-astra, held to the threat model: R1 and R2 confirmed; one WARNING, one NOTE)
+
+| Commit | What |
+|---|---|
+| `b721d71` | test(01-05): RED witnesses, a new pid-budget fixture and test, and a deterministic sibling witness |
+| `4904a85` | fix(01-05): the container task budget is an invariant; thread starts are covered |
+
+### WARNING: the pid budget
+
+- **Finding.** RLIMIT_NPROC per case was at least 16, but `--jobs` was unbounded against the container's 512-task limit, which the harness's own threads also draw on. And `feeder.start()` and `exc_reader.start()` ran before the cleanup try/finally.
+- **RED, current runner `3841f1f`.** `--jobs 32` with `review-pids.jsonl`: 31 hogs each hold 15 sleeping children, and a control starts a subprocess after 1.5 s.
+  - The control was recorded error `BlockingIOError "[Errno 11] Resource temporarily unavailable: '/usr/local/bin/python3'"`.
+  - Hogs 18, 19, 20, 22 and 24 got only 0, 10, 3, 11 and 2 of their 15 children, depending on timing.
+  - Records `ca80f158…`.
+- **Fix.**
+  - **One source:** xtask's `PIDS_LIMIT` (512) emits `--pids-limit` and passes `KSCI_PIDS_LIMIT` into the container.
+  - **Fixed per-case limit:** RLIMIT_NPROC per case uid is the constant 64. What a case may start therefore never depends on `--jobs`, and neither do its records.
+  - **Startup invariant:** `8 (init, main thread, headroom) + jobs × (3 harness threads per job + 64) ≤ KSCI_PIDS_LIMIT`. `--jobs` is clamped deterministically; at 512 the largest that fits is 7.
+  - **Batch-fatal (exit 4):** a missing `KSCI_PIDS_LIMIT`, or one that fits no worker.
+  - **run.json** records `pids` (`limit`, `harness_tasks_fixed`, `harness_tasks_per_job`, `nproc_per_case`, `jobs_requested`, `jobs_max`, `jobs_effective`) and the effective `jobs`.
+  - **Thread starts:** the feeder and status-reader threads now start inside the cleanup try/finally. A thread that cannot start ends the case (kill, reap, sweep), its pipe end is closed, and the case is recorded as `HarnessError`.
+- **GREEN.** Same input at `--jobs 32`: `jobs_requested 32, jobs_effective 7`; all 31 hogs `forked 15`; control ok `control 42 0`; records `6eef2f31…`. At `--jobs 4` the records are byte-identical (`6eef2f31…`).
+- **Mutation witness.** With `exc_reader.start()` replaced by a raise, all 8 smoke cases were recorded `HarnessError "RuntimeError: can't start new thread (mutation)"`, and the batch completed (exit 0). Reverted, confirmed with `cmp`.
+
+### NOTE: the sibling witness was timing-dependent
+
+- **Fix.** `review-r1-sibling.jsonl` is now a handshake:
+  - each victim creates `/tmp/ksci-victim-<i>` and waits for `/tmp/ksci-attack-done`;
+  - the attacker acts only after it has seen all three, and creates the done-file afterwards;
+  - the attacker prints `ready <n>` and the test asserts `ready 3`.
+- **RED on the pre-fix runner.** `c61dc69`'s `run_programs.py`, run with its original flags (all uid 65534, no capabilities), gave `ready 3 signalled 6` and three victims error `Signal SIGKILL`. The same result twice (records `512046bd…`), so the RED no longer depends on timing.
+- **GREEN on the current runner.** `ready 3 signalled 0`; every victim ok `victim <i> saw the attack end`.
+
+### Before and after
+
+| Case | Before | After |
+|---|---|---|
+| pids control `64d83a3e`, `--jobs 32` | error BlockingIOError (EAGAIN) | ok `control 42 0` |
+| pids hogs (31) | 26 `forked 15`; 5 got 0/10/3/11/2 children | all `forked 15` (records `6eef2f31…`, identical at `--jobs 4`) |
+| sibling attacker `72e2939e`, pre-fix runner `c61dc69` | `ready 3 signalled 6`; victims Signal SIGKILL (deterministic) | `ready 3 signalled 0`; victims ok |
+| smoke (base) | records `13992589…5c90` | records `13992589…5c90` (unchanged); `run.json` `4b07e0de…`, because it now records the pid budget |
+
+### Gates after round 3
+
+- fmt and clippy `-D warnings` are clean.
+- `cargo test -p xtask` passes (31 unit, 15 integration, 6 ignored).
+- `cargo test -p xtask --test oracle_review -- --ignored` passes 6 of 6.
+- `check no-corpus` reports no violations, and `cargo xtask ci` reports "all 6 steps passed".
+- No image re-pin was needed: only scripts and xtask flags changed.
+
 ## Next Phase Readiness
 
 - **01-07, 01-10, 01-13 and 01-17** run untrusted programs only through `cargo xtask oracle run`. They pass `--image sympy --require-sympy-env`, get records by digest, and should use `--seed` sweeps for adjudication.
@@ -503,11 +555,11 @@ Each fix went test-first. The RED witnesses were committed first in `2969217`, f
 
 ## Self-Check: PASSED
 
-- All 15 created key files exist on disk.
-- The task commits `bfb62ef` and `8002345`, and the review commits `2969217`, `f67bf6c`, `497c00d`, `f8307c4` and `2c5ed90`, are ancestors of HEAD.
-- After both review rounds:
-  - `cargo test -p xtask` passes (31 unit, 15 integration, 5 ignored docker witnesses);
-  - all 5 docker witnesses pass with `-- --ignored`;
+- All 16 created key files exist on disk.
+- The task commits `bfb62ef` and `8002345`, and the review commits `2969217`, `f67bf6c`, `497c00d`, `f8307c4`, `2c5ed90`, `b721d71` and `4904a85`, are ancestors of HEAD.
+- After all three review rounds:
+  - `cargo test -p xtask` passes (31 unit, 15 integration, 6 ignored docker witnesses);
+  - all 6 docker witnesses pass with `-- --ignored`;
   - clippy `-D warnings`, fmt and `check no-corpus` are clean;
   - `cargo xtask ci` reports "all 6 steps passed".
 - STATE.md, ROADMAP.md and REQUIREMENTS.md were not touched (parallel worktree; the orchestrator owns them).
