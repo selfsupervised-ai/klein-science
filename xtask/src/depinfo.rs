@@ -38,8 +38,15 @@ pub struct Compiled {
 /// examples), host cfg.
 pub const HOST: &[&str] = &["--workspace", "--all-targets"];
 
-/// The shipped WASM target: the R0 component (operator decision 2026-10-11).
-pub const R0_TARGET: &str = "wasm32-wasip2";
+/// The shipped WASM target of the R0 core module: std Rust for `wasm32-unknown-unknown`, which
+/// `wasm-tools component new` wraps into a component that imports nothing (D-16). `cargo xtask
+/// release dist` builds for it and `check provenance` judges the same compile.
+pub const R0_TARGET: &str = "wasm32-unknown-unknown";
+
+/// The rustflags of every R0 compile: 128-bit SIMD and nothing else. Relaxed SIMD is never
+/// enabled; its results are implementation-defined and would break replay. The release build adds
+/// only path remapping to these, so a cfg on `target_feature` reads the same in both compiles.
+pub const R0_RUSTFLAGS: &str = "-Ctarget-feature=+simd128";
 
 /// The R0 compile: the lib target of every crate that goes into the R0 artifact, for
 /// [`R0_TARGET`], so code only the wasm cfg reads is judged too. The crates are the one declared
@@ -56,16 +63,19 @@ pub fn r0_selection(root: &Path) -> Res<Vec<String>> {
     Ok(args)
 }
 
-/// Compiles `selection` of the workspace at `root` into `target_dir` and returns what rustc
-/// read. A failed compile is an error.
+/// Compiles `selection` of the workspace at `root` into `target_dir` with exactly `rustflags`
+/// (as `CARGO_ENCODED_RUSTFLAGS`, so the caller's `RUSTFLAGS` never changes what is judged) and
+/// returns what rustc read. A failed compile is an error.
 pub fn compile_inputs<S: AsRef<str>>(
     root: &Path,
     target_dir: &Path,
     selection: &[S],
+    rustflags: &str,
 ) -> Res<Compiled> {
     let cargo = host::cargo()?;
     let out = cargo
         .command()
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         .arg("check")
         .args(selection.iter().map(AsRef::as_ref))
         .args([

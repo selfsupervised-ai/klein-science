@@ -72,7 +72,7 @@ pub fn r0_crates(root: &Path) -> Res<Vec<String>> {
     let missing = || {
         format!(
             "{}: no non-empty `[workspace.metadata.ksci] r0-crates` list of package names; the \
-             R0 (wasm32-wasip2) crates must be declared there",
+             R0 (wasm32-unknown-unknown) crates must be declared there",
             path.display()
         )
     };

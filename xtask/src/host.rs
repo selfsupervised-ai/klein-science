@@ -247,13 +247,18 @@ pub const TOOLS: &[Tool] = &[
     },
 ];
 
-/// `$CARGO_HOME/bin` (default `$HOME/.cargo/bin`).
-pub fn bin_dir() -> Res<PathBuf> {
+/// `$CARGO_HOME` (default `$HOME/.cargo`): the pinned tools and the registry sources.
+pub fn cargo_home() -> Res<PathBuf> {
     if let Some(home) = env::var_os("CARGO_HOME") {
-        return Ok(PathBuf::from(home).join("bin"));
+        return Ok(PathBuf::from(home));
     }
     let home = env::var_os("HOME").ok_or("neither CARGO_HOME nor HOME is set")?;
-    Ok(PathBuf::from(home).join(".cargo").join("bin"))
+    Ok(PathBuf::from(home).join(".cargo"))
+}
+
+/// `$CARGO_HOME/bin` (default `$HOME/.cargo/bin`).
+pub fn bin_dir() -> Res<PathBuf> {
+    Ok(cargo_home()?.join("bin"))
 }
 
 /// The absolute path of a pinned tool's binary. Every xtask call of a pinned tool goes here.
@@ -731,10 +736,17 @@ fn set_executable(_path: &Path) -> Res<()> {
     Ok(())
 }
 
-/// Held for the duration of a heavy job; dropping it releases `$KSCI_CACHE/heavy.lock`.
+/// Held for the duration of a heavy job; dropping it releases `$KSCI_CACHE/heavy.lock`. A guard
+/// taken under a parent that holds the lock ([`HEAVY_JOB_HELD`]) holds nothing itself.
 pub struct HeavyGuard {
-    _lock: File,
+    _lock: Option<File>,
 }
+
+/// Set by a heavy-job holder (`cargo xtask ci`) on the steps it runs. A child that finds the lock
+/// taken and this variable set runs under its parent's hold instead of waiting for it: the
+/// parent would otherwise wait for the child, and the child for the parent, forever. A child
+/// that finds the lock free takes it as usual.
+pub const HEAVY_JOB_HELD: &str = "KSCI_HEAVY_JOB_HELD";
 
 /// How often the guard re-checks for a klein-rs build.
 const POLL: Duration = Duration::from_secs(30);
@@ -753,6 +765,13 @@ pub fn heavy_job() -> Res<HeavyGuard> {
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
+        Err(TryLockError::WouldBlock) if env::var_os(HEAVY_JOB_HELD).is_some() => {
+            println!(
+                "heavy-job: {} is held by the parent job ({HEAVY_JOB_HELD})",
+                path.display()
+            );
+            return Ok(HeavyGuard { _lock: None });
+        }
         Err(TryLockError::WouldBlock) => {
             println!(
                 "heavy-job: waiting for {} (another heavy job holds it)",
@@ -766,7 +785,7 @@ pub fn heavy_job() -> Res<HeavyGuard> {
     loop {
         let builds = klein_rs_builds()?;
         if builds.is_empty() {
-            return Ok(HeavyGuard { _lock: file });
+            return Ok(HeavyGuard { _lock: Some(file) });
         }
         println!(
             "heavy-job: waiting {}s, klein-rs build running: {}",
