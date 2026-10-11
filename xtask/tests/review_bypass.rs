@@ -804,6 +804,27 @@ fn provenance_judges_the_wasm_build() {
 }
 
 #[test]
+fn provenance_judges_each_compile_before_the_next() {
+    // Review W-A: a build script writes a headerless source for the host and a headed one for
+    // wasm32-wasip2. Judging only after both compiles would see the headed bytes; each compile's
+    // inputs are judged as that compile left them.
+    let repo = provenance_repo("prov-two-target-build");
+    fs::write(
+        repo.join("crates/k/build.rs"),
+        "// provenance: original\n\
+         fn main() {\n    \
+             let wasm = std::env::var(\"TARGET\").unwrap() == \"wasm32-wasip2\";\n    \
+             let body = if wasm { \"// provenance: original\\npub fn g() {}\\n\" } else { \"pub fn g() {}\\n\" };\n    \
+             let dir = std::env::var(\"CARGO_MANIFEST_DIR\").unwrap();\n    \
+             std::fs::write(format!(\"{dir}/src/generated.rs\"), body).unwrap();\n\
+         }\n",
+    )
+    .unwrap();
+    add_to_lib(&repo, "pub mod generated;");
+    assert_violation(&provenance(&repo), "crates/k/src/generated.rs", NO_HEADER);
+}
+
+#[test]
 fn provenance_requires_declared_r0_crates() {
     // The R0 crate set is one declared list; without it the wasm build cannot be judged.
     let repo = provenance_repo("prov-no-r0");

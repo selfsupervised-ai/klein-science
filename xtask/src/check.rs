@@ -354,10 +354,11 @@ fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
         depinfo::compile_inputs(root, &target, &r0)?,
     ] {
         inputs.extend(compiled.inputs);
-        for dir in &compiled.dependency_out_dirs {
-            dependency_output
-                .push(fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?);
-        }
+        dependency_output.extend(dependency_roots(
+            root,
+            &target,
+            &compiled.dependency_out_dirs,
+        )?);
     }
     let external = external_roots()?;
     let mut by_path: BTreeMap<String, Judged> = BTreeMap::new();
@@ -420,6 +421,15 @@ fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
         }
     }
     Ok(by_path.into_values().collect())
+}
+
+/// The exemption roots for dependency build-script output: the `OUT_DIR`s cargo reported for
+/// registry or git packages. (RED: still canonicalises through links, review C1'.)
+pub fn dependency_roots(_root: &Path, _target: &Path, reported: &[PathBuf]) -> Res<Vec<PathBuf>> {
+    reported
+        .iter()
+        .map(|dir| fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display())))
+        .collect()
 }
 
 /// Where a compiler input outside the repository may come from: the cargo registry sources and
@@ -845,6 +855,65 @@ mod tests {
             ),
         ];
         assert_eq!(judge(&tree, NOTICE_EMPTY), Vec::<String>::new());
+    }
+
+    /// A scratch repository root with `target/provenance/debug/build/dep-1/out` (real dirs).
+    fn exemption_tree(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("ksci-xtask-exempt-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let root = fs::canonicalize(&base).unwrap();
+        let target = root.join("target/provenance");
+        let out = target.join("debug/build/dep-1/out");
+        fs::create_dir_all(&out).unwrap();
+        (root, target, out)
+    }
+
+    #[test]
+    fn provenance_exemption_root_is_cargo_out_dir() {
+        let (root, target, out) = exemption_tree("plain");
+        assert_eq!(
+            dependency_roots(&root, &target, std::slice::from_ref(&out)).unwrap(),
+            [out.clone()]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provenance_exemption_refuses_linked_out_dir() {
+        // Review C1': an OUT_DIR swapped for a link to the repository root must not make the
+        // whole repository exempt.
+        let (root, target, out) = exemption_tree("linked-out");
+        fs::remove_dir(&out).unwrap();
+        std::os::unix::fs::symlink(&root, &out).unwrap();
+        let err = dependency_roots(&root, &target, std::slice::from_ref(&out)).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(err.contains("debug/build/dep-1/out"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provenance_exemption_refuses_linked_ancestor() {
+        let (root, target, out) = exemption_tree("linked-ancestor");
+        let build = target.join("debug/build");
+        fs::rename(&build, root.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &build).unwrap();
+        let err = dependency_roots(&root, &target, std::slice::from_ref(&out)).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(err.contains("debug/build"), "{err}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn provenance_exemption_refuses_out_dir_outside_target() {
+        let (root, target, _) = exemption_tree("outside");
+        let stray = root.join("crates/k/out");
+        fs::create_dir_all(&stray).unwrap();
+        assert!(dependency_roots(&root, &target, &[stray]).is_err());
+        let dotted = target.join("debug/build/dep-1/out/../../../../..");
+        assert!(dependency_roots(&root, &target, &[dotted]).is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

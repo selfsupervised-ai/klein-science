@@ -339,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn depinfo_rejects_leading_space() {
+        rejects(" a: src/lib.rs\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_repeated_space() {
+        rejects("a:  src/lib.rs\n");
+        rejects("a: src/lib.rs  src/b.rs\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_trailing_space() {
+        rejects("a: src/lib.rs \n");
+        rejects("src/lib.rs: \n");
+    }
+
+    #[test]
     fn depinfo_requires_the_artifact_source() {
         let dir = std::env::temp_dir().join(format!("ksci-xtask-depsrc-{}", std::process::id()));
         fs::create_dir_all(dir.join("src")).unwrap();
