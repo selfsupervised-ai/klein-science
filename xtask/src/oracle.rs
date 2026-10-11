@@ -2,9 +2,11 @@
 //! The offline oracle (CONF-01): pinned images and the one hardened container runner (D-01).
 //!
 //! Untrusted programs (corpus programs, stand-in runs, census probes) run only through
-//! [`run`]: a `docker run` with no network, a read-only root, a size-capped `/tmp`, no
-//! capabilities, no privilege gain, capped pids and memory, and uid 65534. Repository inputs are
-//! mounted read-only; the only writable host path is a fresh output directory. Every run first
+//! [`run`]: a `docker run` with no network, a read-only root, a size-capped `/tmp`, no privilege
+//! gain, capped pids and memory. The harness runs as uid 65534 holding only CAP_KILL, CAP_SETGID
+//! and CAP_SETUID, and each case runs as its own unprivileged uid ([`HARDENING`]). Repository
+//! inputs are mounted read-only; the only writable host path is a fresh output directory,
+//! reachable only by the harness. Every run first
 //! checks that the local image is the one pinned in `conformance/oracles/images.json` for that
 //! platform, and holds [`host::heavy_job`] for its duration.
 //!
@@ -531,6 +533,13 @@ fn read_blob(cache: &Cache, hex: &str) -> Res<Vec<u8>> {
 
 /// The hardening flags of every oracle container (T-01-13). Asserted by the acceptance greps and
 /// by `oracle_run_flags_are_hardened`.
+///
+/// The container starts as root holding exactly CAP_KILL, CAP_SETGID and CAP_SETUID, and runs
+/// only [`LAUNCHER`]. Before any script code runs, the launcher drops to the harness identity
+/// (uid and gid 65534, no groups), keeping those three capabilities. The harness needs them to
+/// run each case as its own uid and to kill and reap any case's processes (review R1, operator
+/// decision 2026-10-11). `/harness` (mode 0700, owned by the harness) holds the inputs and
+/// outputs, so cases cannot reach them.
 const HARDENING: &[&str] = &[
     "--rm",
     "--pull=never",
@@ -539,15 +548,26 @@ const HARDENING: &[&str] = &[
     "--read-only",
     "--tmpfs",
     "/tmp:rw,size=1g,mode=1777",
+    "--tmpfs",
+    "/harness:rw,size=1m,mode=0700,uid=65534,gid=65534",
     "--cap-drop=ALL",
+    "--cap-add=SETUID",
+    "--cap-add=SETGID",
+    "--cap-add=KILL",
     "--security-opt=no-new-privileges",
     "--pids-limit=512",
     "--memory=8g",
     "--user",
-    "65534:65534",
+    "0:0",
     "--hostname",
     "ksci-oracle",
 ];
+
+/// The trusted entry point that drops to the harness identity, then runs the script in-process.
+const LAUNCHER: &str = "/opt/ksci/conformance/oracles/launch.py";
+/// The harness-only mount points (under the 0700 `/harness` tmpfs).
+const OUT_MOUNT: &str = "/harness/out";
+const IN_MOUNT: &str = "/harness/in";
 
 /// One read-only bind mount.
 struct Mount {
@@ -555,7 +575,8 @@ struct Mount {
     target: String,
 }
 
-/// The `docker run` argv for one oracle run, without the docker binary itself.
+/// The `docker run` argv for one oracle run, without the docker binary itself. `command` is the
+/// container script and its arguments; the container always enters through [`LAUNCHER`].
 fn run_argv(
     platform: &str,
     reference: &str,
@@ -587,12 +608,14 @@ fn run_argv(
         argv.push(mount(&m.source, &m.target, true)?);
     }
     argv.push("--mount".into());
-    argv.push(mount(out, "/out", false)?);
+    argv.push(mount(out, OUT_MOUNT, false)?);
     for (k, v) in env {
         argv.push("-e".into());
         argv.push(format!("{k}={v}").into());
     }
     argv.push(reference.into());
+    argv.push("python3".into());
+    argv.push(LAUNCHER.into());
     argv.extend(command.iter().map(OsString::from));
     Ok(argv)
 }
@@ -704,19 +727,14 @@ pub fn run_script(args: &RunArgs) -> Res<(ExitCode, Outputs)> {
         });
         pythonpath.push(STANDIN_MOUNT);
     }
-    let mut command = vec![
-        "python3".to_owned(),
-        script,
-        "--out".to_owned(),
-        "/out".to_owned(),
-    ];
+    let mut command = vec![script, "--out".to_owned(), OUT_MOUNT.to_owned()];
     let mut names = Vec::new();
     for spec in &args.inputs {
         let (source, name) = resolve_input(&cache, spec)?;
         if names.contains(&name) {
             return Err(format!("two inputs share the file name {name:?}"));
         }
-        let target = format!("/in/{name}");
+        let target = format!("{IN_MOUNT}/{name}");
         command.push("--input".to_owned());
         command.push(target.clone());
         mounts.push(Mount { source, target });
@@ -798,7 +816,7 @@ fn set_world_writable(_dir: &Path) -> Res<()> {
 
 /// Canonicalises each output file in place, stores it, and prints `<file> sha256=<hex>`; for
 /// `records.jsonl` also `ok=N error=N timeout=N`. Only regular files are accepted: a symlink the
-/// container left in `/out` is never followed on the host.
+/// container left in the output directory is never followed on the host.
 fn store_outputs(cache: &Cache, out: &Path) -> Res<Outputs> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(out).map_err(|e| format!("read {}: {e}", out.display()))? {
@@ -911,10 +929,7 @@ mod tests {
             target: CONFORMANCE_MOUNT.to_owned(),
         }];
         let env = [("PYTHONHASHSEED".to_owned(), "0".to_owned())];
-        let command = [
-            "python3".to_owned(),
-            "/opt/ksci/conformance/x.py".to_owned(),
-        ];
+        let command = ["/opt/ksci/conformance/x.py".to_owned()];
         let argv = run_argv(
             "linux/arm64",
             BASE_REFERENCE,
@@ -937,25 +952,43 @@ mod tests {
             assert!(argv.contains(&flag), "{flag} missing from {argv:?}");
         }
         let after = |flag: &str| argv[argv.iter().position(|a| *a == flag).unwrap() + 1];
-        assert_eq!(after("--user"), "65534:65534");
-        assert_eq!(after("--tmpfs"), "/tmp:rw,size=1g,mode=1777");
+        // Root at start, but only to hand exactly three capabilities to the launcher (review R1).
+        assert_eq!(after("--user"), "0:0");
+        let added: Vec<&&str> = argv.iter().filter(|a| a.starts_with("--cap-add")).collect();
+        assert_eq!(
+            added,
+            [&"--cap-add=SETUID", &"--cap-add=SETGID", &"--cap-add=KILL"]
+        );
+        let tmpfs: Vec<&str> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a == "--tmpfs")
+            .map(|(i, _)| argv[i + 1])
+            .collect();
+        assert_eq!(
+            tmpfs,
+            [
+                "/tmp:rw,size=1g,mode=1777",
+                "/harness:rw,size=1m,mode=0700,uid=65534,gid=65534"
+            ]
+        );
         assert_eq!(after("--platform"), "linux/arm64");
         assert!(
             argv.contains(
                 &"type=bind,source=/repo/conformance,target=/opt/ksci/conformance,readonly"
             )
         );
-        // The output directory is the only writable mount.
+        // The output directory is the only writable mount, and it lies in the harness's tmpfs.
         let writable: Vec<&&str> = argv
             .iter()
             .filter(|a| a.starts_with("type=bind") && !a.ends_with(",readonly"))
             .collect();
-        assert_eq!(writable, [&"type=bind,source=/tmp/out,target=/out"]);
-        // The image comes after every flag, then the command.
+        assert_eq!(writable, [&"type=bind,source=/tmp/out,target=/harness/out"]);
+        // The image comes after every flag, then the launcher, then the script.
         let image = argv.iter().position(|a| *a == BASE_REFERENCE).unwrap();
         assert_eq!(
             &argv[image + 1..],
-            ["python3", "/opt/ksci/conformance/x.py"]
+            ["python3", LAUNCHER, "/opt/ksci/conformance/x.py"]
         );
         assert!(
             run_argv(

@@ -2,9 +2,22 @@
 """Run untrusted Python programs, one isolated subprocess per case, and record every outcome.
 
 This script runs only inside the oracle container that `cargo xtask oracle run` starts
-(network-less, read-only root, capped tmpfs, no capabilities, uid 65534). It is the one
-executor shared by the goldens, the stand-in baseline and the census, so their records compare
-directly. Standard library only.
+(network-less, read-only root, capped tmpfs), under launch.py, as the harness: uid and gid 65534
+holding exactly CAP_KILL, CAP_SETGID and CAP_SETUID. It is the one executor shared by the goldens,
+the stand-in baseline and the census, so their records compare directly. Standard library only.
+
+Case identity (review R1, operator decision 2026-10-11). Each case runs as its own unprivileged
+uid and gid: CASE_ID_BASE plus an offset derived from its case_id, unique within the batch
+(assign_case_ids). So no two cases of a batch share a uid, none shares the harness's, and a case
+gets the same uid on every run, so its records stay byte-stable. Supplementary groups are
+cleared, and the exec into the wrapper drops every capability. A case therefore cannot signal or
+ptrace the harness or a sibling, and cannot read their /proc/<pid>/environ, fd or mem. Inputs
+and outputs live under /harness, a tmpfs of mode 0700 owned by the harness, which cases cannot
+even traverse. /proc itself stays enumerable: remounting it with hidepid=2 needs CAP_SYS_ADMIN
+(EPERM, measured), so cases still see other pids, their command lines (the wrapper argv; program
+text travels on a pipe) and /proc/<pid>/stat. RLIMIT_NPROC per case uid bounds how many of the
+container's pids one case can take. /tmp is shared (mode 1777, sticky): a case cannot change or
+remove another case's files there, but can read the world-readable ones.
 
 Input: JSON Lines, one object per line, exactly {"case_id": <sha256 hex of the UTF-8 code>,
 "code": <str>}. Several --input files are unioned by case_id.
@@ -20,9 +33,25 @@ Each case runs in a fresh `python -s -c WRAPPER`. The wrapper is trusted code: b
 the program it lowers RLIMIT_CPU, RLIMIT_AS and RLIMIT_FSIZE, so the limits bind the program and
 everything it starts. (They are set there rather than in a `preexec_fn`, which the subprocess
 documentation calls unsafe in a threaded parent, and this parent runs cases on threads.) The
-program text arrives on a pipe, and an uncaught exception is reported as one JSON line on a
-second, dedicated pipe. The parent kills the case's whole process group at 4x the CPU limit of
-wall-clock time.
+program text arrives on a pipe. The parent kills the case's whole process group at 4x the CPU
+limit of wall-clock time.
+
+Outcome protocol (review R2). `ok` needs positive evidence. The wrapper reports on a dedicated
+status channel. Every line carries a per-case random token and the wrapper's pid, so lines a
+forked child or stray output writes are ignored. It writes `ok` only after the program's code
+returned normally (or raised SystemExit with code 0, None or False). For an uncaught exception
+it first writes `raised`, then `type` (module and qualname, read through type's own descriptors
+so no user code runs), then the message (str() of the exception, untrusted: bounded, and
+`unprintable` if it raises or is not a str), then `end`. stdout is flushed before either marker.
+Classification:
+- `raised` with `type` is an error with that type. The message is `<message unavailable>`
+  when the report was cut short (the process exited, crashed or was killed while str() ran),
+  and `<unprintable>` when str() failed.
+- Without `raised`: a timeout as before; a signal or nonzero exit is an error; `ok` requires the
+  `ok` marker; a clean exit without it is the error IncompleteExit.
+A program that deliberately forges marker lines can still misreport its own outcome: it runs in
+the same process as the reporter. That is outside the threat model (programs are untrusted for
+safety, not adversarial toward their own records).
 
 Containment (review W3). A case ends when its wrapper ends, and everything it started ends with
 it. This process and each wrapper are subreapers (PR_SET_CHILD_SUBREAPER): while a case runs,
@@ -39,11 +68,12 @@ reached EOF after the sweep, the case is an error (HarnessError), never ok.
 Failures. Per case, any failure of the harness itself (spawn, read, classification) is recorded
 as that case's HarnessError; one case never discards the batch (review W2). Batch-fatal, with
 no records written: invalid input or arguments (exit 2), --require-sympy-env unmet (exit 3),
-this process cannot become a subreaper (exit 4), and failing to write the outputs.
+this process cannot become a subreaper or lacks the harness identity (exit 4), and failing to
+write the outputs.
 
 Exit status: 0 after a run (whatever the cases did), 2 for invalid input or arguments, 3 when
 --require-sympy-env is given and the ground types or the mpmath backend are not "python", 4
-when cases cannot be contained.
+when cases cannot be contained or isolated.
 """
 
 import argparse
@@ -75,36 +105,79 @@ REAP_ROUNDS = 1000
 # spawning against the stray sweep, so a just-forked wrapper is never taken for a stray.
 SPAWN_LOCK = threading.Lock()
 LIVE = set()
+# The harness identity launch.py establishes, and the capabilities it must hold.
+HARNESS_ID = 65534
+HARNESS_CAPS = (1 << 5) | (1 << 6) | (1 << 7)  # CAP_KILL, CAP_SETGID, CAP_SETUID
+# Case uid = gid = CASE_ID_BASE + (first 32 bits of case_id mod CASE_ID_SPAN), probed past
+# collisions in case_id order (assign_case_ids).
+CASE_ID_BASE = 100000
+CASE_ID_SPAN = 1 << 24
+# Pids one case may hold (RLIMIT_NPROC per case uid), shared out of the container's 512.
+PIDS_FOR_CASES = 448
+# Longest exception message recorded, in characters.
+MESSAGE_CAP = 65536
+# Placeholder messages (review R2).
+MESSAGE_UNAVAILABLE = "<message unavailable>"
+MESSAGE_UNPRINTABLE = "<unprintable>"
 
 WRAPPER = r"""
 import json, os, resource, sys, types
-code_fd, exc_fd, cpu, mem, fsize = (int(a) for a in sys.argv[1:6])
-prelude = sys.argv[6]
+code_fd, chan_fd, cpu, mem, fsize, nproc = (int(a) for a in sys.argv[1:7])
+prelude = sys.argv[7]
 resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
 resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
 resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
+resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
 with os.fdopen(code_fd, "rb") as f:
+    _token = f.readline().strip().decode("ascii")
     source = f.read()
-exc_out = os.fdopen(exc_fd, "w", encoding="utf-8", errors="backslashreplace")
+_chan = os.fdopen(chan_fd, "w", encoding="utf-8", errors="backslashreplace")
 sys.argv = ["<program>"]
+
+# Captured before the program runs, so rebinding builtins or json does not reach the reporter.
+_dumps, _getpid, _type, _str, _int = json.dumps, os.getpid, type, str, int
+_SystemExit, _BaseException, _exit = SystemExit, BaseException, os._exit
+_qualname = type.__dict__["__qualname__"].__get__
+_module = type.__dict__["__module__"].__get__
+_exit_code = SystemExit.__dict__["code"].__get__
+_stdout = sys.stdout
+
+def _mark(kind, **fields):
+    fields["t"], fields["pid"], fields["k"] = _token, _getpid(), kind
+    _chan.write(_dumps(fields) + "\n")
+    _chan.flush()
+
+def _flush():
+    try:
+        _stdout.flush()
+    except Exception:
+        pass
 
 # Adopt the case's orphans while the case runs, so they stay inside this case.
 import ctypes
 _libc = ctypes.CDLL(None, use_errno=True)
 if _libc.prctl(36, 1, 0, 0, 0) != 0:
-    exc_out.write(json.dumps({"type": "HarnessError",
-                              "message": "PR_SET_CHILD_SUBREAPER failed: errno %d" % ctypes.get_errno()}) + "\n")
-    exc_out.flush()
-    os._exit(0)
+    _mark("harness", message="PR_SET_CHILD_SUBREAPER failed: errno %d" % ctypes.get_errno())
+    _exit(0)
 del _libc
 
-def _report(e):
+def _raised(e, message=None):
+    _flush()
+    _mark("raised")
+    t = _type(e)
+    qualname, module = _qualname(t, _type), _module(t, _type)
+    _mark("type",
+          qualname=qualname if _type(qualname) is _str else "<unnamed>",
+          module=module if _type(module) is _str else "<unknown>")
     try:
-        message = str(e)
-    except BaseException:
-        message = "<unprintable " + type(e).__name__ + ">"
-    exc_out.write(json.dumps({"type": type(e).__name__, "message": message}) + "\n")
-    exc_out.flush()
+        if message is None:
+            message = _str(e)
+        if _type(message) is not _str:
+            raise TypeError
+        _mark("message", text=message[:MESSAGE_CAP])
+    except _BaseException:
+        _mark("unprintable")
+    _mark("end")
 
 try:
     if prelude:
@@ -115,17 +188,21 @@ try:
     main.__dict__["__builtins__"] = __builtins__
     sys.modules["__main__"] = main
     exec(program, main.__dict__)
-except SystemExit as e:
-    if e.code not in (0, None):
-        _report(e)
-except BaseException as e:
-    _report(e)
-finally:
-    try:
-        sys.stdout.flush()
-    except BaseException:
-        pass
-"""
+except _SystemExit as e:
+    code = _exit_code(e)
+    if code is None or code is False or (_type(code) is _int and code == 0):
+        _flush()
+        _mark("ok")
+    elif _type(code) is _int:
+        _raised(e, _int.__repr__(code))
+    else:
+        _raised(e)
+except _BaseException as e:
+    _raised(e)
+else:
+    _flush()
+    _mark("ok")
+""".replace("MESSAGE_CAP", str(MESSAGE_CAP))
 
 
 def fail(code, message):
@@ -205,6 +282,24 @@ def set_subreaper():
     return 0
 
 
+def harness_identity_problem():
+    """None when this process is the harness launch.py establishes (uid and gid 65534, no
+    groups, holding CAP_KILL, CAP_SETGID and CAP_SETUID); otherwise what is wrong."""
+    fields = {}
+    with open("/proc/self/status") as f:
+        for line in f:
+            key, _, value = line.partition(":")
+            fields[key] = value.split()
+    if fields.get("Uid") != [str(HARNESS_ID)] * 4 or fields.get("Gid") != [str(HARNESS_ID)] * 4:
+        return f"uid {fields.get('Uid')} gid {fields.get('Gid')}, expected {HARNESS_ID} (run under launch.py)"
+    if fields.get("Groups") != []:
+        return f"supplementary groups {fields.get('Groups')}"
+    effective = int(fields.get("CapEff", ["0"])[0], 16)
+    if effective & HARNESS_CAPS != HARNESS_CAPS:
+        return f"effective capabilities {effective:#x} lack CAP_KILL, CAP_SETGID or CAP_SETUID"
+    return None
+
+
 def children_of(pid):
     """Pids whose parent is `pid`, from /proc (the container's own pid namespace)."""
     found = []
@@ -277,22 +372,86 @@ def harness_error(message):
     }
 
 
-def run_case_recorded(code, env, limits):
-    """`run_case`, with any failure of the harness itself recorded as this case's error: one
-    case never aborts the batch (review W2)."""
+def assign_case_ids(case_ids):
+    """case_id -> the case's uid (and gid), unique within the batch (review R1).
+
+    Derived from the case_id, so a case gets the same uid on every run whatever the worker count
+    or the order cases finish in (a program that prints os.getuid() stays byte-stable), and no
+    uid is reused within a batch. A collision moves the later case_id, in sorted order, to the
+    next free uid.
+    """
+    taken = set()
+    assigned = {}
+    for case_id in sorted(case_ids):
+        offset = int(case_id[:8], 16) % CASE_ID_SPAN
+        while CASE_ID_BASE + offset in taken:
+            offset = (offset + 1) % CASE_ID_SPAN
+        taken.add(CASE_ID_BASE + offset)
+        assigned[case_id] = CASE_ID_BASE + offset
+    return assigned
+
+
+def run_case_recorded(code, env, limits, case_uid):
+    """`run_case` under the case's own identity, with any failure of the harness itself
+    recorded as this case's error: one case never aborts the batch (review W2)."""
     try:
-        return run_case(code, env, limits)
+        record, _ = run_case(code, env, limits, case_uid)
+        return record
     except Exception as e:
         return harness_error(f"{type(e).__name__}: {e}")
 
 
-def run_case(code, env, limits):
-    """Run one case to completion. When it returns, every process the case started is dead."""
+def channel_events(data, token, pid):
+    """The wrapper's own status lines: JSON objects carrying this case's token and the wrapper's
+    pid. Lines from forked children, partial lines and anything else are ignored."""
+    events = []
+    for line in data.split(b"\n"):
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(event, dict)
+            and event.get("t") == token
+            and event.get("pid") == pid
+            and isinstance(event.get("k"), str)
+        ):
+            events.append(event)
+    return events
+
+
+def reported_exception(events):
+    """The exception the wrapper reported, or None when it reported none. A report cut short
+    after the type still names the type (review R2)."""
+    kinds = [e["k"] for e in events]
+    if "raised" not in kinds:
+        return None
+    after = events[kinds.index("raised") :]
+    kind = next((e for e in after if e["k"] == "type"), None)
+    if kind is None or not isinstance(kind.get("qualname"), str):
+        return {"type": "HarnessError", "message": "the exception report ended before its type"}
+    text = next((e.get("text") for e in after if e["k"] == "message"), None)
+    if isinstance(text, str):
+        message = text
+    elif any(e["k"] == "unprintable" for e in after):
+        message = MESSAGE_UNPRINTABLE
+    else:
+        message = MESSAGE_UNAVAILABLE
+    return {"type": clean(kind["qualname"]), "message": clean(message)}
+
+
+def run_case(code, env, limits, case_uid):
+    """Run one case to completion as `case_uid`. Returns (record, contained); when it returns,
+    every process the case started is dead unless contained is False."""
     cpu, mem, prelude = limits["cpu_seconds"], limits["mem_bytes"], limits["prelude"]
+    token = os.urandom(16).hex()
     code_r, code_w = os.pipe()
     exc_r, exc_w = os.pipe()
     argv = [sys.executable, "-s", "-c", WRAPPER, str(code_r), str(exc_w)]
-    argv += [str(cpu), str(mem), str(FSIZE_BYTES), prelude or ""]
+    argv += [str(cpu), str(mem), str(FSIZE_BYTES), str(limits["nproc_per_case"])]
+    argv += [prelude or ""]
     try:
         with SPAWN_LOCK:
             proc = subprocess.Popen(
@@ -303,6 +462,9 @@ def run_case(code, env, limits):
                 pass_fds=(code_r, exc_w),
                 env=env,
                 start_new_session=True,
+                user=case_uid,
+                group=case_uid,
+                extra_groups=[],
             )
             LIVE.add(proc.pid)
     except BaseException:
@@ -316,7 +478,7 @@ def run_case(code, env, limits):
     def feed():
         try:
             with os.fdopen(code_w, "wb") as f:
-                f.write(code)
+                f.write(token.encode("ascii") + b"\n" + code)
         except OSError:
             pass
 
@@ -398,55 +560,71 @@ def run_case(code, env, limits):
             _, wait_status, rusage = os.wait4(proc.pid, 0)
             with SPAWN_LOCK:
                 LIVE.discard(proc.pid)
-            sweep_strays()
+            contained = sweep_strays()
         proc.returncode = os.waitstatus_to_exitcode(wait_status)
         proc.stdout.close()
-    # Every writer is dead, so the exception channel reaches EOF unless containment failed.
+    # Every writer is dead, so the status channel reaches EOF unless containment failed.
     exc_reader.join(timeout=CLOSE_GRACE)
     feeder.join(timeout=CLOSE_GRACE)
+    return classify(
+        wait_status=wait_status,
+        cpu_used=rusage.ru_utime + rusage.ru_stime,
+        cpu=cpu,
+        killed=killed,
+        contained=contained,
+        stdout_eof=eof,
+        channel_eof=exc["eof"],
+        events=channel_events(b"".join(exc["chunks"]), token, proc.pid),
+        stdout=captured.decode("utf-8", "backslashreplace"),
+        truncated=truncated,
+    ), contained
 
-    cpu_used = rusage.ru_utime + rusage.ru_stime
-    signalled = os.WIFSIGNALED(wait_status)
-    sig = os.WTERMSIG(wait_status) if signalled else None
-    if (
-        killed
-        or sig == signal.SIGXCPU
-        or (sig == signal.SIGKILL and cpu_used >= cpu)
-    ):
-        # What a killed program had flushed depends on timing, so a timeout records no stdout.
-        return {"status": "timeout", "stdout": "", "stdout_truncated": False, "exception": None}
+
+def classify(
+    *,
+    wait_status,
+    cpu_used,
+    cpu,
+    killed,
+    contained,
+    stdout_eof,
+    channel_eof,
+    events,
+    stdout,
+    truncated,
+):
+    """The record of a finished case. Only complete channels are trusted (review W3), and `ok`
+    needs the wrapper's completion marker (review R2)."""
     if not contained:
         return harness_error("processes started by the case survived the sweep")
-    if not eof:
+    if not stdout_eof:
         return harness_error("stdout stayed open after the case ended")
-    if not exc["eof"]:
-        return harness_error("the exception channel stayed open after the case ended")
+    if not channel_eof:
+        return harness_error("the status channel stayed open after the case ended")
+    harness = next((e for e in events if e["k"] == "harness"), None)
+    if harness is not None:
+        return harness_error(str(harness.get("message")))
 
-    exception = None
-    lines = b"".join(exc["chunks"]).decode("utf-8", "backslashreplace").splitlines()
-    if lines:
-        try:
-            record = json.loads(lines[-1])
-            if (
-                not isinstance(record, dict)
-                or set(record) != {"type", "message"}
-                or not all(isinstance(v, str) for v in record.values())
-            ):
-                raise ValueError("bad shape")
-            exception = {"type": clean(record["type"]), "message": clean(record["message"])}
-        except ValueError:
-            exception = {"type": "InvalidExceptionRecord", "message": clean(lines[-1][:200])}
+    def error(kind, message):
+        exception = {"type": kind, "message": message}
+        return {"status": "error", "stdout": stdout, "stdout_truncated": truncated, "exception": exception}
 
-    if exception is None and signalled:
-        exception = {"type": "Signal", "message": signal_name(sig)}
-    elif exception is None and os.WEXITSTATUS(wait_status) != 0:
-        exception = {"type": "ExitCode", "message": str(os.WEXITSTATUS(wait_status))}
-    return {
-        "status": "error" if exception is not None else "ok",
-        "stdout": captured.decode("utf-8", "backslashreplace"),
-        "stdout_truncated": truncated,
-        "exception": exception,
-    }
+    exception = reported_exception(events)
+    if exception is not None:
+        # The program raised; stdout was flushed before the report, so it is complete.
+        return error(exception["type"], exception["message"])
+    signalled = os.WIFSIGNALED(wait_status)
+    sig = os.WTERMSIG(wait_status) if signalled else None
+    if killed or sig == signal.SIGXCPU or (sig == signal.SIGKILL and cpu_used >= cpu):
+        # What a killed program had flushed depends on timing, so a timeout records no stdout.
+        return {"status": "timeout", "stdout": "", "stdout_truncated": False, "exception": None}
+    if signalled:
+        return error("Signal", signal_name(sig))
+    if os.WEXITSTATUS(wait_status) != 0:
+        return error("ExitCode", str(os.WEXITSTATUS(wait_status)))
+    if any(e["k"] == "ok" for e in events):
+        return {"status": "ok", "stdout": stdout, "stdout_truncated": truncated, "exception": None}
+    return error("IncompleteExit", "exit status 0 without the completion marker")
 
 
 def sympy_facts():
@@ -498,19 +676,24 @@ def main():
     errno = set_subreaper()
     if errno:
         fail(4, f"cannot contain cases: PR_SET_CHILD_SUBREAPER failed with errno {errno}")
+    problem = harness_identity_problem()
+    if problem:
+        fail(4, f"cannot isolate cases: {problem}")
+    case_uids = assign_case_ids(cases)
     limits = {
         "cpu_seconds": args.cpu_seconds,
         "wall_seconds": WALL_FACTOR * args.cpu_seconds,
         "mem_bytes": args.mem_bytes,
         "fsize_bytes": FSIZE_BYTES,
         "stdout_cap_bytes": STDOUT_CAP,
+        "nproc_per_case": max(16, PIDS_FOR_CASES // args.jobs),
         "prelude": args.prelude,
     }
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(run_case_recorded, code, env, limits): case_id
+            pool.submit(run_case_recorded, code, env, limits, case_uids[case_id]): case_id
             for case_id, code in cases.items()
         }
         for future in concurrent.futures.as_completed(futures):
