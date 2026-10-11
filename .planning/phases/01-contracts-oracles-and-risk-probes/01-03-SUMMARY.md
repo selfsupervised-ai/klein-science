@@ -140,7 +140,7 @@ trusted.**
   - `disallowed-methods`: `SystemTime::now`, `Instant::now`, `rand::thread_rng`, `rand::random` and `rand::rng`.
   - The lint levels come from `[workspace.lints.clippy]` (plan 01-01). The witness failed even without `-D warnings`, so the `deny` level alone is enough.
 - **deny.toml (LIC-01, and DET-08 for the randomness crates).**
-  - `[graph]`: three targets, `exclude-dev = true`, and `exclude = ["xtask", "ksci-conform", "ksci-metal-probe"]`.
+  - `[graph]`: `exclude-dev = true` and `exclude = ["xtask", "ksci-conform", "ksci-metal-probe"]`. Since the review fixes there is no target filtering (`targets = []`, W1), and every optional feature is audited (`all-features = true`, W2).
   - Licences: the eight-entry permissive allow-list with confidence 0.93. MPL-2.0 is rejected, and a comment says it needs an operator-approved exception (flag F1).
   - Bans: 13 crates, each with a reason. `wildcards = "deny"`, `multiple-versions = "warn"`.
   - Yanked crates are denied, and so are unknown registries and git sources.
@@ -324,3 +324,44 @@ None. No external service configuration is required.
 - Commits on this branch since 46c5bc6: 003c1ed, 542fe34, 5b6a7a5 (3).
 - Re-run on the final tree: `cargo xtask ci` exit 0 (8 steps); `cargo nextest run -p xtask provenance` 11/11 passed;
   `cargo xtask check provenance` exit 0; `git status --porcelain crates/` empty.
+
+## Review fixes
+
+A cross-model review (Codex gpt-6-astra) returned FAIL with three must-fix warnings. The orchestrator reproduced all
+three. Each fix below was checked with the reviewer's own counter-example (the oracle): it passed before the fix, it
+fails after, and every mutation was reverted afterwards. `git status --porcelain` was clean after each revert.
+
+**W1: the deny graph checked the wrong wasm target** (`86c5c25`, fix).
+- The target list named `wasm32-unknown-unknown`, but the shipped R0 target is `wasm32-wasip2`. Dependencies declared only for wasip2 were never audited.
+- Fix: `deny.toml` `targets = []`, so there is no target filtering and every target-specific dependency is audited. There is no target list to keep in step with the shipped targets.
+- Oracle: add `[target.wasm32-wasip2.dependencies] getrandom = "=0.3.4"` to `crates/ksci-wire/Cargo.toml`.
+  - Before: `cargo deny check bans` returned **rc=0**. `cargo deny --target wasm32-wasip2 check bans` returned rc=2, so the miss came from the target filter.
+  - After: `cargo deny check bans` returns **rc=2**, with `error[banned]: crate 'getrandom = 0.3.4' is explicitly banned`.
+  - Reverted with `git checkout -- crates/ksci-wire/Cargo.toml Cargo.lock`. The clean tree's `cargo deny check` returned rc=0.
+
+**W2: optional features were never audited** (`018966a`, fix).
+- With `all-features = false`, a banned crate behind an optional feature was invisible to the check.
+- Fix: `deny.toml` `all-features = true`. Every `cargo deny check`, including the ci step, now audits the all-features graph.
+- Oracle: add `getrandom = { version = "=0.3.4", optional = true }` and `[features] runtime-entropy = ["dep:getrandom"]` to ksci-wire.
+  - Before: plain `cargo deny check bans` returned **rc=0**, while `--all-features` returned rc=2.
+  - After: plain `cargo deny check bans` returns **rc=2**, with `getrandom = 0.3.4` banned (`getrandom v0.3.4 └── ksci-wire v0.1.0`).
+  - Reverted. The clean tree's `cargo deny check` returned rc=0.
+
+**W3: directory symlinks hid compiled source from `check provenance`** (RED `347f068`, test; GREEN `68b231f`, fix).
+- The bug: git lists a symlinked directory as one path with no extension, and the scope filter dropped it. A `#[path]` module could then compile headerless code from behind the link.
+- Fix: one mechanism, which is refusal.
+  - Every non-ignored path under `crates/` or `standin/` is examined with `symlink_metadata`, which does not follow links. This includes the tree roots themselves, in any letter case.
+  - Any symbolic link is a violation, `<path>: symbolic link inside a checked source tree; ...`. The check never follows a link.
+  - `provenance_violations` now judges `Entry::Bytes` (headers) and `Entry::Symlink` (refusal) in one list sorted by path. I named the new enum `Entry`, not `Source`, after ast-grep showed that `store::Source` already exists.
+- RED: three integration tests in `xtask/tests/review_bypass.rs` run the built binary in a scratch klein repository.
+  - `provenance_rejects_directory_symlink_in_source_tree` (linked dir plus `git add -N`).
+  - `provenance_rejects_file_symlink_in_source_tree` (an untracked `.rs` link to a *headed* file outside the trees).
+  - `provenance_rejects_symlinked_standin_tree` (the `standin` root itself is a link).
+  - Against the unfixed code, nextest exited 100 with 3 of 3 failing on the planned assertion: `check provenance passed: status: exit status: 0 ... provenance ok`. There was no fixture fault.
+- GREEN: all 3 pass. A new unit test, `provenance_checked_trees`, covers the tree-membership predicate. `cargo nextest run -p xtask provenance` now runs 15 tests, all passing.
+- Real-tree oracle: `review-fixture/witness.rs` with no header, a link `crates/ksci-wire/src/imported -> ../../../review-fixture`, `#[path = "imported/witness.rs"] pub mod provenance_bypass;` appended to ksci-wire's `lib.rs`, then `git add -N .`.
+  - Before: `cargo xtask check provenance` returned **rc=0** ("5 files checked"), while `cargo check -p ksci-wire` compiled the file.
+  - After: **rc=1**, with `crates/ksci-wire/src/imported: symbolic link inside a checked source tree; ...`.
+  - Reverted with `git reset` on the intent-to-add entries, removal of the link and fixture, and `git checkout -- crates/ksci-wire/src/lib.rs`.
+
+**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 98 tests with 98 passing. Clippy and fmt are clean. rust-analyzer was still unavailable in this session, so structural checks used ast-grep (`provenance_violations` and `Entry::*` call sites, and the `store::Source` clash) together with the full clippy compile.
