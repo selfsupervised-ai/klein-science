@@ -58,6 +58,11 @@ pub const STEPS: &[(&str, &[&str])] = &[
         &["cargo", "nextest", "run", "--workspace", "--locked"],
     ),
     ("check no-corpus", &["cargo", "xtask", "check", "no-corpus"]),
+    // LIC-02: provenance headers against the licence policy and NOTICE.
+    (
+        "check provenance",
+        &["cargo", "xtask", "check", "provenance"],
+    ),
 ];
 
 /// Runs every step from the workspace root and stops at the first failure.

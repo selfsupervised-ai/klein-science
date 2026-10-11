@@ -8,6 +8,11 @@
 //! the tree xtask was compiled from), and the bytes git would commit: each index entry by its staged blob, never by the
 //! working copy, plus each untracked, non-ignored file (what `git add` stages next). An entry it
 //! cannot size fails the check rather than being skipped.
+//!
+//! `check provenance` (LIC-02, CLAUDE.md rule 2) makes every shipped source file name where it
+//! came from: original work, a port of an allowed project (tied to [`PORT_POLICY`] and to a
+//! `Project:` block in NOTICE), or a paper by DOI. It judges the working copy of every tracked or
+//! untracked, non-ignored `.rs` file under `crates/` and `.py` file under `standin/`.
 
 use std::fs;
 use std::io::Write;
@@ -24,12 +29,16 @@ use crate::{host, workspace};
 pub enum CheckCmd {
     /// Fail when a staged (index) blob or an untracked, non-ignored file looks like corpus bytes.
     NoCorpus,
+    /// Fail when a `.rs` file under `crates/` or a `.py` file under `standin/` lacks a valid
+    /// provenance header, or a port header is outside the licence policy or missing from NOTICE.
+    Provenance,
 }
 
 /// Runs one `check` command.
 pub fn run(cmd: CheckCmd) -> Res<ExitCode> {
     match cmd {
         CheckCmd::NoCorpus => no_corpus(),
+        CheckCmd::Provenance => provenance(),
     }
 }
 
@@ -253,18 +262,219 @@ pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     out
 }
 
-/// The provenance violations among `(path, contents)` pairs, judged against the NOTICE text,
-/// sorted by path. (RED stub: the real check lands with the GREEN commit.)
-pub fn provenance_violations(files: &[(String, Vec<u8>)], _notice: &str) -> Vec<String> {
-    files
-        .iter()
-        .map(|(path, _)| format!("{path}: unimplemented"))
-        .collect()
+/// The licence policy for ported code (CLAUDE.md rule 2): every upstream project that may be
+/// ported, by its exact lower-case name, and the SPDX identifier its port headers must declare.
+/// Anything else (Symbolica, FLINT, Giac, any GPL or LGPL project) is not portable.
+pub const PORT_POLICY: [(&str, &str); 5] = [
+    ("diofant", "BSD-3-Clause"),
+    ("fricas", "BSD-3-Clause"),
+    ("mpmath", "BSD-3-Clause"),
+    ("symengine", "MIT"),
+    ("sympy", "BSD-3-Clause"),
+];
+
+/// The notice file at the workspace root that every port's upstream notice lives in.
+const NOTICE_FILE: &str = "NOTICE";
+
+fn provenance() -> Res<ExitCode> {
+    let root = workspace::root()?;
+    // Tracked and untracked, non-ignored files: a new file cannot dodge the check by not being
+    // added yet. Scope is decided here, not by a git pathspec, so case variants are judged too.
+    let listing = host::git_output(
+        &root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    let mut paths = Vec::new();
+    for raw in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = String::from_utf8(raw.to_vec())
+            .map_err(|_| format!("provenance: path {raw:?} is not UTF-8"))?;
+        if provenance_in_scope(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let notice = fs::read_to_string(root.join(NOTICE_FILE))
+        .map_err(|e| format!("provenance: {NOTICE_FILE}: {e}"))?;
+    // The working copy is judged: it is what cargo compiles. A listed file that cannot be read
+    // (a tracked file deleted from the working copy) fails the check rather than being skipped.
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = fs::read(root.join(&path)).map_err(|e| format!("provenance: {path}: {e}"))?;
+        files.push((path, bytes));
+    }
+    let found = provenance_violations(&files, &notice);
+    for v in &found {
+        println!("{v}");
+    }
+    if found.is_empty() {
+        let blocks = notice
+            .split('\n')
+            .filter(|l| l.starts_with("Project: "))
+            .count();
+        println!(
+            "provenance ok, {} files checked in {}, {NOTICE_FILE} has {blocks} Project blocks",
+            files.len(),
+            root.display()
+        );
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!(
+            "error: provenance: {} violation(s); every .rs file under crates/ and .py file under \
+             standin/ starts with a provenance header",
+            found.len()
+        );
+        Ok(ExitCode::FAILURE)
+    }
 }
 
-/// Whether the provenance check judges `path`. (RED stub.)
-pub fn provenance_in_scope(_path: &str) -> bool {
-    false
+/// Whether the provenance check judges `path`: a `.rs` file under `crates/` or a `.py` file
+/// under `standin/`. As in [`violations`], directory and extension are matched on the
+/// ASCII-lowercased path, so a case variant (`Crates/x.RS`) is judged, never exempt.
+pub fn provenance_in_scope(path: &str) -> bool {
+    let folded = path.to_ascii_lowercase();
+    (folded.starts_with("crates/") && folded.ends_with(".rs"))
+        || (folded.starts_with("standin/") && folded.ends_with(".py"))
+}
+
+/// The provenance violations among `(path, contents)` pairs, judged against the NOTICE text,
+/// as `<path>: <reason>` lines sorted by path (each path judged once).
+///
+/// The header is the first line, or for a `.py` file the second line when the first is a `#!`
+/// shebang or a PEP 263 coding cookie. It is one of, with `//` in Rust and `#` in Python:
+/// - `// provenance: original`
+/// - `// provenance: port <project>@<tag>:<upstream-path> (<SPDX>)`
+/// - `// provenance: paper doi:<doi>`
+///
+/// A port passes only when the project is in [`PORT_POLICY`] (exact name), the SPDX equals the
+/// policy's, and the NOTICE text has a line that is exactly `Project: <project>`.
+pub fn provenance_violations(files: &[(String, Vec<u8>)], notice: &str) -> Vec<String> {
+    let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted.dedup_by(|a, b| a.0 == b.0);
+    let mut out = Vec::new();
+    for (path, bytes) in sorted {
+        for reason in header_violations(path, bytes, notice) {
+            out.push(format!("{path}: {reason}"));
+        }
+    }
+    out
+}
+
+/// One parsed provenance header.
+enum Header<'a> {
+    Original,
+    Paper,
+    Port { project: &'a str, spdx: &'a str },
+}
+
+/// The reasons one file's header fails, in a fixed order; empty when it passes.
+fn header_violations(path: &str, bytes: &[u8], notice: &str) -> Vec<String> {
+    let python = path.to_ascii_lowercase().ends_with(".py");
+    let comment = if python { "#" } else { "//" };
+    let mut lines = bytes.split(|b| *b == b'\n');
+    let first = lines.next().unwrap_or_default();
+    let line = if python && (first.starts_with(b"#!") || is_coding_cookie(first)) {
+        lines.next().unwrap_or_default()
+    } else {
+        first
+    };
+    let lead = format!("{comment} provenance:");
+    if !line.starts_with(lead.as_bytes()) {
+        return vec!["no provenance header".to_owned()];
+    }
+    let parsed = std::str::from_utf8(line)
+        .ok()
+        .and_then(|l| l.strip_prefix(&format!("{lead} ")))
+        .and_then(parse_header);
+    let malformed = || {
+        format!(
+            "malformed provenance header {:?}",
+            String::from_utf8_lossy(line)
+        )
+    };
+    match parsed {
+        None => vec![malformed()],
+        Some(Header::Original | Header::Paper) => Vec::new(),
+        Some(Header::Port { project, spdx }) => {
+            let Some((_, required)) = PORT_POLICY.iter().find(|(p, _)| *p == project) else {
+                return vec![format!(
+                    "port project {project:?} is not in the licence policy"
+                )];
+            };
+            let mut reasons = Vec::new();
+            if spdx != *required {
+                reasons.push(format!(
+                    "port {project} declares {spdx}, the licence policy requires {required}"
+                ));
+            }
+            let block = format!("Project: {project}");
+            if !notice.split('\n').any(|l| l == block) {
+                reasons.push(format!("port {project} has no {block:?} line in NOTICE"));
+            }
+            reasons
+        }
+    }
+}
+
+/// The header after `provenance: `, or `None` when it matches none of the three forms.
+fn parse_header(body: &str) -> Option<Header<'_>> {
+    if body == "original" {
+        return Some(Header::Original);
+    }
+    if let Some(doi) = body.strip_prefix("paper doi:") {
+        return is_doi(doi).then_some(Header::Paper);
+    }
+    let port = body.strip_prefix("port ")?;
+    let (source, spdx) = port.rsplit_once(" (")?;
+    let spdx = spdx.strip_suffix(')')?;
+    let (project, rest) = source.split_once('@')?;
+    let (tag, upstream) = rest.split_once(':')?;
+    let token =
+        |s: &str| !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c == '(' || c == ')');
+    let spdx_ok = !spdx.is_empty() && !spdx.contains(['(', ')']) && spdx.trim() == spdx;
+    (token(project) && token(tag) && token(upstream) && spdx_ok)
+        .then_some(Header::Port { project, spdx })
+}
+
+/// `10.<registrant>/<suffix>`: registrant digits and dots, suffix non-empty with no whitespace
+/// or control characters.
+fn is_doi(doi: &str) -> bool {
+    let Some((prefix, suffix)) = doi.split_once('/') else {
+        return false;
+    };
+    let Some(registrant) = prefix.strip_prefix("10.") else {
+        return false;
+    };
+    !registrant.is_empty()
+        && registrant.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && !suffix.is_empty()
+        && !suffix.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Whether a line is a PEP 263 coding cookie: a comment matching `coding[:=]\s*[-\w.]+`.
+fn is_coding_cookie(line: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(line);
+    let Some(comment) = text
+        .trim_start_matches([' ', '\t', '\x0c'])
+        .strip_prefix('#')
+    else {
+        return false;
+    };
+    comment.match_indices("coding").any(|(i, _)| {
+        let after = &comment[i + "coding".len()..];
+        after
+            .strip_prefix([':', '='])
+            .map(|v| v.trim_start_matches([' ', '\t']))
+            .and_then(|v| v.chars().next())
+            .is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    })
 }
 
 #[cfg(test)]
@@ -518,6 +728,9 @@ mod tests {
         assert!(provenance_in_scope("crates/x/src/Upper.RS"));
         assert!(provenance_in_scope("standin/names.py"));
         assert!(provenance_in_scope("standin/pkg/sub/mod.py"));
+        // A case variant of a scope directory is judged, never exempt.
+        assert!(provenance_in_scope("Crates/x/src/a.rs"));
+        assert!(provenance_in_scope("STANDIN/a.Py"));
         assert!(!provenance_in_scope("xtask/src/main.rs"));
         assert!(!provenance_in_scope("crates/ksci-wire/Cargo.toml"));
         assert!(!provenance_in_scope("crates/x/tool.py"));
