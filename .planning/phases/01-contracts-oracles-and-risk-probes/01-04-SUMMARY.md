@@ -306,3 +306,95 @@ None.
 ## Self-Check: PASSED
 
 All 9 created files exist on disk. Commits f028a33, 95fd7ef, 205b855 and f40cf3e are on the branch. The working tree is clean.
+
+## Review fixes (cross-model review, Codex gpt-6-astra: FAIL → fixed)
+
+Each fix was witnessed before it was made. W1 and N1 each have a RED commit and then a fix commit. N2 is a
+test-harness fix, witnessed by mutation before and after.
+
+| Finding | RED / witness commit | Fix commit |
+|---|---|---|
+| W1: unbounded error text kills the worker | `e1c4ecd` test(01-04) | `9eb72dc` fix(01-04) |
+| N1: a writer accepts tags the reader rejects | `20844d2` test(01-04) | `0c6dda0` fix(01-04) |
+| N2: worker test teardown has no deadline | (mutation, not committed) | `8bec491` fix(01-04) |
+
+### W1: error messages bounded at 1024 bytes, deterministically
+
+- **Root cause.** Error text quotes the request: a JSON pointer names a key, and an unknown op is named. A request
+  may be 64 MiB, and nothing bounded the quote.
+- **Fix, in the shared layer.** `ksci_ops::Message` has a private field, and every `OpError` variant carries one.
+  `Message::new` formats into a sink that keeps at most `MAX_ERROR_MESSAGE_BYTES` (1024) bytes. A longer text keeps
+  its longest prefix that ends on a character boundary and is at most 1012 bytes, then gets `" [truncated]"`. The
+  cut depends only on the text, so R0 and R2 get the same bytes. The cut happens while formatting, so the 64 MiB
+  echo is never built. `schema/expr.v1.md` gained an **Errors** section that states the kinds and the bound.
+- **Before.** The reviewer's case was rerun on the release worker:
+  - a 1 MiB key gave exit 0 and a **1048598-byte** error frame;
+  - a frame of exactly 64 MiB gave **exit 1, 0 bytes on stdout, nothing on stderr**.
+
+  Both new tests failed on the code before the fix:
+  - `ops_error_message_bounded`: left 1048598, right 1024;
+  - `worker_error_frame_bounded`: "a response frame", because the worker died without writing one.
+- **After.** On the release worker, both sizes give exit 0 and a tag-1 frame with a **1024-byte** payload. Both
+  tests pass.
+- **Mutation witnesses on the fix.**
+  - Slice at `room` rather than at the character boundary: `ops_error_message_bounded` fails, because the
+    slice panics on a byte index inside '𝑥'.
+  - Leave no room for the suffix: it fails with left 1036, right 1024.
+- **One guard has no witness.** The guard that stops writing after a cut cannot be observed. A cut leaves at least
+  1021 bytes, and `Message::new` keeps at most 1012, so nothing written after a cut can survive. Its comment now
+  says exactly that and claims nothing more.
+- **Every site (rule 7, fallback, because rust-analyzer is unavailable).**
+  - Compiler enumeration: changing the variant payload to `Message` produced E0308 at exactly 5 producers. The
+    sixth, in `canonicalize`, already used `.into()` from `&str`.
+  - ast-grep `OpError::$K($A)` outside tests: those 6 sites, all now `Message::new` or `From`. The private field
+    makes this hold for any future producer.
+  - ast-grep `write_response_frame(...)`: 3 production writes, all in `ksci-worker/src/main.rs`:
+    - bounded `OpError` messages;
+    - `invoke` output, which is capped at `MAX_DOCUMENT_BYTES`;
+    - the fixed-shape `TooLarge` text, about 55 bytes.
+
+### N1: response-frame tags are a type
+
+- **Fix.** `ksci_wire::frame::Tag`, with variants `Ok`, `BadRequest`, `UnsupportedOp` and `Internal`, replaces the
+  four `TAG_*` `u8` constants. `write_response_frame` takes a `Tag` and `read_response_frame` returns one, so an
+  undefined tag cannot be written.
+- **Before.** `frame_written_reads_back` failed: tag 4 was written and read back as `Err(UnknownTag(4))`. The
+  `compile_fail` doctest failed with "Test compiled successfully, but it's marked `compile_fail`".
+- **After.**
+  - The test checks all 256 bytes: the four tags round-trip, and every other byte is read as `UnknownTag`.
+  - The doctest passes.
+  - Stable rustdoc does not check the error code, so the snippet was also compiled with `rustc` against the
+    ksci-wire rlib. It fails with exactly one error, **E0308**.
+- **Every site.**
+  - Compiler enumeration listed every user of the old API: 2 errors in `ksci-wire/tests/frame.rs`, 2 in
+    `ksci-worker/src/main.rs` and 2 in `ksci-worker/tests/stdio.rs`. All were updated.
+  - A text search for `TAG_` in crates, xtask and conformance finds nothing. ast-grep cannot match inside an
+    identifier, so text search was the right tool here.
+  - ast-grep finds 3 writers (all in the worker) and 1 production reader (the stdio test helper).
+  - Plan 01-06 references only `OpError` and "tag-prefixed response frames", not the constants. Its `R2Worker`
+    should map `Tag` to its `Outcome`.
+
+### N2: test teardown has a deadline
+
+- **Fix.** `finish` reads stdout and stderr on a helper thread with `recv_timeout(PATIENCE)`. The new
+  `exit_within` polls `try_wait` in 10 ms ticks for at most 30 s, so the tests read no clock. On expiry both kill
+  the child and fail.
+- **Witness 1: a worker that ignores EOF** (`Ok(None) => loop { park() }`), run with a 60 s nextest cap.
+  - Before: `worker_error_tags` and `worker_roundtrip_matches_invoke` hit **TIMEOUT at 60 s**. Without the cap
+    they would hang forever.
+  - After: both **FAIL at 30.3 s** with "the worker kept its output open 30s after end of input".
+  - The mutation was reverted.
+- **Witness 2: a stand-in that closes stdout and stderr and keeps running** (`sh -c 'exec >&- 2>&-; sleep 100'`),
+  driven by a temporary probe test that goes straight to `finish`.
+  - Before: **TIMEOUT at 60 s**.
+  - After: **FAIL at 36 s** with "the worker did not exit within 30s".
+  - The probe and the mutation were removed.
+
+### State after the fixes
+
+- Workspace: 95/95 tests pass (3 new: `ops_error_message_bounded`, `worker_error_frame_bounded` and
+  `frame_written_reads_back`).
+- ksci-wire doctests: 6/6.
+- clippy `-D warnings`, `cargo fmt --check` and `cargo xtask check no-corpus` (84 files) are clean.
+- `cargo check -p ksci-ops --target wasm32-wasip2` is clean.
+- STATE.md and ROADMAP.md were not touched.
