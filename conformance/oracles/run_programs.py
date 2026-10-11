@@ -24,8 +24,10 @@ xtask passes as KSCI_PIDS_LIMIT. Each case uid gets a fixed RLIMIT_NPROC (NPROC_
 (pid_budget). So cases cannot starve each other or the harness of tasks, and what a case may
 start never depends on --jobs. The requested and effective worker counts go into run.json.
 
-Input: JSON Lines, one object per line, exactly {"case_id": <sha256 hex of the UTF-8 code>,
-"code": <str>}. Several --input files are unioned by case_id.
+Input: JSON Lines, one object per line, with {"case_id": <sha256 hex of the UTF-8 code>,
+"code": <str>}. Other keys are metadata of the producer (the golden slice's "stratum") and are
+ignored: nothing but the code reaches a case, and case_id is checked against it. Several --input
+files are unioned by case_id.
 
 Output, in --out:
 - records.jsonl: one object per case, sorted by case_id, with the keys case_id, status
@@ -252,8 +254,8 @@ def load_cases(paths):
                 case = json.loads(line)
             except ValueError as e:
                 fail(2, f"{where}: not JSON: {e}")
-            if not isinstance(case, dict) or set(case) != {"case_id", "code"}:
-                fail(2, f"{where}: a case is exactly {{case_id, code}}")
+            if not isinstance(case, dict) or not {"case_id", "code"} <= set(case):
+                fail(2, f"{where}: a case needs case_id and code")
             case_id, code = case["case_id"], case["code"]
             if not isinstance(case_id, str) or not isinstance(code, str):
                 fail(2, f"{where}: case_id and code must be strings")
