@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99.0"
+license = "Apache-2.0"
+publish = false
+
+# Exact pins. serde and serde_json match klein-rs, so JCS input parsing matches Klein's own;
+# serde_json_canonicalizer and sha2 are the same crates and pins as klein-rs.
+[workspace.dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+serde_json_canonicalizer = "=0.3.2"
+sha2 = "=0.11.0"
+thiserror = "=2.0.21"
+static_assertions = "=1.1.0"
+proptest = "=1.11.0"
+
+# The disallowed lists live in clippy.toml (plan 01-03).
+[workspace.lints.clippy]
+disallowed_types = "deny"
+disallowed_methods = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+debug = false
+incremental = false

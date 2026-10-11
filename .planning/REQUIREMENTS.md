@@ -17,9 +17,9 @@ v1 = milestones M0–M5 (roadmap phases 1–6). M6, the parity long tail, is v2.
 
 - [ ] **DET-01**: An expression's identity is the SHA-256 of the RFC-8785 JCS encoding of its canonical DAG node table,
       and the same expression built in any order has the same identity.
-- [ ] **DET-02**: Every numeric leaf on the wire is a tagged string (Integer, Rational, Float with precision) and special
+- [x] **DET-02**: Every numeric leaf on the wire is a tagged string (Integer, Rational, Float with precision) and special
       values are named atoms, so no CAS number passes through a JSON number.
-- [ ] **DET-03**: Provenance (implementation, device, driver, timings) travels in an envelope outside the hashed bytes.
+- [x] **DET-03**: Provenance (implementation, device, driver, timings) travels in an envelope outside the hashed bytes.
 - [ ] **DET-04**: `fuel_exhausted` is raised only by a logical step budget counted identically on R0, R1 and R2;
       Wasmtime fuel, memory caps and GPU timeouts surface as host errors, not as results.
 - [ ] **DET-05**: A CI job runs the same exact operation on R0, R1 (emulated) and R2 at several thread counts and fails on
@@ -255,8 +255,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | DET-01 | Phase 1 | Pending |
-| DET-02 | Phase 1 | Pending |
-| DET-03 | Phase 1 | Pending |
+| DET-02 | Phase 1 | Complete |
+| DET-03 | Phase 1 | Complete |
 | DET-04 | Phase 1 | Pending |
 | DET-05 | Phase 2 | Pending |
 | DET-06 | Phase 5 | Pending |
