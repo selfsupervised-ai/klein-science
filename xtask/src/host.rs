@@ -37,7 +37,8 @@ use std::time::Duration;
 use clap::Subcommand;
 
 use crate::Res;
-use crate::store::{self, Cache, workspace_root};
+use crate::store::{self, Cache};
+use crate::workspace;
 
 /// `cargo xtask tools ...`
 #[derive(Subcommand)]
@@ -302,6 +303,25 @@ pub fn git() -> Res<Command> {
     Ok(Command::new(git_path()?))
 }
 
+/// Runs the pinned `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
+pub fn git_output(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
+    let out = git()?
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
 fn resolve_git() -> Res<PathBuf> {
     let tool = TOOLS
         .iter()
@@ -400,9 +420,9 @@ fn check() -> Res<ExitCode> {
     }
 }
 
-/// `toolchain.channel` from the workspace's rust-toolchain.toml.
+/// `toolchain.channel` from the rust-toolchain.toml of the checkout xtask runs in.
 pub fn toolchain_channel() -> Res<String> {
-    let path = workspace_root().join("rust-toolchain.toml");
+    let path = workspace::root()?.join("rust-toolchain.toml");
     let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let doc: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     doc.get("toolchain")

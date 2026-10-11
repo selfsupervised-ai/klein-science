@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 
 use crate::Res;
 use crate::host::tool_path;
+use crate::workspace;
 
 /// `cargo xtask store ...`
 #[derive(Subcommand)]
@@ -64,7 +65,7 @@ pub fn run(cmd: StoreCmd) -> Res<()> {
     let remote = Remote::from_env();
     match cmd {
         StoreCmd::Fetch { recipes } => {
-            let corpora = corpora_dir();
+            let corpora = corpora_dir()?;
             for recipe in &recipes {
                 fetch_recipe(&cache, &remote, recipe, &corpora)?;
             }
@@ -314,25 +315,19 @@ impl fmt::Display for Source {
     }
 }
 
-/// The workspace root (the parent of `xtask/`).
-pub fn workspace_root() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().unwrap_or(manifest).to_path_buf()
-}
-
-/// `$CARGO_TARGET_DIR`, or `<workspace>/target`.
-pub fn target_dir() -> PathBuf {
+/// `$CARGO_TARGET_DIR`, or `target/` of the checkout xtask runs in ([`workspace::root`]).
+pub fn target_dir() -> Res<PathBuf> {
     match env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => workspace_root().join("target"),
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(workspace::root()?.join("target")),
     }
 }
 
 /// `$KSCI_CORPORA`, or `<target>/corpora`. Tests resolve the same directory.
-pub fn corpora_dir() -> PathBuf {
+pub fn corpora_dir() -> Res<PathBuf> {
     match env::var_os("KSCI_CORPORA") {
-        Some(dir) => PathBuf::from(dir),
-        None => target_dir().join("corpora"),
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(target_dir()?.join("corpora")),
     }
 }
 

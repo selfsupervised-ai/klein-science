@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use crate::Res;
 use crate::host::{self, heavy_job};
-use crate::store::workspace_root;
+use crate::workspace;
 
 /// The CI steps, in order: `(name, argv)`. Each argv starts with `cargo`, which runs as the
 /// resolved cargo; a step that needs another tool reaches it through `cargo xtask`, which runs
@@ -48,11 +48,11 @@ pub const STEPS: &[(&str, &[&str])] = &[
 
 /// Runs every step from the workspace root and stops at the first failure.
 pub fn run() -> Res<ExitCode> {
+    let root = workspace::root()?;
     let cargo = host::cargo()?;
     let shown = cargo.path.display();
     println!("ci: cargo is {shown}");
     let _held = heavy_job()?;
-    let root = workspace_root();
     for (name, argv) in STEPS {
         let (program, args) = argv.split_first().ok_or("empty CI step")?;
         if *program != "cargo" {

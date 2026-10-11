@@ -4,21 +4,20 @@
 //! `check no-corpus` (CONF-02, CLAUDE.md rule 6) keeps corpus, golden and vector bytes out of git:
 //! git holds recipes, manifests and aggregate scores, and the bytes live in the artifact store.
 //!
-//! It judges the git repository of the current directory (not the tree xtask was compiled
-//! from), and the bytes git would commit: each index entry by its staged blob, never by the
+//! It judges the klein-science checkout of the current directory ([`workspace::root`], never
+//! the tree xtask was compiled from), and the bytes git would commit: each index entry by its staged blob, never by the
 //! working copy, plus each untracked, non-ignored file (what `git add` stages next). An entry it
 //! cannot size fails the check rather than being skipped.
 
-use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitCode, Stdio};
 
 use clap::Subcommand;
 
 use crate::Res;
-use crate::host;
+use crate::{host, workspace};
 
 /// `cargo xtask check ...`
 #[derive(Subcommand)]
@@ -51,7 +50,7 @@ const GOLDEN_EXT: [&str; 2] = ["json", "md"];
 const CORPORA_EXT: [&str; 2] = ["toml", "md"];
 
 fn no_corpus() -> Res<ExitCode> {
-    let root = repo_root()?;
+    let root = workspace::root()?;
     let mut files = index_files(&root)?;
     let staged = files.len();
     files.extend(untracked_files(&root)?);
@@ -78,43 +77,11 @@ fn no_corpus() -> Res<ExitCode> {
     }
 }
 
-/// Runs the pinned `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
-fn git_out(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
-    let out = host::git()?
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {}: {}: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(out.stdout)
-}
-
-/// The top level of the git work tree of the current directory: the guard judges the
-/// repository it is asked about, not the tree xtask was compiled from.
-fn repo_root() -> Res<PathBuf> {
-    let cwd = env::current_dir().map_err(|e| format!("current directory: {e}"))?;
-    let out = git_out(&cwd, &["rev-parse", "--show-toplevel"])?;
-    let top = String::from_utf8(out).map_err(|e| format!("git rev-parse: {e}"))?;
-    let top = top.trim_end_matches(['\n', '\r']);
-    if top.is_empty() {
-        return Err(format!("{} is not inside a git work tree", cwd.display()));
-    }
-    Ok(PathBuf::from(top))
-}
-
 /// Every index entry as `(path, staged blob size)`: the bytes the next commit holds, whatever
 /// the working copy says. An entry that is not a readable blob (a submodule, a missing object)
 /// is an error: what cannot be sized cannot be judged.
 fn index_files(root: &Path) -> Res<Vec<(String, u64)>> {
-    let listing = git_out(root, &["ls-files", "-z", "--stage"])?;
+    let listing = host::git_output(root, &["ls-files", "-z", "--stage"])?;
     let mut entries = Vec::new();
     for record in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         // `<mode> SP <object> SP <stage> TAB <path>`
@@ -209,7 +176,7 @@ fn blob_sizes(root: &Path, entries: &[(String, String)]) -> Res<Vec<Result<u64, 
 /// embedded repository (listed with a trailing `/`) holds none of this repository's bytes; it is
 /// named, not judged.
 fn untracked_files(root: &Path) -> Res<Vec<(String, u64)>> {
-    let listing = git_out(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let listing = host::git_output(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
     let mut files = Vec::new();
     for raw in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8_lossy(raw).into_owned();
