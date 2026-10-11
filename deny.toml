@@ -3,14 +3,11 @@
 # Run by `cargo xtask ci` as `cargo deny check` (advisories, bans, licenses, sources).
 
 [graph]
-# The targets the shipped crates are built for: the Mac (R2 Metal), Linux (R2 CPU/GPU and the
-# oracle box) and wasm32 (the R0 component; wasm32-unknown-unknown stands in for wasm32-wasip2,
-# which cargo-deny's built-in cfg table may not know).
-targets = [
-    "aarch64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "wasm32-unknown-unknown",
-]
+# No target filtering: every target-specific dependency is audited, whatever target it is for.
+# A target list has to be kept in step with every shipped target (wasm32-wasip2 for R0, the native
+# R2 hosts), and one that drifts hides that target's dependencies (review W1: a
+# `[target.wasm32-wasip2.dependencies] getrandom` passed a list naming wasm32-unknown-unknown).
+targets = []
 # Dev-dependencies are never shipped (proptest, for one, pulls rand).
 exclude-dev = true
 # Unshipped tooling, test hosts and probes. Exclusion is recursive: a crate reachable only
