@@ -841,12 +841,21 @@ impl<'de> serde::Deserialize<'de> for Table {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Table, D::Error> {
         use serde::de::Error;
         // The same strict parse as Table::from_slice, so no serde path lets a repeated key through.
-        let value = strict_value(deserializer).map_err(|(e, strict)| match strict {
-            Some(strict) => D::Error::custom(strict),
-            None => e,
-        })?;
+        let value = strict_document(deserializer)?;
         Table::from_value(&value).map_err(D::Error::custom)
     }
+}
+
+/// The strict parse for a serde `Deserialize` impl: [`strict_value`], with a repeated key or excess depth reported
+/// as its typed [`WireError`].
+pub(crate) fn strict_document<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Value, D::Error> {
+    use serde::de::Error;
+    strict_value(deserializer).map_err(|(e, strict)| match strict {
+        Some(strict) => D::Error::custom(strict),
+        None => e,
+    })
 }
 
 /// Reject any cycle, reachable or not, with an iterative three-colour DFS.

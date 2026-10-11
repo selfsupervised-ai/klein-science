@@ -440,10 +440,18 @@ fn envelope_request_roundtrip() {
     let json = request_json(r#""100""#);
     let request =
         Request::from_canonical_slice(json.as_bytes()).expect("canonical request decodes");
-    assert_eq!(request.op, "science.cas.canonicalize");
-    assert_eq!(request.budget.steps_u64(), Some(100));
-    assert_eq!(request.args["expr"].identity(), X2_PLUS_1_IDENTITY);
+    assert_eq!(request.op(), "science.cas.canonicalize");
+    assert_eq!(request.budget().steps(), 100);
+    assert_eq!(request.args()["expr"].identity(), X2_PLUS_1_IDENTITY);
     assert_eq!(to_jcs(&request).expect("encodes"), json.as_bytes());
+    assert_eq!(request.to_jcs(), json.as_bytes());
+    // The constructor builds the same request.
+    let built = Request::new(
+        "science.cas.canonicalize",
+        [("expr".to_owned(), table(X2_PLUS_1_CANONICAL))].into(),
+        Budget::new(100),
+    );
+    assert_eq!(built, request);
 }
 
 #[test]
@@ -480,7 +488,7 @@ fn envelope_steps() {
         let request =
             Request::from_canonical_slice(request_json(&format!(r#""{steps}""#)).as_bytes())
                 .expect("steps decode");
-        assert_eq!(request.budget.steps_u64(), Some(expected));
+        assert_eq!(request.budget().steps(), expected);
     }
     for steps in ["18446744073709551616", "-1", "01", "", "+1", "1.5"] {
         assert_eq!(
@@ -497,12 +505,11 @@ fn envelope_steps() {
             path: "/budget/steps".into()
         }
     );
+    assert_eq!(ksci_wire::numeral::parse_u64("007"), None);
+    // A budget holds a u64, so it encodes to the one step numeral of its value.
     assert_eq!(
-        Budget {
-            steps: "007".into()
-        }
-        .steps_u64(),
-        None
+        to_jcs(&Budget::new(u64::MAX)).expect("encodes"),
+        br#"{"steps":"18446744073709551615"}"#
     );
 }
 
@@ -541,24 +548,13 @@ fn envelope_request_rejects_bad_contents() {
     }
 }
 
+/// The exact response for x**2 + 1. Its bytes are pinned by `envelope_response_shape`.
 fn exact_response() -> Response {
-    Response {
-        v: 1,
-        status: Status::Exact,
-        numeric_class: "exact".into(),
-        result: Some(table(X2_PLUS_1_CANONICAL)),
-        identity: Some(X2_PLUS_1_IDENTITY.into()),
-    }
+    Response::exact(&table(X2_PLUS_1_CANONICAL))
 }
 
 fn exhausted_response() -> Response {
-    Response {
-        v: 1,
-        status: Status::FuelExhausted,
-        numeric_class: "exact".into(),
-        result: None,
-        identity: None,
-    }
+    Response::fuel_exhausted()
 }
 
 #[test]
@@ -567,6 +563,16 @@ fn envelope_response_shape() {
         r#"{{"identity":"{X2_PLUS_1_IDENTITY}","numeric_class":"exact","result":{X2_PLUS_1_CANONICAL},"status":"exact","v":1}}"#
     );
     let exhausted = r#"{"identity":null,"numeric_class":"exact","result":null,"status":"fuel_exhausted","v":1}"#;
+    // The accessors read what the constructors built.
+    let response = exact_response();
+    assert_eq!(response.status(), Status::Exact);
+    assert_eq!(response.numeric_class(), "exact");
+    assert_eq!(response.result(), Some(&table(X2_PLUS_1_CANONICAL)));
+    assert_eq!(response.identity(), Some(X2_PLUS_1_IDENTITY));
+    let response = exhausted_response();
+    assert_eq!(response.status(), Status::FuelExhausted);
+    assert_eq!(response.numeric_class(), "exact");
+    assert_eq!((response.result(), response.identity()), (None, None));
     assert_eq!(exact_response().to_jcs(), exact.as_bytes());
     assert_eq!(exhausted_response().to_jcs(), exhausted.as_bytes());
     assert_eq!(Response::from_slice(exact.as_bytes()), Ok(exact_response()));
@@ -689,7 +695,7 @@ fn envelope_response_invariants() {
     // The two valid shapes still decode, and the constructors produce them.
     let ok = response_json(&int1, "exact", INT_1, "exact");
     assert_eq!(
-        Response::from_slice(ok.as_bytes()).map(|r| r.identity),
+        Response::from_slice(ok.as_bytes()).map(|r| r.identity().map(str::to_owned)),
         Ok(Some(int1_identity))
     );
     let dirty = table(
@@ -940,7 +946,7 @@ fn provenance(tag: &str) -> Provenance {
         backend: format!("backend-{tag}"),
         device: format!("device-{tag}"),
         driver: format!("driver-{tag}"),
-        wall_ms: format!("{}", tag.len()),
+        wall_ms: tag.len() as u64,
     }
 }
 
@@ -948,20 +954,27 @@ fn provenance(tag: &str) -> Provenance {
 fn envelope_provenance_outside() {
     let request = request_json(r#""100""#);
     let response = exact_response().to_jcs();
-    let r0 = Record::new(request.as_bytes(), &response, provenance("r0"));
-    let r2 = Record::new(request.as_bytes(), &response, provenance("r2-metal"));
-    assert_ne!(r0.provenance, r2.provenance);
-    assert_eq!(r0.request_digest, r2.request_digest);
-    assert_eq!(r0.response_digest, r2.response_digest);
-    assert_eq!(r0.request_digest, sha256_hex(request.as_bytes()));
-    assert_eq!(r0.response_digest, sha256_hex(&response));
-    // The record itself carries provenance under "impl".
+    // The record is built from the decoded request and response; its digests are those of the bytes as sent.
+    let decoded_request =
+        Request::from_canonical_slice(request.as_bytes()).expect("request decodes");
+    let decoded_response = Response::from_slice(&response).expect("response decodes");
+    let r0 = Record::new(&decoded_request, &decoded_response, provenance("r0"));
+    let r2 = Record::new(&decoded_request, &decoded_response, provenance("r2-metal"));
+    assert_ne!(r0.provenance(), r2.provenance());
+    assert_eq!(r0.request_digest(), r2.request_digest());
+    assert_eq!(r0.response_digest(), r2.response_digest());
+    assert_eq!(r0.request_digest(), sha256_hex(request.as_bytes()));
+    assert_eq!(r0.response_digest(), sha256_hex(&response));
+    // The record itself carries provenance under "impl", and wall_ms as a decimal string.
     let record = String::from_utf8(to_jcs(&r0).expect("encodes")).expect("utf-8");
     assert!(
         record.contains(r#""provenance":{"backend":"backend-r0""#),
         "{record}"
     );
     assert!(record.contains(r#""impl":"ksci-r0""#), "{record}");
+    assert!(record.contains(r#""wall_ms":"2""#), "{record}");
+    // A record reads back through serde to the same value.
+    assert_eq!(serde_json::from_str::<Record>(&record).ok(), Some(r0));
     // A response or request carrying provenance is rejected.
     let with_provenance = String::from_utf8(response).expect("utf-8").replacen(
         r#""numeric_class""#,
