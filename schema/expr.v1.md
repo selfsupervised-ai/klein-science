@@ -15,7 +15,7 @@ An expression is one JSON object with exactly three keys:
 - `root` is the index of the expression's root node.
 - `v` is the schema version, exactly `1`.
 
-Any other key, or a missing key, is rejected. A cycle anywhere in the table is rejected, whether or not the root
+Any other key, a missing key or a repeated key is rejected. A cycle anywhere in the table is rejected, whether or not the root
 reaches it. An index must be below `nodes.len()`; `nodes.len() - 1` is the largest valid index.
 
 ## Node kinds
@@ -88,6 +88,10 @@ an assumption value, a bare node), or a non-integer, negative or too-large numbe
 - Names are compared as exact UTF-8 bytes. There is no Unicode normalisation: `"x"` and `"x\u0301"` are different
   names.
 - Object keys are written in RFC 8785 order (UTF-16 code units). Assumption keys are ASCII, so this is byte order.
+- No object may repeat a key, at any depth, in a table, a request or a response. Keys are compared after
+  unescaping, so `"v"` and `"\u0076"` are the same key. A repeat is rejected as `DuplicateKey` with the JSON pointer
+  of the repeated key, even when both copies carry the same value. JSON parsers disagree on which copy wins, so
+  none does.
 
 ## Canonical form
 
@@ -124,10 +128,14 @@ Example: `x**2 + 1` canonicalises to
 
 with identity `37f7939bd191aa48173b1b6a45838b6b246aeb8a001d276f9b1c2798342cb964`.
 
-## Document size cap
+## Document size and depth caps
 
 A document longer than 64 MiB (`MAX_DOCUMENT_BYTES` = 67108864 bytes) is rejected before it is parsed. A document
 of exactly 64 MiB passes the size check. The cap applies to tables, requests and responses alike.
+
+Arrays and objects nest at most 32 deep (`MAX_DEPTH`). The first array or object past that depth is rejected as
+`TooDeep` with its JSON pointer. The deepest valid document, a request whose argument table holds a symbol with
+assumptions, nests 6 deep.
 
 ## Envelopes
 
@@ -153,9 +161,14 @@ digests with provenance, which is never inside the hashed bytes.
 ```
 
 - `status` is `exact`, or `fuel_exhausted` when the logical step budget ran out.
-- `numeric_class` is `exact` in Phase 1.
-- `result` is the result table and `identity` its identity; both are `null` when there is no result.
+- `numeric_class` is `exact` in Phase 1, whatever the status. Any other value is rejected.
+- With status `exact`, `result` is the result table **in canonical form** (it equals its own canonical table), and
+  `identity` is exactly that table's identity: 64 lowercase hex digits. A missing result or identity, a
+  non-canonical result, or any other identity is rejected.
+- With status `fuel_exhausted`, `result` and `identity` are both `null`. A result or an identity is rejected.
 - The keys are always present, and unknown keys (such as `provenance`) are rejected.
+
+So a response has one byte string per outcome: an exact result has one canonical table and one identity.
 
 Example: the response for `x**2 + 1` with an exact result is
 
@@ -179,8 +192,9 @@ digests whatever their provenance.
 ### Canonical input
 
 A request is accepted only if its bytes equal their own JCS re-encoding. Any other spelling (whitespace, key order,
-a duplicated key, an unnecessary escape, a trailing newline) is rejected as `NonCanonical`, so each request has
-exactly one byte string and one digest. Responses are read back under the same rule.
+an unnecessary escape, a trailing newline) is rejected as `NonCanonical`, so each request has exactly one byte
+string and one digest. A duplicated key is rejected before this check, as `DuplicateKey`. Responses are read back
+under the same rules, and then checked against the Response rules above.
 
 ### What is hashed
 

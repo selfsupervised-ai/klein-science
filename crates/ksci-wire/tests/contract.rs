@@ -590,8 +590,8 @@ fn response_rejected(json: &str) -> WireError {
     }
 }
 
-fn invalid_response(path: &str) -> impl Fn(&WireError) -> bool + '_ {
-    move |e| matches!(e, WireError::InvalidResponse { path: p, .. } if p == path)
+fn is_invalid_response(err: &WireError, path: &str) -> bool {
+    matches!(err, WireError::InvalidResponse { path: p, .. } if p == path)
 }
 
 const INT_1: &str = r#"{"nodes":[["Int","1"]],"root":0,"v":1}"#;
@@ -609,29 +609,27 @@ fn envelope_response_invariants() {
         counter,
         r#"{"identity":"0000000000000000000000000000000000000000000000000000000000000000","numeric_class":"approx","result":{"nodes":[["Int","1"]],"root":0,"v":1},"status":"exact","v":1}"#
     );
-    let cases: Vec<(String, Box<dyn Fn(&WireError) -> bool>)> = vec![
-        (counter, Box::new(invalid_response("/numeric_class"))),
+    // Each case names the InvalidResponse path it expects, or None for IdentityMismatch.
+    let cases: Vec<(String, Option<&str>)> = vec![
+        (counter, Some("/numeric_class")),
         // numeric_class is "exact" in Phase 1, whatever the status.
         (
             response_json(&x2, "approx", X2_PLUS_1_CANONICAL, "exact"),
-            Box::new(invalid_response("/numeric_class")),
+            Some("/numeric_class"),
         ),
         (
             response_json("null", "approx", "null", "fuel_exhausted"),
-            Box::new(invalid_response("/numeric_class")),
+            Some("/numeric_class"),
         ),
         (
             response_json("null", "", "null", "fuel_exhausted"),
-            Box::new(invalid_response("/numeric_class")),
+            Some("/numeric_class"),
         ),
         // identity is the identity of result: all zeros, another valid table's identity, upper-case hex.
-        (
-            response_json(&zeros, "exact", INT_1, "exact"),
-            Box::new(|e| matches!(e, WireError::IdentityMismatch { .. })),
-        ),
+        (response_json(&zeros, "exact", INT_1, "exact"), None),
         (
             response_json(&int1, "exact", X2_PLUS_1_CANONICAL, "exact"),
-            Box::new(|e| matches!(e, WireError::IdentityMismatch { .. })),
+            None,
         ),
         (
             response_json(
@@ -640,29 +638,29 @@ fn envelope_response_invariants() {
                 X2_PLUS_1_CANONICAL,
                 "exact",
             ),
-            Box::new(|e| matches!(e, WireError::IdentityMismatch { .. })),
+            None,
         ),
         // status exact needs a result and its identity.
         (
             response_json("null", "exact", "null", "exact"),
-            Box::new(invalid_response("/result")),
+            Some("/result"),
         ),
         (
             response_json("null", "exact", X2_PLUS_1_CANONICAL, "exact"),
-            Box::new(invalid_response("/identity")),
+            Some("/identity"),
         ),
         (
             response_json(&x2, "exact", "null", "exact"),
-            Box::new(invalid_response("/result")),
+            Some("/result"),
         ),
         // status fuel_exhausted carries neither.
         (
             response_json(&x2, "exact", X2_PLUS_1_CANONICAL, "fuel_exhausted"),
-            Box::new(invalid_response("/result")),
+            Some("/result"),
         ),
         (
             response_json(&x2, "exact", "null", "fuel_exhausted"),
-            Box::new(invalid_response("/identity")),
+            Some("/identity"),
         ),
         // The result is in canonical form: the same expression with an unreachable node, under its true identity.
         (
@@ -672,12 +670,16 @@ fn envelope_response_invariants() {
                 r#"{"nodes":[["Sym","x",{}],["Int","2"],["Pow",0,1],["Int","1"],["Add",2,3],["Sym","y",{}]],"root":4,"v":1}"#,
                 "exact",
             ),
-            Box::new(invalid_response("/result")),
+            Some("/result"),
         ),
     ];
-    for (json, expected) in &cases {
+    for (json, path) in &cases {
         let err = response_rejected(json);
-        assert!(expected(&err), "{json}: {err:?}");
+        let expected = match path {
+            Some(path) => is_invalid_response(&err, path),
+            None => matches!(err, WireError::IdentityMismatch { .. }),
+        };
+        assert!(expected, "{json}: {err:?}");
     }
     // The two valid shapes still decode, and the constructors produce them.
     let ok = response_json(&int1, "exact", INT_1, "exact");

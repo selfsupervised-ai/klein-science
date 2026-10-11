@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
+use serde::de::DeserializeSeed;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -353,12 +354,197 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Parse `bytes` as JSON after the size check.
+/// Parse `bytes` as JSON after the size check, rejecting repeated keys and nesting deeper than [`MAX_DEPTH`].
 pub(crate) fn parse_document(bytes: &[u8]) -> Result<Value, WireError> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
         return Err(WireError::TooLarge { len: bytes.len() });
     }
-    serde_json::from_slice(bytes).map_err(|e| WireError::NotJson(e.to_string()))
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = strict_value(&mut deserializer)
+        .map_err(|(e, strict)| strict.unwrap_or_else(|| WireError::NotJson(e.to_string())))?;
+    deserializer
+        .end()
+        .map_err(|e| WireError::NotJson(e.to_string()))?;
+    Ok(value)
+}
+
+/// Build a [`Value`] from `deserializer`, failing on a repeated object key or nesting deeper than [`MAX_DEPTH`].
+///
+/// On failure it returns the deserializer's error and, when the failure is one of those two, the typed
+/// [`WireError`] that names it.
+fn strict_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Value, (D::Error, Option<WireError>)> {
+    let failure = std::cell::RefCell::new(None);
+    match (Strict {
+        depth: 0,
+        failure: &failure,
+    })
+    .deserialize(deserializer)
+    {
+        Ok(value) => Ok(value),
+        Err(e) => Err((
+            e,
+            failure.into_inner().map(|(kind, mut path)| {
+                path.reverse();
+                let path = pointer_owned(&path);
+                match kind {
+                    StrictFailure::DuplicateKey => WireError::DuplicateKey { path },
+                    StrictFailure::TooDeep => WireError::TooDeep { path },
+                }
+            }),
+        )),
+    }
+}
+
+/// One step of a path, owned, collected while a strict parse unwinds.
+enum OwnedSeg {
+    Key(String),
+    Index(usize),
+}
+
+fn pointer_owned(path: &[OwnedSeg]) -> String {
+    let segs: Vec<Seg<'_>> = path
+        .iter()
+        .map(|seg| match seg {
+            OwnedSeg::Key(key) => Seg::Key(key),
+            OwnedSeg::Index(i) => Seg::Index(*i),
+        })
+        .collect();
+    pointer(&segs)
+}
+
+#[derive(Clone, Copy)]
+enum StrictFailure {
+    DuplicateKey,
+    TooDeep,
+}
+
+/// The failure and its path, innermost segment first: each enclosing container appends its own segment as the
+/// error unwinds, so the success path builds no paths at all.
+type FailureCell = std::cell::RefCell<Option<(StrictFailure, Vec<OwnedSeg>)>>;
+
+/// A seed that builds a [`Value`] like serde_json's own, but fails on a repeated key and counts nesting.
+///
+/// The depth bound is ours and stricter than serde_json's recursion limit (128), so recursion here is bounded at
+/// [`MAX_DEPTH`] frames.
+#[derive(Clone, Copy)]
+struct Strict<'a> {
+    depth: usize,
+    failure: &'a FailureCell,
+}
+
+impl Strict<'_> {
+    /// Enter one more array or object, or fail as too deep.
+    fn enter<E: serde::de::Error>(self) -> Result<Self, E> {
+        if self.depth >= MAX_DEPTH {
+            *self.failure.borrow_mut() = Some((StrictFailure::TooDeep, Vec::new()));
+            return Err(E::custom(format_args!("nesting deeper than {MAX_DEPTH}")));
+        }
+        Ok(Strict {
+            depth: self.depth + 1,
+            failure: self.failure,
+        })
+    }
+
+    /// Add `seg` to the path of a failure that is unwinding through this container.
+    fn unwind(self, seg: impl FnOnce() -> OwnedSeg) {
+        if let Some((_, path)) = self.failure.borrow_mut().as_mut() {
+            path.push(seg());
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Strict<'_> {
+    type Value = Value;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Strict<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Value, E> {
+        Ok(Value::Bool(b))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Value, E> {
+        Ok(Value::Number(n.into()))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Value, E> {
+        Ok(Value::Number(n.into()))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Value, E> {
+        // As serde_json's own Value: JSON text has no NaN or infinity, so this is always a number.
+        Ok(serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Value, E> {
+        Ok(Value::String(s.to_owned()))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Value, E> {
+        Ok(Value::String(s))
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        self.deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let inner = self.enter()?;
+        let mut items = Vec::new();
+        loop {
+            match seq.next_element_seed(inner) {
+                Ok(Some(item)) => items.push(item),
+                Ok(None) => return Ok(Value::Array(items)),
+                Err(e) => {
+                    let i = items.len();
+                    self.unwind(|| OwnedSeg::Index(i));
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
+        use serde::de::Error;
+        let inner = self.enter()?;
+        let mut map = Map::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if map.contains_key(&key) {
+                *self.failure.borrow_mut() =
+                    Some((StrictFailure::DuplicateKey, vec![OwnedSeg::Key(key)]));
+                return Err(A::Error::custom("duplicate object key"));
+            }
+            match access.next_value_seed(inner) {
+                Ok(value) => {
+                    map.insert(key, value);
+                }
+                Err(e) => {
+                    self.unwind(|| OwnedSeg::Key(key));
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Value::Object(map))
+    }
 }
 
 /// Check that `value` is the number [`SCHEMA_VERSION`].
@@ -653,8 +839,13 @@ impl Serialize for Table {
 
 impl<'de> serde::Deserialize<'de> for Table {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Table, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        Table::from_value(&value).map_err(serde::de::Error::custom)
+        use serde::de::Error;
+        // The same strict parse as Table::from_slice, so no serde path lets a repeated key through.
+        let value = strict_value(deserializer).map_err(|(e, strict)| match strict {
+            Some(strict) => D::Error::custom(strict),
+            None => e,
+        })?;
+        Table::from_value(&value).map_err(D::Error::custom)
     }
 }
 

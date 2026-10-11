@@ -92,15 +92,38 @@ pub struct Response {
     pub identity: Option<String>,
 }
 
+/// The only `numeric_class` in Phase 1.
+const NUMERIC_CLASS_EXACT: &str = "exact";
+
+fn invalid(path: &str, reason: &'static str) -> WireError {
+    WireError::InvalidResponse {
+        path: path.into(),
+        reason,
+    }
+}
+
 impl Response {
-    /// An exact response carrying `result` in canonical form and its identity.
-    pub fn exact(_result: &Table) -> Response {
-        unimplemented!("review F1 skeleton")
+    /// An exact response: `result` in canonical form and its identity.
+    pub fn exact(result: &Table) -> Response {
+        let result = result.canonicalize();
+        Response {
+            v: SCHEMA_VERSION,
+            status: Status::Exact,
+            numeric_class: NUMERIC_CLASS_EXACT.into(),
+            identity: Some(result.identity()),
+            result: Some(result),
+        }
     }
 
-    /// A response for a request whose step budget ran out.
+    /// The response for a request whose logical step budget ran out: no result and no identity.
     pub fn fuel_exhausted() -> Response {
-        unimplemented!("review F1 skeleton")
+        Response {
+            v: SCHEMA_VERSION,
+            status: Status::FuelExhausted,
+            numeric_class: NUMERIC_CLASS_EXACT.into(),
+            result: None,
+            identity: None,
+        }
     }
 
     /// The response's JCS bytes, the bytes that are hashed.
@@ -108,13 +131,59 @@ impl Response {
         to_jcs(self).expect("a response always encodes")
     }
 
-    /// Decode a response, which must be in canonical form (as [`Response::to_jcs`] writes it).
+    /// Decode a response, which must be in canonical form (as [`Response::to_jcs`] writes it) and satisfy
+    /// [`Response::check`].
     pub fn from_slice(bytes: &[u8]) -> Result<Response, WireError> {
         let response: Response = decode_canonical(bytes)?;
-        if response.v != SCHEMA_VERSION {
+        response.check()?;
+        Ok(response)
+    }
+
+    /// Check every response rule of `schema/expr.v1.md`:
+    ///
+    /// - `v` is 1 and `numeric_class` is `exact`;
+    /// - status `exact`: `result` is present and in canonical form, and `identity` is its identity;
+    /// - status `fuel_exhausted`: `result` and `identity` are both `null`.
+    pub fn check(&self) -> Result<(), WireError> {
+        if self.v != SCHEMA_VERSION {
             return Err(WireError::Version { path: "/v".into() });
         }
-        Ok(response)
+        if self.numeric_class != NUMERIC_CLASS_EXACT {
+            return Err(invalid(
+                "/numeric_class",
+                "numeric_class is \"exact\" in Phase 1",
+            ));
+        }
+        match (self.status, &self.result, &self.identity) {
+            (Status::Exact, None, _) => Err(invalid("/result", "status exact carries a result")),
+            (Status::Exact, Some(_), None) => Err(invalid(
+                "/identity",
+                "status exact carries the result's identity",
+            )),
+            (Status::Exact, Some(result), Some(claimed)) => {
+                let canonical = result.canonicalize();
+                if &canonical != result {
+                    return Err(invalid("/result", "the result is in canonical form"));
+                }
+                let actual = sha256_hex(&canonical.to_jcs());
+                if claimed != &actual {
+                    return Err(WireError::IdentityMismatch {
+                        claimed: claimed.clone(),
+                        actual,
+                    });
+                }
+                Ok(())
+            }
+            (Status::FuelExhausted, Some(_), _) => Err(invalid(
+                "/result",
+                "status fuel_exhausted carries no result",
+            )),
+            (Status::FuelExhausted, None, Some(_)) => Err(invalid(
+                "/identity",
+                "status fuel_exhausted carries no identity",
+            )),
+            (Status::FuelExhausted, None, None) => Ok(()),
+        }
     }
 }
 
