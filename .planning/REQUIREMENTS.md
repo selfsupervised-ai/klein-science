@@ -254,12 +254,105 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| DET-01 | Phase 1 | Pending |
+| DET-02 | Phase 1 | Pending |
+| DET-03 | Phase 1 | Pending |
+| DET-04 | Phase 1 | Pending |
+| DET-05 | Phase 2 | Pending |
+| DET-06 | Phase 5 | Pending |
+| DET-07 | Phase 2 | Pending |
+| DET-08 | Phase 1 | Pending |
+| CONF-01 | Phase 1 | Pending |
+| CONF-02 | Phase 1 | Pending |
+| CONF-03 | Phase 1 | Pending |
+| CONF-04 | Phase 3 | Pending |
+| CONF-05 | Phase 4 | Pending |
+| CONF-06 | Phase 1 | Pending |
+| LIC-01 | Phase 1 | Pending |
+| LIC-02 | Phase 1 | Pending |
+| DEP-01 | Phase 1 | Pending |
+| DEP-02 | Phase 1 | Pending |
+| DEP-03 | Phase 1 | Pending |
+| PLUG-01 | Phase 1 | Pending |
+| PLUG-02 | Phase 1 | Pending |
+| PLUG-03 | Phase 5 | Pending |
+| PLUG-04 | Phase 5 | Pending |
+| GUEST-01 | Phase 1 | Pending |
+| GUEST-02 | Phase 1 | Pending |
+| GUEST-03 | Phase 2 | Pending |
+| GUEST-04 | Phase 2 | Pending |
+| GUEST-05 | Phase 2 | Pending |
+| GUEST-06 | Phase 2 | Pending |
+| GUEST-07 | Phase 2 | Pending |
+| PRINT-01 | Phase 2 | Pending |
+| PRINT-02 | Phase 2 | Pending |
+| PRINT-03 | Phase 2 | Pending |
+| CORE-01 | Phase 2 | Pending |
+| CORE-02 | Phase 2 | Pending |
+| CORE-03 | Phase 2 | Pending |
+| CORE-04 | Phase 2 | Pending |
+| CORE-05 | Phase 2 | Pending |
+| CORE-06 | Phase 2 | Pending |
+| CORE-07 | Phase 2 | Pending |
+| CORE-08 | Phase 2 | Pending |
+| CORE-09 | Phase 2 | Pending |
+| POLY-01 | Phase 3 | Pending |
+| POLY-02 | Phase 3 | Pending |
+| POLY-03 | Phase 3 | Pending |
+| POLY-04 | Phase 3 | Pending |
+| POLY-05 | Phase 3 | Pending |
+| POLY-06 | Phase 3 | Pending |
+| NT-01 | Phase 3 | Pending |
+| NT-02 | Phase 3 | Pending |
+| NT-03 | Phase 3 | Pending |
+| SOLVE-01 | Phase 3 | Pending |
+| SOLVE-02 | Phase 3 | Pending |
+| SOLVE-03 | Phase 4 | Pending |
+| SOLVE-04 | Phase 3 | Pending |
+| SOLVE-05 | Phase 4 | Pending |
+| SOLVE-06 | Phase 4 | Pending |
+| SOLVE-07 | Phase 4 | Pending |
+| SIMP-01 | Phase 4 | Pending |
+| SIMP-02 | Phase 4 | Pending |
+| SIMP-03 | Phase 4 | Pending |
+| SIMP-04 | Phase 4 | Pending |
+| SIMP-05 | Phase 4 | Pending |
+| CALC-01 | Phase 5 | Pending |
+| CALC-02 | Phase 5 | Pending |
+| CALC-03 | Phase 5 | Pending |
+| CALC-04 | Phase 5 | Pending |
+| CALC-05 | Phase 5 | Pending |
+| NUM-01 | Phase 5 | Pending |
+| NUM-02 | Phase 5 | Pending |
+| MAT-01 | Phase 6 | Pending |
+| DISC-01 | Phase 6 | Pending |
+| CERT-01 | Phase 4 | Pending |
+| CERT-02 | Phase 4 | Pending |
+| CERT-03 | Phase 3 | Pending |
+| CERT-04 | Phase 3 | Pending |
+| CERT-05 | Phase 4 | Pending |
+| CERT-06 | Phase 4 | Pending |
+| CERT-07 | Phase 6 | Pending |
+| CERT-08 | Phase 5 | Pending |
+| CERT-09 | Phase 4 | Pending |
+| PROVER-01 | Phase 5 | Pending |
+| PROVER-02 | Phase 5 | Pending |
+| PROVER-03 | Phase 5 | Pending |
+| ACCEL-01 | Phase 1 | Pending |
+| ACCEL-02 | Phase 3 | Pending |
+| ACCEL-03 | Phase 3 | Pending |
+| ACCEL-04 | Phase 6 | Pending |
+| GATE-01 | Phase 2 | Pending |
+| GATE-02 | Phase 3 | Pending |
+| GATE-03 | Phase 4 | Pending |
+| GATE-04 | Phase 6 | Pending |
 
 **Coverage:**
 - v1 requirements: 92 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 92
+- Mapped to phases: 92
+- Unmapped: 0
+- Per phase: Phase 1: 19, Phase 2: 20, Phase 3: 18, Phase 4: 16, Phase 5: 14, Phase 6: 5
 
 ---
 *Requirements defined: 2026-10-11*
-*Last updated: 2026-10-11 after initial definition*
+*Last updated: 2026-10-11 after roadmap creation (traceability filled)*
