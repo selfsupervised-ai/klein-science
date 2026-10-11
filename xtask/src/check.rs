@@ -331,19 +331,28 @@ fn under_testdata(rel: &Path) -> bool {
 ///
 /// - Inside the repository, a regular `.rs` file is judged by its header. A non-`.rs` input
 ///   (`include_str!`/`include_bytes!` data) is allowed, unjudged, only under a `testdata/`
-///   directory; anywhere else it is a violation. Build-script output in the provenance target
-///   directory (`OUT_DIR`) is allowed: the build script that wrote it is itself judged.
+///   directory; anywhere else it is a violation. Nothing is exempt for lying in the provenance
+///   target directory (review C1): a file there, including the `OUT_DIR` output of a workspace
+///   build script, is judged like any other input; a headed build script does not vouch for the
+///   bytes it generates.
+/// - The `OUT_DIR` output of a registry or git dependency's build script
+///   ([`depinfo::Compiled::dependency_out_dirs`]) is that dependency's own output and is allowed,
+///   as its source is.
 /// - Outside the repository, an input is allowed only under the cargo registry sources, the cargo
 ///   git checkouts or the pinned toolchain's sysroot; anything else is a violation.
 ///
 /// One real file read under several names is judged once, its other names noted.
 fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
     let target = root.join(PROVENANCE_TARGET);
-    let inputs = depinfo::compile_inputs(root, &target)?;
-    let generated = fs::canonicalize(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let compiled = depinfo::compile_inputs(root, &target)?;
+    let mut dependency_output = Vec::new();
+    for dir in &compiled.dependency_out_dirs {
+        dependency_output
+            .push(fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?);
+    }
     let external = external_roots()?;
     let mut by_path: BTreeMap<String, Judged> = BTreeMap::new();
-    for input in inputs {
+    for input in compiled.inputs {
         let written = input.display().to_string();
         let abs = if input.is_absolute() {
             input
@@ -357,7 +366,7 @@ fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
                     "compiler input cannot be resolved: {e}"
                 ))),
             ),
-            Ok(real) if real.starts_with(&generated) => continue,
+            Ok(real) if dependency_output.iter().any(|d| real.starts_with(d)) => continue,
             Ok(real) => match real.strip_prefix(root) {
                 Ok(rel) => {
                     let rel = rel.display().to_string();
