@@ -229,8 +229,9 @@ pub fn parse_dep_info(text: &str) -> Res<Vec<PathBuf>> {
     Ok(inputs)
 }
 
-/// Splits a dep-info line at spaces; `\ ` is a space inside a path, and any other backslash is
-/// an error.
+/// Splits a non-empty dep-info line at single spaces, exactly as rustc writes it (review W-B):
+/// a leading, repeated or trailing unescaped space is an error, as is any backslash other than
+/// `\ ` (a space inside a path).
 fn split_words(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -242,16 +243,18 @@ fn split_words(line: &str) -> Result<Vec<String>, String> {
                 other => return Err(format!("unrecognised escape `\\{}`", other.unwrap_or(' '))),
             },
             ' ' => {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
+                if word.is_empty() {
+                    return Err("a leading or repeated space".to_owned());
                 }
+                words.push(std::mem::take(&mut word));
             }
             _ => word.push(c),
         }
     }
-    if !word.is_empty() {
-        words.push(word);
+    if word.is_empty() {
+        return Err("a trailing space".to_owned());
     }
+    words.push(word);
     Ok(words)
 }
 
