@@ -51,6 +51,8 @@ registries = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Path dependencies between our own unpublished (publish = false) crates carry no version; that is not a wildcard risk.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
