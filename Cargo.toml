@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -18,6 +18,9 @@ sha2 = "=0.11.0"
 thiserror = "=2.0.21"
 static_assertions = "=1.1.0"
 proptest = "=1.11.0"
+# Unshipped tooling (xtask). toml 1.1.6 is the newest release older than 7 days.
+clap = { version = "=4.6.7", features = ["derive"] }
+toml = "=1.1.6"
 
 # The disallowed lists live in clippy.toml (plan 01-03).
 [workspace.lints.clippy]
