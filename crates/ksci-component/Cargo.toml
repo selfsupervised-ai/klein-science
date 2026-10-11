@@ -1,0 +1,18 @@
+[package]
+name = "ksci-component"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The R0 shell: the science-cas WIT exports, delegating to ksci-ops"
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+wit-bindgen = { workspace = true }
+ksci-ops = { path = "../ksci-ops" }

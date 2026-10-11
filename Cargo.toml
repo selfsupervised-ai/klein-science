@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*", "conformance/ksci-conform", "xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -12,7 +12,7 @@ publish = false
 # `cargo xtask check provenance` compiles exactly these for wasm32-wasip2 and judges what rustc
 # read. A plan that adds an R0 crate (ksci-ops) adds it here.
 [workspace.metadata.ksci]
-r0-crates = ["ksci-ops", "ksci-wire"]
+r0-crates = ["ksci-component", "ksci-ops", "ksci-wire"]
 
 # Exact pins. serde and serde_json match klein-rs, so JCS input parsing matches Klein's own;
 # serde_json_canonicalizer and sha2 are the same crates and pins as klein-rs.
@@ -27,6 +27,13 @@ proptest = "=1.11.0"
 # Unshipped tooling (xtask). toml 1.1.6 is the newest release older than 7 days.
 clap = { version = "=4.6.7", features = ["derive"] }
 toml = "=1.1.6"
+# The R0 guest bindings (ksci-component): the macro and cabi_realloc only, no async runtime.
+wit-bindgen = { version = "=0.62.0", default-features = false, features = ["macros", "realloc"] }
+# The R0 test hosts (ksci-conform, unshipped): Klein's current pin and the D6 floor (D-17), two
+# renamed dependencies behind one host definition (D-01). A compiler, the runtime and the
+# component model only: no WASI, no parallel compilation, no cache, no async.
+wasmtime46 = { package = "wasmtime", version = "=46.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "std"] }
+wasmtime49 = { package = "wasmtime", version = "=49.0.2", default-features = false, features = ["runtime", "cranelift", "component-model", "std"] }
 
 # The disallowed lists live in clippy.toml (plan 01-03).
 [workspace.lints.clippy]

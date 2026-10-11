@@ -8,6 +8,7 @@ mod ci;
 mod depinfo;
 mod host;
 mod oracle;
+mod release;
 mod store;
 mod workspace;
 
@@ -41,6 +42,9 @@ enum Cmd {
     /// Offline oracle images and the one hardened container runner.
     #[command(subcommand)]
     Oracle(oracle::OracleCmd),
+    /// Build the shipped artifacts (R0 component, R2 worker) and their digests.
+    #[command(subcommand)]
+    Release(release::ReleaseCmd),
 }
 
 fn main() -> ExitCode {
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
         Cmd::Check(cmd) => check::run(cmd),
         Cmd::Ci => ci::run(),
         Cmd::Oracle(cmd) => oracle::run(cmd),
+        Cmd::Release(cmd) => release::run(cmd),
     };
     match result {
         Ok(code) => code,

@@ -1,0 +1,18 @@
+[package]
+name = "ksci-conform"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Unshipped conformance host: the R0 component under Wasmtime and the R2 worker, compared byte for byte"
+
+# No `[lints] workspace = true`: ksci-conform is unshipped test tooling (excluded from the shipped
+# cargo-deny graph). It spawns processes and hosts Wasmtime, which the shipped-crate lints do not cover.
+
+[dependencies]
+# No ksci-ops: the host judges the shipped artifacts only, never the op layer linked in-process.
+ksci-wire = { path = "../../crates/ksci-wire" }
+serde_json = { workspace = true }
+wasmtime46 = { workspace = true }
+wasmtime49 = { workspace = true }
