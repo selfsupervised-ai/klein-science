@@ -294,7 +294,7 @@ fn provenance() -> Res<ExitCode> {
     for raw in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8(raw.to_vec())
             .map_err(|_| format!("provenance: path {raw:?} is not UTF-8"))?;
-        if provenance_in_scope(&path) {
+        if in_checked_tree(&path) {
             paths.push(path);
         }
     }
@@ -304,10 +304,20 @@ fn provenance() -> Res<ExitCode> {
         .map_err(|e| format!("provenance: {NOTICE_FILE}: {e}"))?;
     // The working copy is judged: it is what cargo compiles. A listed file that cannot be read
     // (a tracked file deleted from the working copy) fails the check rather than being skipped.
+    // A symbolic link anywhere in a checked tree is refused, never followed (review W3): git
+    // lists a linked directory as one extension-less path, so the source behind it would
+    // otherwise go unjudged while `#[path]` or a module file compiles it.
     let mut files = Vec::with_capacity(paths.len());
     for path in paths {
-        let bytes = fs::read(root.join(&path)).map_err(|e| format!("provenance: {path}: {e}"))?;
-        files.push((path, bytes));
+        let meta = fs::symlink_metadata(root.join(&path))
+            .map_err(|e| format!("provenance: {path}: {e}"))?;
+        if meta.is_symlink() {
+            files.push((path, Entry::Symlink));
+        } else if provenance_in_scope(&path) {
+            let bytes =
+                fs::read(root.join(&path)).map_err(|e| format!("provenance: {path}: {e}"))?;
+            files.push((path, Entry::Bytes(bytes)));
+        }
     }
     let found = provenance_violations(&files, &notice);
     for v in &found {
@@ -327,7 +337,7 @@ fn provenance() -> Res<ExitCode> {
     } else {
         eprintln!(
             "error: provenance: {} violation(s); every .rs file under crates/ and .py file under \
-             standin/ starts with a provenance header",
+             standin/ starts with a provenance header, and neither tree holds a symbolic link",
             found.len()
         );
         Ok(ExitCode::FAILURE)
@@ -343,8 +353,32 @@ pub fn provenance_in_scope(path: &str) -> bool {
         || (folded.starts_with("standin/") && folded.ends_with(".py"))
 }
 
-/// The provenance violations among `(path, contents)` pairs, judged against the NOTICE text,
-/// as `<path>: <reason>` lines sorted by path (each path judged once).
+/// The source trees the provenance check guards, as ASCII-lowercase directory names.
+const CHECKED_TREES: [&str; 2] = ["crates", "standin"];
+
+/// Whether `path` is a checked tree itself or lies inside one (case-insensitive, as
+/// [`provenance_in_scope`]): where a symbolic link is refused.
+pub fn in_checked_tree(path: &str) -> bool {
+    let folded = path.to_ascii_lowercase();
+    CHECKED_TREES.iter().any(|tree| {
+        folded == *tree
+            || folded
+                .strip_prefix(tree)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// One entry of a checked source tree, as the provenance check sees it.
+pub enum Entry {
+    /// The bytes of a regular in-scope file.
+    Bytes(Vec<u8>),
+    /// A symbolic link (to a file or a directory): refused, never followed.
+    Symlink,
+}
+
+/// The provenance violations among `(path, source)` pairs, judged against the NOTICE text,
+/// as `<path>: <reason>` lines sorted by path (each path judged once). A [`Entry::Symlink`] is
+/// always a violation.
 ///
 /// The header is the first line, or for a `.py` file the second line when the first is a `#!`
 /// shebang or a PEP 263 coding cookie. It is one of, with `//` in Rust and `#` in Python:
@@ -354,13 +388,21 @@ pub fn provenance_in_scope(path: &str) -> bool {
 ///
 /// A port passes only when the project is in [`PORT_POLICY`] (exact name), the SPDX equals the
 /// policy's, and the NOTICE text has a line that is exactly `Project: <project>`.
-pub fn provenance_violations(files: &[(String, Vec<u8>)], notice: &str) -> Vec<String> {
-    let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
+pub fn provenance_violations(files: &[(String, Entry)], notice: &str) -> Vec<String> {
+    let mut sorted: Vec<&(String, Entry)> = files.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
     sorted.dedup_by(|a, b| a.0 == b.0);
     let mut out = Vec::new();
-    for (path, bytes) in sorted {
-        for reason in header_violations(path, bytes, notice) {
+    for (path, source) in sorted {
+        let reasons = match source {
+            Entry::Symlink => vec![
+                "symbolic link inside a checked source tree; provenance is judged on regular \
+                 files only, so replace the link with the files it names"
+                    .to_owned(),
+            ],
+            Entry::Bytes(bytes) => header_violations(path, bytes, notice),
+        };
+        for reason in reasons {
             out.push(format!("{path}: {reason}"));
         }
     }
@@ -487,11 +529,26 @@ mod tests {
     const NOTICE_EMPTY: &str = "klein-science\n\nPorted code notices\n";
 
     fn judge(files: &[(&str, &str)], notice: &str) -> Vec<String> {
-        let files: Vec<(String, Vec<u8>)> = files
+        let files: Vec<(String, Entry)> = files
             .iter()
-            .map(|(p, c)| ((*p).to_owned(), c.as_bytes().to_vec()))
+            .map(|(p, c)| ((*p).to_owned(), Entry::Bytes(c.as_bytes().to_vec())))
             .collect();
         provenance_violations(&files, notice)
+    }
+
+    #[test]
+    fn provenance_checked_trees() {
+        for inside in ["crates", "crates/k/src/imported", "Standin", "standin/a"] {
+            assert!(in_checked_tree(inside), "{inside}");
+        }
+        for outside in [
+            "cratesx/a.rs",
+            "standins",
+            "xtask/src/main.rs",
+            "review-fixture/a",
+        ] {
+            assert!(!in_checked_tree(outside), "{outside}");
+        }
     }
 
     const SYMPY_PORT_PY: &str =
