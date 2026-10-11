@@ -21,17 +21,18 @@ provides:
 affects: [01-07 strata and extraction image, 01-10 goldens, 01-12 stand-in name table, 01-13 stand-in baseline, 01-17 census]
 
 actuals:
-  tokens: 16600
+  tokens: 21800
   tasks: 3
-  commits: 2
+  commits: 7
 plan_head_before: 46c5bc6e6e4a686f4fa0ee7726e84e465f0112d7
-plan_head_after: 80023456c60a275130002d375f00161dd30d2336
+plan_head_after: 497c00ddd6480b26137baa5ee4202b2f8f63e960
 
 tech-stack:
   added: [docker 28.3.3 (pinned system tool), docker buildx, "python:3.13-slim-trixie@sha256:70729b46…", sympy 1.14.0 (oracle image only), mpmath 1.3.0 (oracle image only)]
   patterns:
     - "Untrusted code runs only through oracle::run_script; every flag lives in the HARDENING const and a unit test asserts it"
-    - "Image identity = docker image inspect --platform <p> {{.Id}} (the platform manifest digest); every run checks it against images.json first"
+    - "Image identity = the content-addressed local image ID; docker run executes exactly that ID, after checking it resolves to the pinned platform manifest (review W1)"
+    - "Case containment: run_programs and every case wrapper are subreapers; a finished case's descendants are swept, and a case is classified only from channels that reached EOF (review W3)"
     - "Container outputs are re-encoded with ksci_wire::to_jcs on the host and stored by digest; only regular files are admitted"
     - "System tools (git, docker) resolve through host::resolve_system from fixed absolute paths, never PATH"
 
@@ -45,6 +46,9 @@ key-files:
     - conformance/oracles/sympy/requirements.lock
     - conformance/oracles/sympy/introspect.py
     - testdata/programs/smoke.jsonl
+    - testdata/programs/review.jsonl
+    - testdata/programs/review-concurrency.jsonl
+    - xtask/tests/oracle_review.rs
   modified:
     - xtask/src/main.rs
     - xtask/src/host.rs
@@ -56,6 +60,9 @@ key-decisions:
   - "images.json: schema tag, and reference per platform pin (built images are tagged per platform)"
   - "The SymPy table asserts the observed 921 runtime __all__ names (902 literal + 19 subpackages), not the plan's 902"
   - "pyarrow 26.0.0 cleared for plan 01-07 by operator decision, waiving the 7-day freshness rule"
+  - "Review W1: docker run executes the pinned content-addressed image ID, never the tag; pins carry identity (image ID) and manifest (per-platform manifest digest)"
+  - "Review W3: containment by two-level PR_SET_CHILD_SUBREAPER plus sweep; PID/user namespaces are EPERM in the hardened container (measured), so not used"
+  - "Review W2: per-case harness failures are recorded as HarnessError; batch-fatal only for invalid input (2), unmet env (3), no subreaper (4), unwritable outputs"
 
 patterns-established:
   - "Witness by probe: own-authored adversarial programs (network, rootfs, mounts, limits, symlink in /out) run through the real runner, kept out of git"
@@ -147,13 +154,17 @@ status: complete
   - The build fails if gmpy2, python-flint or numpy is present; the distributions installed are exactly mpmath, pip and sympy.
   - It runs as `USER 65534:65534`.
 
-## Pins (conformance/oracles/images.json)
+## Pins (conformance/oracles/images.json, after the review W1 re-pin)
 
-| Image | Platform | Identity | Stored tar sha256 | Emulated |
-|---|---|---|---|---|
-| base | linux/arm64 | `sha256:cf97c3b79da1c706532c7042f851654d97d3b88c8ca6520acda9cf4479ea9b14` (matches RESEARCH.md's arm64 digest) | — | no |
-| sympy | linux/arm64 | `sha256:b468cfd6ec79408995fe9b8506e47952296a5fe78f9285d57517dff5b1d7e140` | `34738054929e9bb08cca54a2d0574e7901fe75d4fab2a598fb09ecc88ba34537` | no |
-| sympy | linux/amd64 | `sha256:4f33ed0632da2fe22a365386f7ddae072ccc332b940e2943b0b5567c5cabbfa9` | `774bd1ede69a31bc1e8ef79ff439923cf6736800d5031e5531fedb77d422549e` | yes |
+`identity` is the content-addressed local image ID that `docker run` executes. `manifest` is the platform manifest that ID resolves to, and it is checked before every run.
+
+| Image | Platform | Identity (runs) | Manifest | Stored tar sha256 | Emulated |
+|---|---|---|---|---|---|
+| base | linux/arm64 | `sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f` (the index) | `sha256:cf97c3b79da1c706532c7042f851654d97d3b88c8ca6520acda9cf4479ea9b14` (matches RESEARCH.md's arm64 digest) | — | no |
+| sympy | linux/arm64 | `sha256:b468cfd6ec79408995fe9b8506e47952296a5fe78f9285d57517dff5b1d7e140` | same as the identity | `37c964f01f1a163522a422d6c07449f7bf58ae705714601a402e3542571cac57` | no |
+| sympy | linux/amd64 | `sha256:4f33ed0632da2fe22a365386f7ddae072ccc332b940e2943b0b5567c5cabbfa9` | same as the identity | `7d1446620e1a3bfc2a125f80e1491400a3e91cb9d16f2b5a9f49fcb1ea88e3ec` | yes |
+
+The re-pin rebuilt sympy. Buildx reused cached layers, so the identities are unchanged. The tars are new (`34738054…` became `37c964f0…` for arm64, `774bd1ed…` became `7d144662…` for amd64), because `docker save` now saves by identity instead of by tag. The introspection table was re-run, and its digest is unchanged.
 
 - **Introspection table:** `introspection_sha256` = `011f497f2f95d8ffdcd59528df1caf992f2cf3a65a2cdfa43c90c7c717a81da9`.
   - It holds 921 names: 457 functions, 392 classes, 52 instances and 20 modules.
@@ -320,12 +331,89 @@ status: complete
   - Both new `.py` files start with `# provenance: original`.
   - `Cargo.lock` is unchanged.
 
+## Review fixes (cross-model review: Codex gpt-6-astra, FAIL with 3 must-fix warnings, confirmed by the orchestrator)
+
+Each fix went test-first. The RED witnesses were committed first in `2969217`, failing on the unfixed code, then fixed.
+
+| Commit | What |
+|---|---|
+| `2969217` | test(01-05): RED witnesses for W1, W2 and W3 |
+| `f67bf6c` | fix(01-05): run the verified content-addressed image identity, never the tag (W1) |
+| `497c00d` | fix(01-05): contain every case's descendants and never discard the batch (W2, W3) |
+
+- **No rust-analyzer.** The LSP was unavailable this session. As CLAUDE.md's fallback, every-site checks used ast-grep plus compiler enumeration (`cargo clippy --all-targets`).
+- **The new witnesses are ignored tests.** Both tests in `xtask/tests/oracle_review.rs` are `#[ignore]` because they need docker and the pinned base image, and because `cargo xtask ci` holds the heavy-job lock they would take. Run them with `cargo test -p xtask --test oracle_review -- --ignored`.
+
+### W1: the pin was checked on a tag that was then executed
+
+- **Finding.** `run_script` checked `inspect --platform <p> <reference>` against the pin, then passed `pinned.reference`, a mutable tag, to `docker run`. A retag between the check and the run would execute a different image.
+- **Measured before the fix:**
+  - docker runs a built image by its ID;
+  - for the base image, the runnable ID is the index digest `sha256:70729b46…`;
+  - the platform manifest `sha256:cf97c3b7…` is not runnable, either as `sha256:cf97…` or as `python@sha256:cf97…` ("No such image").
+- **Fix (one path).**
+  - `PlatformPin.identity` is now the local image ID (`inspect .Id`), which is content-addressed. `run_image(pin)` returns it, and `docker run` executes it.
+  - The new `PlatformPin.manifest` holds the platform manifest that the ID resolves to. `verify_pin` checks it before every run and after `--from-store`.
+  - The reference (tag) is only a name; it is never executed. `docker save` also saves by identity.
+- **RED.** `oracle_runs_the_pinned_identity_not_the_tag`: `left: "ksci-oracle-sympy:linux-arm64"`, `right: "sha256:aaaa…"`.
+- **GREEN, the same test.** Live witnesses:
+  - With `ksci-oracle-sympy:linux-arm64` retagged to the base image, a `--require-sympy-env` run still ran sympy. Its `run.json` is `90b24ba6…`, which carries the sympy facts; the base image has no sympy and would have exited 3.
+  - A tampered `manifest` in `images.json` is refused: "resolves to manifest sha256:cf97… locally but is pinned to sha256:0000…; refusing to run".
+  - After `docker rmi`, `--from-store` loads the untagged image by ID and runs.
+
+### W2: an unnamed signal discarded the whole batch
+
+- **Finding.** `signal.Signals(sig).name` raised `ValueError: 36 is not a valid Signals` for SIGRTMIN+2. `run_programs.py` exited 1, and xtask stored nothing.
+- **Fix.**
+  - `signal_name` falls back to the number, deterministically.
+  - `run_case_recorded` turns any harness failure inside one case into that case's `HarnessError` record (`"<ExceptionType>: <message>"`), with no stdout.
+  - `run_case` ends the case on any failure: it kills the wrapper, reaps it and sweeps.
+- **Batch-fatal by decision:**
+  - invalid input or arguments (exit 2);
+  - `--require-sympy-env` unmet (exit 3);
+  - `run_programs.py` cannot become a subreaper (exit 4, new);
+  - failing to write the outputs.
+
+### W3: an escaped child outlived its case and hid its exception
+
+- **Finding.** A child that called `os.setsid()` escaped the `killpg`. It held the exception pipe open, and the buffered `f.read(65536)` kept the record inside the reader. The case was recorded `ok` with no exception, and the child outlived the case.
+- **Mechanism chosen: a two-level subreaper and a sweep.**
+  - `run_programs.py` and each case wrapper call `prctl(PR_SET_CHILD_SUBREAPER)`.
+  - While a case runs, its orphans are adopted by its own wrapper. Once the wrapper is gone, everything left is adopted by `run_programs.py`, whatever session or process group it moved to.
+  - When a wrapper exits, `sweep_strays` SIGKILLs and reaps every child of `run_programs.py` that is not a live wrapper. It repeats in rounds, because a killed process's children are re-parented in turn.
+  - Spawning and sweeping share `SPAWN_LOCK`, so a just-forked wrapper is never swept.
+  - A per-case PID namespace would be the stronger primitive, but inside the hardened container `unshare(CLONE_NEWPID)` and `unshare(CLONE_NEWUSER)` both return `EPERM` (measured). Granting them would weaken the sandbox.
+- **Classification needs complete channels.**
+  - The exception channel is read with raw `os.read`.
+  - After the sweep, stdout and the exception channel must both reach EOF within `CLOSE_GRACE` (2 s). Otherwise the case is `HarnessError`, never `ok`.
+- **Residual.** The wrapper's subreaper flag lives in the program's own process, so a program that clears it with ctypes only exposes its own orphans to other cases' sweeps. Containment of finished cases does not depend on that flag.
+
+### Per case, before and after
+
+| Case | Before the fix | After |
+|---|---|---|
+| orchestrator w2 `33174b22` (`os.kill(getpid(), SIGRTMIN+1)`) | run_programs crashed, batch discarded, nothing stored | error `Signal "35"`; the batch is kept (`b8079233` hello is ok); records `d39e402a…` |
+| orchestrator w3 `7320fca9` (setsid child holds the pipes, parent raises) | ok, exception null (records `e82da2cd…` per the orchestrator) | error `ValueError "boom"`; records `5605d7fb…` |
+| own `abe29b00` (SIGRTMIN+2) | batch aborted (`ValueError: 36 is not a valid Signals`) | error `Signal "36"` |
+| own `5231a540` (escape, then raise) | ok, exception null | error `ValueError "escaped"` |
+| own `42099a76` + `34fc6f01` (escaped child; next case checks it) | `spawned`, then `stray alive` | `spawned`, then `stray gone` |
+| own concurrency `1d69cd63` (a running case's orphan) + `d979b41a` (a running case's child), with 24 fast cases | (new guard) | `orphan done` and `child done 0`. With the wrapper subreaper disabled, the orphan was killed by another case's sweep and printed `"\n"` (RED) |
+| smoke suite, base and sympy | records `13992589…5c90` | records `13992589…5c90` (unchanged); run.json `0750a3b9…` and `90b24ba6…` (unchanged) |
+| boundary probes (`probe.jsonl`) | records `923d797a…` | records `923d797a…` (unchanged) |
+
+### Determinism of record bytes (note for plans 01-07 and 01-10)
+
+- **What the runner guarantees.** It removes the nondeterminism it introduces: the hash seed is fixed per run, the hostname is fixed, the worker count does not change record bytes, timeout records carry no stdout, and harness errors carry no stdout.
+- **What it cannot guarantee.** Raw `stdout` and exception messages are recorded verbatim, so a program that prints object addresses (`<… at 0x7f…>`), times, pids, random draws or hash-ordered containers under a varied seed gives different bytes on every run. Records are byte-stable only for programs that are deterministic themselves.
+- **Admission policy for later plans (open item for 01-07 and 01-10).** Plans 01-07 and 01-10 must admit a case as a golden only after the same records come out on two or more independent runs, at least across two seeds and both architectures (Pitfall J). A disagreeing case is adjudicated or excluded, never normalised silently. Any normalisation (for example `0x…` addresses) must be an explicit, versioned rule applied in the scorer, not in the runner.
+
 ## Next Phase Readiness
 
 - **01-07, 01-10, 01-13 and 01-17** run untrusted programs only through `cargo xtask oracle run`. They pass `--image sympy --require-sympy-env`, get records by digest, and should use `--seed` sweeps for adjudication.
 - **01-07:** use pyarrow **26.0.0** with the hashes above (operator decision).
 - **01-12:** generate the stand-in name table from introspection blob `011f497f…1da9` (921 names, 20 modules, 76 abc symbols).
 - **Other worktrees** run `cargo xtask oracle build-image sympy --platform linux/arm64 --from-store` before their first run.
+- **01-07 and 01-10** apply the record-admission policy in "Determinism of record bytes" above.
 
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
@@ -333,6 +421,11 @@ status: complete
 
 ## Self-Check: PASSED
 
-- All 8 created key files exist on disk.
-- Task commits `bfb62ef` and `8002345` are ancestors of HEAD.
+- All 11 created key files exist on disk.
+- The task commits `bfb62ef` and `8002345`, and the review commits `2969217`, `f67bf6c` and `497c00d`, are ancestors of HEAD.
+- After the review fixes:
+  - `cargo test -p xtask` passes (31 unit, 15 integration, 2 ignored docker witnesses);
+  - both docker witnesses pass with `-- --ignored`;
+  - clippy `-D warnings`, fmt and `check no-corpus` are clean;
+  - `cargo xtask ci` reports "all 6 steps passed".
 - STATE.md, ROADMAP.md and REQUIREMENTS.md were not touched (parallel worktree; the orchestrator owns them).
