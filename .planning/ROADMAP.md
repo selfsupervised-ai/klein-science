@@ -52,6 +52,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 ## Phase Details
 
 ### Phase 1: Contracts, Oracles and Risk Probes
+
 **Goal**: Every later layer has a fixed wire contract, a pinned SymPy oracle, and mechanical determinism and licence
 guards to test against. The largest unknowns (Monty protocols, Metal under Seatbelt, CubeCL integer widths, the
 Wasmtime pin) are measured and filed as klein-rs requests.
@@ -98,26 +99,42 @@ Wasmtime pin) are measured and filed as klein-rs requests.
 **Plans**: 18 plans in 8 waves
 
 Plans:
+**Wave 1**
 - [ ] 01-01-PLAN.md — ksci-wire: canonical node table, string numerals, JCS, SHA-256 identity, envelopes (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 01-02-PLAN.md — xtask spine: recipe fetch, artifact-store client, pinned host tools, heavy-job guard, RFC 8785 vectors, no-corpus (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
 - [ ] 01-03-PLAN.md — determinism and licence guards: clippy, cargo-deny, provenance headers and NOTICE, each seen RED (wave 3)
 - [ ] 01-04-PLAN.md — ksci-ops and the R2 worker: `science.cas.canonicalize`, logical step budget, stdio frames (wave 3)
 - [ ] 01-05-PLAN.md — digest-pinned SymPy oracle image, hardened program runner, introspection table (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
 - [ ] 01-06-PLAN.md — WIT tool and zero-import R0 component; R0 (Wasmtime 46.0.1 and 49.0.2) == R2; fuel and memory host errors (wave 4)
 - [ ] 01-07-PLAN.md — TIR corpus by recipe, extraction, stratified hash-ranked ~1k golden slice (wave 4)
 - [ ] 01-08-PLAN.md — Python JCS mirror, `_tool` and `host_shim`; three-way differential with rfc8785 (wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
 - [ ] 01-09-PLAN.md — reproducible dist (two clean builds), zero-import and relaxed-SIMD gates, VM CI workflow (wave 5)
 - [ ] 01-10-PLAN.md — reproducible goldens: 4 hash seeds x 2 runs x 2 platforms, adjudication queue (wave 5)
 - [ ] 01-11-PLAN.md — fixed-box manifest and CubeCL Metal probe (mulhi, u64, Montgomery, fast-math, watchdog) (wave 5)
 - [ ] 01-12-PLAN.md — stand-in import surface (902 names, sympy.abc) and Monty-subset lint (wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
 - [ ] 01-13-PLAN.md — three-level runner and the M0 baseline (proxy) (wave 6)
 - [ ] 01-14-PLAN.md — go-live: VM runner, green CI, private GHCR publish and round trip (wave 6)
 - [ ] 01-15-PLAN.md — Seatbelt minimum rules by ablation, D1 draft, per-box budget ratification (wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
 - [ ] 01-16-PLAN.md — signed klein.plugin.v1 bundle: capability manifests, Mac Keychain signing, verify_strict (wave 7)
 - [ ] 01-17-PLAN.md — TIR and OMR protocol census (dynamic and static), meijerint share, D4 draft (wave 7)
+
+**Wave 8** *(blocked on Wave 7 completion)*
 - [ ] 01-18-PLAN.md — D6 draft; operator files D1, D4 and D6; ratification recorded (wave 8)
 
 ### Phase 2: Core Expressions
+
 **Goal**: An LLM's SymPy program that builds expressions, evaluates numbers and functions, substitutes, expands,
 differentiates and prints gets SymPy's exact output from the stand-in. The same exact core results are byte-identical
 on R0, R1 and R2.
@@ -157,6 +174,7 @@ research-phase.
 **Plans**: TBD
 
 ### Phase 3: Polynomials, Number Theory and Algebraic Solve
+
 **Goal**: LLM programs get SymPy's answers through the exact algebra layer when they factor, divide, take gcds, find
 roots, solve linear systems and univariate polynomial equations, or ask number-theory questions. At least 60% of TIR
 programs pass.
@@ -200,6 +218,7 @@ programs pass.
 **Plans**: TBD
 
 ### Phase 4: Solve, Simplify, Assumptions and Piecewise
+
 **Goal**: LLM programs that solve transcendental equations, systems and inequalities, simplify, query assumptions and
 use Piecewise and sets get SymPy's results, and at least 90% of TIR programs pass. Solve and identity results carry
 Lean-checked certificates where they are certifiable.
@@ -241,6 +260,7 @@ Lean-checked certificates where they are certifiable.
 **Plans**: TBD
 
 ### Phase 5: Calculus, Numerics and the Lean Loop
+
 **Goal**: LLM programs that take limits, series, integrals, sums and simple ODEs and recurrences get SymPy's results.
 `science.numerics` ships quadrature, ODE solvers and `lambdify`, and the CAS-to-Lean loop runs end to end through
 `lean.certify`.
@@ -289,6 +309,7 @@ Lean-checked certificates where they are certifiable.
 **Plans**: TBD
 
 ### Phase 6: Matrices, Sets, Logic, Combinatorics and GPU Budgets
+
 **Goal**: LLM programs using `Matrix`, sets, logic and combinatorics get SymPy's results, and at least 97% of TIR
 programs pass. GPU linear-algebra and NTT budgets are measured on the Mac's Metal GPU.
 **Depends on**: Phase 5 (the ≥ 97% gate counts every earlier layer; `Matrix` builds on Phase 3's `ks-dmat`)
