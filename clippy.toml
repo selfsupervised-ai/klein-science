@@ -1,0 +1,31 @@
+# Determinism guards (DET-08, CLAUDE.md rule 4). Every crate with `[lints] workspace = true`
+# denies `disallowed_types` and `disallowed_methods` (Cargo.toml [workspace.lints.clippy]); these
+# lists say what they disallow. Unshipped tooling (xtask) does not opt in.
+#
+# Hash-ordered maps and sets reach output in iteration order, and that order depends on the seed
+# and on pointer width (wasm32 vs 64-bit). Use a canonical structural sort, or a BTreeMap/BTreeSet
+# where an order is needed. Clocks and process-seeded RNGs make a result depend on the run.
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "DET-08: hash-ordered iteration is nondeterministic; sort canonically or use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "DET-08: hash-ordered iteration is nondeterministic; sort canonically or use BTreeSet" },
+    { path = "std::hash::RandomState", reason = "DET-08: a per-process random hash seed makes runs differ" },
+    { path = "std::collections::hash_map::RandomState", reason = "DET-08: a per-process random hash seed makes runs differ" },
+    # hashbrown and foldhash are not in the graph yet (they arrive with ks-expr). clippy 1.99 is
+    # silent about a path whose crate is absent, so these need no `allow-invalid`.
+    { path = "hashbrown::HashMap", reason = "DET-08: hash-ordered iteration is nondeterministic; use the interner's HashTable with a fixed-seed hasher, never iterate it to output" },
+    { path = "hashbrown::HashSet", reason = "DET-08: hash-ordered iteration is nondeterministic; sort canonically" },
+    { path = "foldhash::fast::RandomState", reason = "DET-08: a random seed makes runs differ; use foldhash::fast::FixedState" },
+]
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "DET-08: wall-clock time makes a result depend on the run; wall time belongs only in the provenance Record" },
+    { path = "std::time::Instant::now", reason = "DET-08: monotonic-clock time makes a result depend on the run; budgets are logical step counts" },
+    # rand is banned from the shipped graph by cargo-deny; it reaches test targets only through
+    # proptest (a dev-dependency), built without the features that compile these functions. There
+    # clippy 1.99 reports the paths as unreachable (and `rand::rng` as the private module of that
+    # name), so these three entries, and only these, carry `allow-invalid`.
+    { path = "rand::thread_rng", reason = "DET-08: process-seeded RNG; use rand_chacha seeded from the request digest", allow-invalid = true },
+    { path = "rand::random", reason = "DET-08: process-seeded RNG; use rand_chacha seeded from the request digest", allow-invalid = true },
+    { path = "rand::rng", reason = "DET-08: process-seeded RNG; use rand_chacha seeded from the request digest", allow-invalid = true },
+]

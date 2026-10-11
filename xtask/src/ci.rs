@@ -29,6 +29,20 @@ pub const STEPS: &[(&str, &[&str])] = &[
             "warnings",
         ],
     ),
+    // LIC-01, DET-08: licences, banned crates, advisories and sources of the shipped graph
+    // (deny.toml).
+    (
+        "deny",
+        &[
+            "cargo",
+            "deny",
+            "check",
+            "advisories",
+            "bans",
+            "licenses",
+            "sources",
+        ],
+    ),
     (
         "store fetch rfc8785",
         &[

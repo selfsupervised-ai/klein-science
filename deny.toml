@@ -1,0 +1,84 @@
+# cargo-deny 0.20.2 configuration: the licence and supply-chain guard for the shipped dependency
+# graph (LIC-01, CLAUDE.md rule 2), plus the randomness-crate bans that back DET-08.
+# Run by `cargo xtask ci` as `cargo deny check` (advisories, bans, licenses, sources).
+
+[graph]
+# The targets the shipped crates are built for: the Mac (R2 Metal), Linux (R2 CPU/GPU and the
+# oracle box) and wasm32 (the R0 component; wasm32-unknown-unknown stands in for wasm32-wasip2,
+# which cargo-deny's built-in cfg table may not know).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "wasm32-unknown-unknown",
+]
+# Dev-dependencies are never shipped (proptest, for one, pulls rand).
+exclude-dev = true
+# Unshipped tooling, test hosts and probes. Exclusion is recursive: a crate reachable only
+# through these is out of the graph. ksci-conform (plan 01-06) and ksci-metal-probe (plan 01-11)
+# are listed ahead of their arrival; cargo-deny 0.20.2 accepts a spec that is not in the graph yet.
+exclude = ["xtask", "ksci-conform", "ksci-metal-probe"]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Advisories are denied by default; a yanked crate is denied too.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licences only (CLAUDE.md rule 2). GPL, LGPL and AGPL are never allowed.
+# MPL-2.0 is allowed only by an explicit, operator-approved exception (STACK flag F1, egglog's
+# im-rc); there is none in Phase 1, so MPL-2.0 is rejected like any licence not listed here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+    # CLAUDE.md rule 2: GPL/LGPL code is never linked or shipped.
+    { crate = "rug", reason = "CLAUDE.md rule 2: LGPL-3.0+, links GMP/MPFR; use dashu-int and the mpmath port" },
+    { crate = "gmp-mpfr-sys", reason = "CLAUDE.md rule 2: LGPL (GMP/MPFR bindings)" },
+    { crate = "malachite", reason = "CLAUDE.md rule 2: LGPL-3.0-only; use dashu-int" },
+    { crate = "malachite-base", reason = "CLAUDE.md rule 2: LGPL-3.0-only (malachite)" },
+    { crate = "malachite-nz", reason = "CLAUDE.md rule 2: LGPL-3.0-only (malachite)" },
+    { crate = "malachite-q", reason = "CLAUDE.md rule 2: LGPL-3.0-only (malachite)" },
+    { crate = "malachite-float", reason = "CLAUDE.md rule 2: LGPL-3.0-only (malachite)" },
+    { crate = "flint-sys", reason = "CLAUDE.md rule 2: FLINT is LGPL; offline oracle only, never linked" },
+    { crate = "algebraeon", reason = "CLAUDE.md rule 2: GPL-3.0-only; never linked or read" },
+    # CLAUDE.md rule 1: Symbolica is never used in any form. This ban entry is its only mention.
+    { crate = "symbolica", reason = "CLAUDE.md rule 1: Symbolica-clean; never linked, read, run or compared" },
+    { crate = "internment", reason = "RUSTSEC-2026-0266 (malicious dependency), earlier UAF and data race; use the own interner" },
+    # DET-08: no process-seeded randomness in a shipped crate.
+    { crate = "getrandom", reason = "DET-08: OS randomness makes results differ per run; seed rand_chacha from the request digest" },
+    { crate = "rand", reason = "DET-08: StdRng/thread RNG and value-breaking distributions; use rand_chacha with own range mapping" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
