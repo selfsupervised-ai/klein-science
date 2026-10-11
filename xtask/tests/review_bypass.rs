@@ -191,6 +191,31 @@ fn no_corpus_fails_closed_on_unsized_index_entry() {
     assert!(shown.contains("vendor/sub"), "{shown}");
 }
 
+#[test]
+fn no_corpus_fails_closed_on_missing_blob() {
+    let repo = scratch("missing-blob");
+    git(&repo, &["init", "-q"]);
+    // A file entry whose blob is not in the object store: no bytes to size, so refuse.
+    git(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644,2222222222222222222222222222222222222222,ghost.txt",
+        ],
+    );
+    let out = no_corpus(&repo);
+    let shown = text(&out);
+    assert!(!out.status.success(), "no-corpus passed:\n{shown}");
+    assert!(
+        shown.contains(
+            "ghost.txt: staged object 2222222222222222222222222222222222222222 is missing"
+        ),
+        "{shown}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // R2: ci never runs `cargo` from PATH
 // ---------------------------------------------------------------------------------------------

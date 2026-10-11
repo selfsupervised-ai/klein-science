@@ -183,7 +183,10 @@ fn blob_sizes(root: &Path, entries: &[(String, String)]) -> Res<Vec<Result<u64, 
                 (Some(_), Some("blob"), Some(size)) => size
                     .parse::<u64>()
                     .map_err(|e| format!("has an unreadable size {size:?}: {e}")),
-                (Some(_), Some(kind), _) => Err(format!("is {kind}, not a blob")),
+                (Some(_), Some("missing"), None) => {
+                    Err("is missing from the object store".to_owned())
+                }
+                (Some(_), Some(kind), _) => Err(format!("is a {kind}, not a blob")),
                 _ => Err(format!("is unreadable ({line:?})")),
             }
         })
