@@ -21,7 +21,10 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+pub mod envelope;
 pub mod numeral;
+
+pub use envelope::{Budget, Provenance, Record, Request, Response, Status};
 
 /// The `v` every document carries.
 pub const SCHEMA_VERSION: u32 = 1;

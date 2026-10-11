@@ -1,7 +1,12 @@
 // provenance: original
 //! Contract tests for `klein.science.expr.v1` (see `schema/expr.v1.md`).
 
-use ksci_wire::{Table, WireError};
+use ksci_wire::{
+    Budget, Node, NodeId, Provenance, Record, Request, Response, Special, Status, Table, WireError,
+    sha256_hex, to_jcs,
+};
+use proptest::prelude::*;
+use proptest::test_runner::{RngAlgorithm, RngSeed};
 
 fn table(json: &str) -> Table {
     Table::from_slice(json.as_bytes()).unwrap_or_else(|e| panic!("{json} should decode: {e}"))
@@ -408,4 +413,362 @@ fn numerals_argument_order_preserved() {
         doc(r#"["Sym","y",{}],["Sym","x",{}],["Add",0,1]"#, 2).as_bytes()
     );
     assert_ne!(yx.identity(), xy.identity());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// DET-03: envelopes, the canonical-input check and provenance outside the hashed bytes.
+
+/// A canonical request for `science.cas.canonicalize` on x**2 + 1 with the given `steps` JSON value.
+fn request_json(steps: &str) -> String {
+    format!(
+        r#"{{"args":{{"expr":{X2_PLUS_1_CANONICAL}}},"budget":{{"steps":{steps}}},"op":"science.cas.canonicalize","v":1}}"#
+    )
+}
+
+fn request_rejected(json: &str) -> WireError {
+    match Request::from_canonical_slice(json.as_bytes()) {
+        Ok(_) => panic!("{json} should be rejected"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn envelope_request_roundtrip() {
+    let json = request_json(r#""100""#);
+    let request =
+        Request::from_canonical_slice(json.as_bytes()).expect("canonical request decodes");
+    assert_eq!(request.op, "science.cas.canonicalize");
+    assert_eq!(request.budget.steps_u64(), Some(100));
+    assert_eq!(request.args["expr"].identity(), X2_PLUS_1_IDENTITY);
+    assert_eq!(to_jcs(&request).expect("encodes"), json.as_bytes());
+}
+
+#[test]
+fn envelope_noncanonical() {
+    let canonical = request_json(r#""100""#);
+    let variants = [
+        // A space after the opening brace.
+        canonical.replacen('{', "{ ", 1),
+        // Keys reordered: v first.
+        format!(
+            r#"{{"v":1,"args":{{"expr":{X2_PLUS_1_CANONICAL}}},"budget":{{"steps":"100"}},"op":"science.cas.canonicalize"}}"#
+        ),
+        // A duplicated key.
+        canonical.replacen(
+            r#""op":"science.cas.canonicalize""#,
+            r#""op":"science.cas.canonicalize","op":"science.cas.canonicalize""#,
+            1,
+        ),
+        // An unnecessary escape.
+        canonical.replacen("science.cas", r"science.cas", 1),
+        // Assumption keys out of order inside the table.
+        canonical.replacen(
+            r#"["Sym","x",{}]"#,
+            r#"["Sym","x",{"real":true,"positive":true}]"#,
+            1,
+        ),
+        // A trailing newline.
+        format!("{canonical}\n"),
+    ];
+    for json in &variants {
+        assert_ne!(json, &canonical);
+        assert_eq!(request_rejected(json), WireError::NonCanonical, "{json}");
+    }
+}
+
+#[test]
+fn envelope_steps() {
+    for (steps, expected) in [("0", 0), ("18446744073709551615", u64::MAX)] {
+        let request =
+            Request::from_canonical_slice(request_json(&format!(r#""{steps}""#)).as_bytes())
+                .expect("steps decode");
+        assert_eq!(request.budget.steps_u64(), Some(expected));
+    }
+    for steps in ["18446744073709551616", "-1", "01", "", "+1", "1.5"] {
+        assert_eq!(
+            request_rejected(&request_json(&format!(r#""{steps}""#))),
+            WireError::Numeral {
+                path: "/budget/steps".into()
+            },
+            "steps {steps:?}"
+        );
+    }
+    assert_eq!(
+        request_rejected(&request_json("5")),
+        WireError::JsonNumberNotAllowed {
+            path: "/budget/steps".into()
+        }
+    );
+    assert_eq!(
+        Budget {
+            steps: "007".into()
+        }
+        .steps_u64(),
+        None
+    );
+}
+
+#[test]
+fn envelope_request_rejects_bad_contents() {
+    // A version other than 1.
+    let v2 = request_json(r#""1""#).replacen(r#","v":1}"#, r#","v":2}"#, 1);
+    assert!(v2.ends_with(r#""v":2}"#));
+    assert_eq!(
+        request_rejected(&v2),
+        WireError::Version { path: "/v".into() }
+    );
+    // A JSON number inside the argument table is reported with its full path.
+    let number = request_json(r#""1""#).replacen(r#"["Int","2"]"#, r#"["Int",2]"#, 1);
+    assert_eq!(
+        request_rejected(&number),
+        WireError::JsonNumberNotAllowed {
+            path: "/args/expr/nodes/1/1".into()
+        }
+    );
+    // A cyclic argument table, an unknown key and a missing budget.
+    let cyclic = request_json(r#""1""#).replacen(r#"["Pow",0,1]"#, r#"["Pow",4,1]"#, 1);
+    let extra = request_json(r#""1""#).replacen(r#","v":1}"#, r#","v":1,"x":true}"#, 1);
+    let missing = format!(
+        r#"{{"args":{{"expr":{X2_PLUS_1_CANONICAL}}},"op":"science.cas.canonicalize","v":1}}"#
+    );
+    for json in [cyclic, extra, missing] {
+        assert!(
+            !matches!(request_rejected(&json), WireError::NonCanonical),
+            "{json}"
+        );
+    }
+}
+
+fn exact_response() -> Response {
+    Response {
+        v: 1,
+        status: Status::Exact,
+        numeric_class: "exact".into(),
+        result: Some(table(X2_PLUS_1_CANONICAL)),
+        identity: Some(X2_PLUS_1_IDENTITY.into()),
+    }
+}
+
+fn exhausted_response() -> Response {
+    Response {
+        v: 1,
+        status: Status::FuelExhausted,
+        numeric_class: "exact".into(),
+        result: None,
+        identity: None,
+    }
+}
+
+#[test]
+fn envelope_response_shape() {
+    let exact = format!(
+        r#"{{"identity":"{X2_PLUS_1_IDENTITY}","numeric_class":"exact","result":{X2_PLUS_1_CANONICAL},"status":"exact","v":1}}"#
+    );
+    let exhausted = r#"{"identity":null,"numeric_class":"exact","result":null,"status":"fuel_exhausted","v":1}"#;
+    assert_eq!(exact_response().to_jcs(), exact.as_bytes());
+    assert_eq!(exhausted_response().to_jcs(), exhausted.as_bytes());
+    assert_eq!(Response::from_slice(exact.as_bytes()), Ok(exact_response()));
+    assert_eq!(
+        Response::from_slice(exhausted.as_bytes()),
+        Ok(exhausted_response())
+    );
+}
+
+fn provenance(tag: &str) -> Provenance {
+    Provenance {
+        impl_: format!("ksci-{tag}"),
+        backend: format!("backend-{tag}"),
+        device: format!("device-{tag}"),
+        driver: format!("driver-{tag}"),
+        wall_ms: format!("{}", tag.len()),
+    }
+}
+
+#[test]
+fn envelope_provenance_outside() {
+    let request = request_json(r#""100""#);
+    let response = exact_response().to_jcs();
+    let r0 = Record::new(request.as_bytes(), &response, provenance("r0"));
+    let r2 = Record::new(request.as_bytes(), &response, provenance("r2-metal"));
+    assert_ne!(r0.provenance, r2.provenance);
+    assert_eq!(r0.request_digest, r2.request_digest);
+    assert_eq!(r0.response_digest, r2.response_digest);
+    assert_eq!(r0.request_digest, sha256_hex(request.as_bytes()));
+    assert_eq!(r0.response_digest, sha256_hex(&response));
+    // The record itself carries provenance under "impl".
+    let record = String::from_utf8(to_jcs(&r0).expect("encodes")).expect("utf-8");
+    assert!(
+        record.contains(r#""provenance":{"backend":"backend-r0""#),
+        "{record}"
+    );
+    assert!(record.contains(r#""impl":"ksci-r0""#), "{record}");
+    // A response or request carrying provenance is rejected.
+    let with_provenance = String::from_utf8(response).expect("utf-8").replacen(
+        r#""numeric_class""#,
+        r#""provenance":{},"numeric_class""#,
+        1,
+    );
+    assert!(Response::from_slice(with_provenance.as_bytes()).is_err());
+    let request_with_provenance = request.replacen(r#""op""#, r#""provenance":{},"op""#, 1);
+    assert!(Request::from_canonical_slice(request_with_provenance.as_bytes()).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// DET-01: identity does not depend on construction order (property test, fixed seed so failures replay).
+
+/// One generated node: a leaf, or an internal node whose child selectors are reduced modulo its own index.
+#[derive(Clone, Debug)]
+enum Spec {
+    Int(i64),
+    Sym(u8),
+    Atom(u8),
+    Add(Vec<usize>),
+    Mul(Vec<usize>),
+    Pow(usize, usize),
+    Fn(u8, Vec<usize>),
+}
+
+fn spec() -> impl Strategy<Value = Spec> {
+    prop_oneof![
+        any::<i64>().prop_map(Spec::Int),
+        (0u8..5).prop_map(Spec::Sym),
+        (0u8..7).prop_map(Spec::Atom),
+        prop::collection::vec(any::<usize>(), 2..5).prop_map(Spec::Add),
+        prop::collection::vec(any::<usize>(), 2..5).prop_map(Spec::Mul),
+        (any::<usize>(), any::<usize>()).prop_map(|(b, e)| Spec::Pow(b, e)),
+        ((0u8..3), prop::collection::vec(any::<usize>(), 0..4)).prop_map(|(f, a)| Spec::Fn(f, a)),
+    ]
+}
+
+const ATOMS: [&str; 7] = ["oo", "-oo", "zoo", "nan", "pi", "E", "I"];
+
+fn leaf(spec: &Spec) -> Node {
+    match spec {
+        Spec::Int(n) => Node::Int(n.to_string()),
+        Spec::Sym(s) | Spec::Fn(s, _) => Node::Sym {
+            name: format!("s{s}"),
+            assumptions: Default::default(),
+        },
+        Spec::Atom(a) => {
+            Node::Atom(Special::from_name(ATOMS[usize::from(*a)]).expect("named atom"))
+        }
+        Spec::Add(_) | Spec::Mul(_) | Spec::Pow(..) => Node::Int("0".into()),
+    }
+}
+
+/// A DAG where node i refers only to nodes below i; the root is the last node.
+fn build(specs: &[Spec]) -> Vec<Node> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let pick = |sel: &usize| NodeId(u32::try_from(sel % i).expect("small"));
+            match spec {
+                _ if i == 0 => leaf(spec),
+                Spec::Add(c) => Node::Add(c.iter().map(pick).collect()),
+                Spec::Mul(c) => Node::Mul(c.iter().map(pick).collect()),
+                Spec::Pow(b, e) => Node::Pow(pick(b), pick(e)),
+                Spec::Fn(f, a) => Node::Fn {
+                    name: format!("f{f}"),
+                    args: a.iter().map(pick).collect(),
+                },
+                leaf_spec => leaf(leaf_spec),
+            }
+        })
+        .collect()
+}
+
+fn remap(node: &Node, mut f: impl FnMut(NodeId) -> NodeId) -> Node {
+    match node {
+        Node::Add(c) => Node::Add(c.iter().map(|&i| f(i)).collect()),
+        Node::Mul(c) => Node::Mul(c.iter().map(|&i| f(i)).collect()),
+        Node::Pow(b, e) => Node::Pow(f(*b), f(*e)),
+        Node::Fn { name, args } => Node::Fn {
+            name: name.clone(),
+            args: args.iter().map(|&i| f(i)).collect(),
+        },
+        leaf => leaf.clone(),
+    }
+}
+
+/// The same expression rebuilt with duplicated nodes (some edges redirected to the copies), unreachable nodes
+/// appended, and every node moved to a new position.
+fn scramble(base: &[Node], dups: &[usize], redirect: &[bool], extra: &[u8], keys: &[u64]) -> Table {
+    let n = base.len();
+    let mut nodes = base.to_vec();
+    let mut copy_of: Vec<Option<usize>> = vec![None; n];
+    for d in dups {
+        let src = d % n;
+        if copy_of[src].is_none() {
+            copy_of[src] = Some(nodes.len());
+            nodes.push(base[src].clone());
+        }
+    }
+    let mut edge = 0usize;
+    let mut nodes: Vec<Node> = nodes
+        .iter()
+        .map(|node| {
+            remap(node, |c| {
+                edge += 1;
+                match copy_of[c.index()] {
+                    Some(copy) if redirect[edge % redirect.len()] => {
+                        NodeId(u32::try_from(copy).expect("small"))
+                    }
+                    _ => c,
+                }
+            })
+        })
+        .collect();
+    for (k, e) in extra.iter().enumerate() {
+        nodes.push(Node::Sym {
+            name: format!("unreachable{e}"),
+            assumptions: Default::default(),
+        });
+        if k == 0 {
+            // An unreachable internal node pointing into the live part.
+            nodes.push(Node::Add(vec![
+                NodeId(0),
+                NodeId(u32::try_from(n - 1).expect("small")),
+            ]));
+        }
+    }
+    // Move node i to the position of its rank under (key, i).
+    let mut order: Vec<usize> = (0..nodes.len()).collect();
+    order.sort_by_key(|&i| (keys[i % keys.len()], i));
+    let mut position = vec![0u32; nodes.len()];
+    for (new, &old) in order.iter().enumerate() {
+        position[old] = u32::try_from(new).expect("small");
+    }
+    let moved: Vec<Node> = order
+        .iter()
+        .map(|&old| remap(&nodes[old], |c| NodeId(position[c.index()])))
+        .collect();
+    Table::new(moved, NodeId(position[n - 1])).expect("scrambled table is valid")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        rng_algorithm: RngAlgorithm::ChaCha,
+        rng_seed: RngSeed::Fixed(0x6b73_6369_7769_7265),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn identity_property(
+        specs in prop::collection::vec(spec(), 1..=48),
+        dups in prop::collection::vec(any::<usize>(), 0..=8),
+        redirect in prop::collection::vec(any::<bool>(), 1..=8),
+        extra in prop::collection::vec(any::<u8>(), 0..=7),
+        keys in prop::collection::vec(any::<u64>(), 1..=64),
+    ) {
+        let base = build(&specs);
+        let root = NodeId(u32::try_from(base.len() - 1).expect("small"));
+        let clean = Table::new(base.clone(), root).expect("generated table is valid");
+        let scrambled = scramble(&base, &dups, &redirect, &extra, &keys);
+        prop_assert!(scrambled.nodes().len() <= 64);
+        prop_assert_eq!(clean.canonicalize().to_jcs(), scrambled.canonicalize().to_jcs());
+        prop_assert_eq!(clean.identity(), scrambled.identity());
+    }
 }
