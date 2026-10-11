@@ -96,11 +96,11 @@ Wasmtime pin) are measured and filed as klein-rs requests.
 - Also measure, on the oracle, the share of TIR definite integrals that SymPy routes through `meijerint`. It decides
   whether Meijer G leaves the v2 tail.
 
-**Plans**: 18 plans in 8 waves
+**Plans**: 1/18 plans executed in 8 waves
 
 Plans:
 **Wave 1**
-- [ ] 01-01-PLAN.md — ksci-wire: canonical node table, string numerals, JCS, SHA-256 identity, envelopes (wave 1)
+- [x] 01-01-PLAN.md — ksci-wire: canonical node table, string numerals, JCS, SHA-256 identity, envelopes (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 - [ ] 01-02-PLAN.md — xtask spine: recipe fetch, artifact-store client, pinned host tools, heavy-job guard, RFC 8785 vectors, no-corpus (wave 2)
@@ -405,7 +405,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Contracts, Oracles and Risk Probes | 0/18 | Planned | - |
+| 1. Contracts, Oracles and Risk Probes | 1/18 | In Progress | - |
 | 2. Core Expressions | 0/TBD | Not started | - |
 | 3. Polynomials, Number Theory and Algebraic Solve | 0/TBD | Not started | - |
 | 4. Solve, Simplify, Assumptions and Piecewise | 0/TBD | Not started | - |
