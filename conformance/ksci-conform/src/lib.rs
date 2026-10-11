@@ -75,16 +75,19 @@ impl Limits {
 pub enum Pin {
     /// Klein's current pin, wasmtime =46.0.1.
     W46,
+    /// The D6 floor (D-17), wasmtime =49.0.2.
+    W49,
 }
 
 impl Pin {
     /// Every pin, oldest first.
-    pub const ALL: [Pin; 1] = [Pin::W46];
+    pub const ALL: [Pin; 2] = [Pin::W46, Pin::W49];
 
     /// The pinned Wasmtime version.
     pub const fn version(self) -> &'static str {
         match self {
             Pin::W46 => "46.0.1",
+            Pin::W49 => "49.0.2",
         }
     }
 }
@@ -161,9 +164,17 @@ macro_rules! r0_host {
 
             impl R0 {
                 /// Compile the component at `path` with fuel metering on.
+                ///
+                /// Guest faults (an `unreachable` after a failed allocation, for one) are
+                /// handled with Unix signals on every platform. On macOS Wasmtime defaults to a
+                /// Mach exception port per process, and two Wasmtime copies in one process (both
+                /// pins) each claim it, so a fault in the first copy's code reaches the second
+                /// copy's handler and kills the process with SIGILL. Signal handlers chain: each
+                /// copy forwards a fault outside its own code to the handler it replaced.
                 pub fn load(path: &Path) -> Result<R0, HostError> {
                     let mut config = Config::new();
                     config.consume_fuel(true);
+                    config.macos_use_mach_ports(false);
                     let engine = Engine::new(&config)
                         .map_err(|e| HostError::Spawn(format!("engine: {e:?}")))?;
                     let component = Component::from_file(&engine, path).map_err(|e| {
@@ -251,11 +262,24 @@ macro_rules! r0_host {
 }
 
 r0_host!(w46, wasmtime46);
+r0_host!(w49, wasmtime49);
 
 /// The R0 component under one Wasmtime pin.
 pub enum R0 {
     /// Under wasmtime =46.0.1.
     W46(w46::R0),
+    /// Under wasmtime =49.0.2.
+    W49(w49::R0),
+}
+
+/// Runs `$call` on the host of whichever pin `$r0` holds.
+macro_rules! on_pin {
+    ($r0:expr, $host:ident => $call:expr) => {
+        match $r0 {
+            R0::W46($host) => $call,
+            R0::W49($host) => $call,
+        }
+    };
 }
 
 impl R0 {
@@ -263,28 +287,23 @@ impl R0 {
     pub fn load(pin: Pin, path: &Path) -> Result<R0, HostError> {
         Ok(match pin {
             Pin::W46 => R0::W46(w46::R0::load(path)?),
+            Pin::W49 => R0::W49(w49::R0::load(path)?),
         })
     }
 
     /// `cas.invoke` in a fresh store.
     pub fn invoke(&self, request: &[u8], limits: Limits) -> Result<Outcome, HostError> {
-        match self {
-            R0::W46(h) => h.invoke(request, limits),
-        }
+        on_pin!(self, h => h.invoke(request, limits))
     }
 
     /// `cas.plan` in a fresh store.
     pub fn plan(&self, request: &[u8], limits: Limits) -> Result<Outcome<Vec<Vec<u8>>>, HostError> {
-        match self {
-            R0::W46(h) => h.plan(request, limits),
-        }
+        on_pin!(self, h => h.plan(request, limits))
     }
 
     /// `cas.map` in a fresh store.
     pub fn map(&self, piece: &[u8], limits: Limits) -> Result<Outcome, HostError> {
-        match self {
-            R0::W46(h) => h.map(piece, limits),
-        }
+        on_pin!(self, h => h.map(piece, limits))
     }
 
     /// `cas.reduce` in a fresh store.
@@ -294,9 +313,7 @@ impl R0 {
         outputs: &[Vec<u8>],
         limits: Limits,
     ) -> Result<Outcome, HostError> {
-        match self {
-            R0::W46(h) => h.reduce(request, outputs, limits),
-        }
+        on_pin!(self, h => h.reduce(request, outputs, limits))
     }
 }
 
