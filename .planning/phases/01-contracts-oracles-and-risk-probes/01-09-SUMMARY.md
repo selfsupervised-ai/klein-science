@@ -345,3 +345,7 @@ its runner group to this repository, enables "Require approval for all outside c
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+All 6 claimed files exist; all 8 task commits (b26741a, 6e8f06b, 198953a, a85e700, 99dbcf3, 5080514, 0265579, 825b32a) are on this branch above 229fc4c.
