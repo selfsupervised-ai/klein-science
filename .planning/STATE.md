@@ -1,6 +1,12 @@
 ---
-gsd_state_version: '1.0'
+gsd_state_version: "1.0"
+current_phase: 1
+current_phase_name: Contracts, Oracles and Risk Probes
 status: planning
+stopped_at: Phase 1 context gathered
+last_updated: "2026-10-11T05:52:16.713Z"
+last_activity: 2026-10-11, roadmap created (6 phases; all 92 v1 requirements mapped)
+state_head: 9dcaec32ca5ebadf52506e69e1a82a8c1b794908
 progress:
   total_phases: 6
   completed_phases: 0
@@ -70,8 +76,6 @@ None yet.
 ### Blockers/Concerns
 
 - [Pre-Phase 1] Not scheduled yet. Work starts after Klein's 04.05/04.06 closes (deadline 2026-10-21).
-- [Pre-Phase 1] CLAUDE.md rule 4 still says "canonical tree". The ruling (identity over the canonical DAG node table)
-  awaits that amendment before DET-01 fixes the schema.
 - [All gates] TIR pass rates are proxy (CPython `host_shim`) until klein-rs D4 (the widened Monty protocol) lands.
 - [Phase 3+] Lean certificates are checked by a pinned offline Lean + Mathlib toolchain until D5. This proxy needs
   operator confirmation.
@@ -89,6 +93,6 @@ Items acknowledged and deferred at milestone close, most recent first:
 
 ## Session Continuity
 
-Last session: 2026-10-11
-Stopped at: ROADMAP.md, STATE.md and the REQUIREMENTS.md traceability were written; awaiting operator approval
-Resume file: None
+Last session: 2026-10-11T05:52:16.700Z
+Stopped at: Phase 1 context gathered
+Resume file: .planning/phases/01-contracts-oracles-and-risk-probes/01-CONTEXT.md
