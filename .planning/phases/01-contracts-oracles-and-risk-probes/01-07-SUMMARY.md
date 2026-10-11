@@ -269,3 +269,9 @@ None. No external service configuration is required.
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+- All 12 created files exist; images.json and .gitignore modified.
+- Commits d8d3721, 3de7ae9, e479ce1, f420f38 are on this branch (798d3e1..HEAD).
+- Re-run: 22 unit tests pass; check no-corpus and check provenance pass; manifest acceptance (selected 1000, no "code") passes.
