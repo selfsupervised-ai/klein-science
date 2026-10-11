@@ -341,3 +341,9 @@ None for this plan. The first real push to GHCR still needs the operator's `oras
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+- All 10 key files exist on disk.
+- Task commits ecee41f and b04b90b and the SUMMARY commit 8224fe4 are on this branch.
+- REQUIREMENTS.md not changed: DET-01 and CONF-02 are held by the shared-ID gate (0/2 ready) until sibling plans that declare them finish.
