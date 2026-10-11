@@ -19,7 +19,8 @@ adds code to klein-rs. Anything it needs from Klein's core is filed as a request
    - Exact results (Z, Q, Z/p) are byte-identical across the WASM, parallel-CPU and native/GPU implementations. That is
      shown by conformance with a witness seen RED before an operation class is admitted.
    - Float results are tagged approximate and replayed from the record.
-   - Expression identity is SHA-256 over the RFC-8785 JCS canonical tree.
+   - Expression identity is SHA-256 over the RFC-8785 JCS encoding of the canonical DAG node table: the canonical tree
+     serialised at linear size, with shared subterms stored once.
 5. **Claims need oracles.** A test is a witness only after it has failed against the unfixed code. Performance claims are
    measured on a fixed box, never estimated.
 6. **No benchmark or third-party corpus bytes in git.** Corpora are fetch recipes plus digests.

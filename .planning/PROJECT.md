@@ -21,7 +21,7 @@ Operator rulings of 2026-10-11, made on the research in `research/SUMMARY.md` ("
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Identity = SHA-256 of the JCS canonical DAG **node table** (amends rule 4's "canonical tree" wording) | A literal tree is exponential for shared subterms; the node table is the same tree at linear size | — Pending (amend CLAUDE.md rule 4) |
+| Identity = SHA-256 of the JCS canonical DAG **node table** (amends rule 4's "canonical tree" wording) | A literal tree is exponential for shared subterms; the node table is the same tree at linear size | ✓ Applied 2026-10-11 (CLAUDE.md rule 4 amended) |
 | Pull the algebraic `solve` core forward (with POLY root-finding); the ≥60% TIR gate moves to the end of M2 | `solve` is in 51% of SymPy programs; M1 alone reaches 36.6% | — Pending |
 | Per-symbol `is_*` assumptions in M1; `ask`/`refine` stay in M3 | Construction-time evaluation depends on them | — Pending |
 | Exact domain matrices (`ks-dmat`) in M2; `Matrix` API and GPU LA budgets stay in M5 | F4, resultants and linsolve need them | — Pending |
