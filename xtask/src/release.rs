@@ -161,7 +161,9 @@ fn build_artifacts(
     artifacts.insert(COMPONENT.to_owned(), component);
 
     // c. The R2 worker for the host triple.
-    let mut build = cargo_build(tc, src_root, target_dir, &remap)?;
+    let mut worker_flags = remap;
+    worker_flags.extend(native_link_flags(&tc.triple, src_root)?);
+    let mut build = cargo_build(tc, src_root, target_dir, &worker_flags)?;
     build.args(["-p", WORKER]);
     run_checked(&mut build, "cargo build -p ksci-worker")?;
     let exe = format!("{WORKER}{}", std::env::consts::EXE_SUFFIX);
@@ -174,6 +176,27 @@ fn build_artifacts(
     artifacts.insert(format!("{}/{exe}", tc.triple), worker);
 
     Ok(Built { artifacts })
+}
+
+/// The link flags a native worker for `triple` needs to be reproducible across source paths.
+///
+/// Apple's ld derives `LC_UUID` from the whole link, including the debug-map (`N_OSO`) entries
+/// that name each object file by its absolute path in the target directory. The LTO object
+/// carries std's line tables, so the entry exists; stripping later removes it but not the UUID,
+/// and the ad-hoc code signature hashes the page holding the UUID. Two trees at different paths
+/// therefore gave workers that differed only in those bytes (plan 01-09, assumption A6).
+/// `-oso_prefix <src_root>/` makes the entries relative to the tree, so the UUID is the same.
+fn native_link_flags(triple: &str, src_root: &Path) -> Res<Vec<String>> {
+    if !triple.contains("-apple-") {
+        return Ok(Vec::new());
+    }
+    let text = src_root
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", src_root.display()))?;
+    if text.contains(',') {
+        return Err(format!("{text} contains ','; it cannot pass through -Wl"));
+    }
+    Ok(vec![format!("-Clink-arg=-Wl,-oso_prefix,{text}/")])
 }
 
 /// A `cargo build --locked --release` of the tree at `src_root` into `target_dir`, with exactly
@@ -501,6 +524,15 @@ mod tests {
         );
         assert!(remap_flags(Path::new("rel"), Path::new("/h")).is_err());
         assert!(remap_flags(Path::new("/a=b"), Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn release_native_link_flags_apple_only() {
+        let apple = native_link_flags("aarch64-apple-darwin", Path::new("/t/src")).unwrap();
+        assert_eq!(apple, ["-Clink-arg=-Wl,-oso_prefix,/t/src/"]);
+        let linux = native_link_flags("x86_64-unknown-linux-gnu", Path::new("/t/src")).unwrap();
+        assert!(linux.is_empty());
+        assert!(native_link_flags("aarch64-apple-darwin", Path::new("/a,b")).is_err());
     }
 
     #[test]
