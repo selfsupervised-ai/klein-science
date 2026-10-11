@@ -1,0 +1,7 @@
+# provenance: original
+# Dev-only test oracles for standin/ (never shipped, never imported by standin/sympy).
+# Package legitimacy: approved by operator, 2026-10-12 (plan 01-08 Task 2 gate), for exactly the set
+# locked in dev.lock (requirement and hash lines sha256 79a648b06d9274e8c09a3fd1694d607091ec592b8d5a2aa14baf3450512ce5c4).
+# Regenerate: uv pip compile conformance/python/dev.in --generate-hashes --python-version 3.13 --no-build -o conformance/python/dev.lock
+rfc8785==0.1.4
+pydantic-monty==1.1.0

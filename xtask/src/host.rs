@@ -54,7 +54,19 @@ pub enum ToolsCmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Create `.venv` (CPython [`VENV_PYTHON`], uv-managed) if it is absent, then sync it to the
+    /// hash-locked dev test oracles ([`DEV_LOCK`]). The one way any worktree, CI job or plan gets
+    /// the dev venv; idempotent.
+    Venv,
 }
+
+/// The exact CPython of the dev venv. uv fetches it as a uv-managed interpreter, so a system
+/// Python never stands in, and every worktree and CI job runs the same patch release.
+pub const VENV_PYTHON: &str = "3.13.16";
+
+/// The dev test oracles (rfc8785, pydantic-monty and their transitive packages), hash-locked and
+/// approved by the operator on 2026-10-12 (plan 01-08, Task 2). Never shipped.
+pub const DEV_LOCK: &str = "conformance/python/dev.lock";
 
 /// Runs one `tools` command.
 pub fn run(cmd: ToolsCmd) -> Res<ExitCode> {
@@ -62,6 +74,7 @@ pub fn run(cmd: ToolsCmd) -> Res<ExitCode> {
         ToolsCmd::Install => install().map(|()| ExitCode::SUCCESS),
         ToolsCmd::Check => check(),
         ToolsCmd::Guard { cmd } => guard(&cmd),
+        ToolsCmd::Venv => venv(),
     }
 }
 
@@ -798,6 +811,63 @@ pub fn matching_builds<'a>(ps: &'a str, marker: &str, own_pid: u32) -> Vec<&'a s
             pid != Some(own_pid) && matches!(base, "cargo" | "rustc") && line.contains(marker)
         })
         .collect()
+}
+
+/// `tools venv`: `.venv` at the checkout root, on the pinned uv only.
+///
+/// - `uv venv --managed-python --python <VENV_PYTHON> .venv` when `.venv` is absent;
+/// - the venv's own Python must report exactly [`VENV_PYTHON`]; a `.venv` on another interpreter
+///   fails with the command that replaces it;
+/// - always `uv pip sync --require-hashes --no-build` against [`DEV_LOCK`], so every installed
+///   file matches an approved sha256 and no package code runs at install time.
+fn venv() -> Res<ExitCode> {
+    let root = workspace::root()?;
+    let uv = tool_path("uv")?;
+    if !uv.is_file() {
+        return Err(format!(
+            "{} is missing; run: cargo xtask tools install",
+            uv.display()
+        ));
+    }
+    let run_uv = |args: &[&str]| -> Res<()> {
+        let status = Command::new(&uv)
+            .args(args)
+            .current_dir(&root)
+            .status()
+            .map_err(|e| format!("run {}: {e}", uv.display()))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("uv {} failed: {status}", args.join(" ")))
+        }
+    };
+    let venv = root.join(".venv");
+    if fs::symlink_metadata(&venv).is_err() {
+        run_uv(&["venv", "--managed-python", "--python", VENV_PYTHON, ".venv"])?;
+    }
+    let python = venv.join("bin").join("python");
+    let out = Command::new(&python)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("run {}: {e}", python.display()))?;
+    let reported = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if !out.status.success() || reported != format!("Python {VENV_PYTHON}") {
+        return Err(format!(
+            "{} reports {reported:?}, not Python {VENV_PYTHON}; remove .venv and run: cargo xtask tools venv",
+            python.display()
+        ));
+    }
+    run_uv(&[
+        "pip",
+        "sync",
+        "--require-hashes",
+        "--no-build",
+        "--python",
+        ".venv/bin/python",
+        DEV_LOCK,
+    ])?;
+    println!("{reported} at {}, synced to {DEV_LOCK}", python.display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn guard(cmd: &[String]) -> Res<ExitCode> {
