@@ -12,8 +12,14 @@
 //! verifies the download against the registry index.
 //!
 //! `tools check` also checks the other code oracle, rust-analyzer: a rustup component of the
-//! pinned toolchain (rust-toolchain.toml), not a cargo install. It must report that toolchain's
-//! version.
+//! pinned toolchain (rust-toolchain.toml), not a cargo install. [`toolchain_bin`] resolves it
+//! through rustup (itself run as `$CARGO_HOME/bin/rustup`), checks the path lies in that
+//! toolchain's directory, and xtask runs it by that absolute path. It must report that
+//! toolchain's version.
+//!
+//! Every cargo that xtask starts is [`cargo`]: the cargo that invoked xtask (`$CARGO`), else the
+//! pinned toolchain's cargo resolved through rustup. It must be an absolute path and report the
+//! pinned toolchain's version. No pinned binary is ever found by a `PATH` lookup.
 
 use std::env;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -265,14 +271,18 @@ fn check() -> Res<ExitCode> {
         }
     }
     let channel = toolchain_channel()?;
-    let analyzer = rust_analyzer_version()?;
-    let good = analyzer.as_deref() == Some(channel.as_str());
+    let analyzer = rust_analyzer_version();
+    let good = analyzer.as_ref().ok().map(|(v, _)| v.as_str()) == Some(channel.as_str());
     ok &= good;
+    let (shown, source) = match &analyzer {
+        Ok((v, path)) => (v.as_str(), path.display().to_string()),
+        Err(why) => ("missing", why.clone()),
+    };
     println!(
-        "{:<14} {:<9} {:<9} {} (toolchain component)",
+        "{:<14} {:<9} {:<9} {} (toolchain component: {source})",
         "rust-analyzer",
         channel,
-        analyzer.as_deref().unwrap_or("missing"),
+        shown,
         if good { "ok" } else { "MISMATCH" }
     );
     if ok {
@@ -284,7 +294,7 @@ fn check() -> Res<ExitCode> {
 }
 
 /// `toolchain.channel` from the workspace's rust-toolchain.toml.
-fn toolchain_channel() -> Res<String> {
+pub fn toolchain_channel() -> Res<String> {
     let path = workspace_root().join("rust-toolchain.toml");
     let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let doc: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -295,19 +305,122 @@ fn toolchain_channel() -> Res<String> {
         .ok_or_else(|| format!("{}: no toolchain.channel", path.display()))
 }
 
-/// `rust-analyzer --version` run from the workspace root, so rustup resolves the pinned
-/// toolchain's component. `None` when it does not run or prints no version.
-fn rust_analyzer_version() -> Res<Option<String>> {
-    let out = match Command::new("rust-analyzer")
-        .arg("--version")
-        .current_dir(workspace_root())
+/// `$RUSTUP_HOME` (default `$HOME/.rustup`).
+fn rustup_home() -> Res<PathBuf> {
+    if let Some(home) = env::var_os("RUSTUP_HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    let home = env::var_os("HOME").ok_or("neither RUSTUP_HOME nor HOME is set")?;
+    Ok(PathBuf::from(home).join(".rustup"))
+}
+
+/// The absolute path of `bin` in the pinned toolchain (rust-toolchain.toml), resolved by
+/// `$CARGO_HOME/bin/rustup which --toolchain <channel>` and checked to lie in
+/// `$RUSTUP_HOME/toolchains/<channel>-<host>/`. Never a `PATH` lookup.
+pub fn toolchain_bin(bin: &str) -> Res<PathBuf> {
+    let channel = toolchain_channel()?;
+    let rustup = tool_path("rustup")?;
+    if !rustup.is_file() {
+        return Err(format!("{} not found", rustup.display()));
+    }
+    let out = Command::new(&rustup)
+        .args(["which", bin, "--toolchain", &channel])
         .output()
-    {
-        Ok(out) if out.status.success() => out,
-        _ => return Ok(None),
-    };
+        .map_err(|e| format!("run {}: {e}", rustup.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "rustup which {bin} --toolchain {channel}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let named = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let real = fs::canonicalize(&named).map_err(|e| format!("{}: {e}", named.display()))?;
+    let toolchains = rustup_home()?.join("toolchains");
+    let toolchains =
+        fs::canonicalize(&toolchains).map_err(|e| format!("{}: {e}", toolchains.display()))?;
+    if !in_toolchain(&real, &toolchains, &channel) {
+        return Err(format!(
+            "{} is not inside {}/{channel}-<host>",
+            real.display(),
+            toolchains.display()
+        ));
+    }
+    Ok(real)
+}
+
+/// Whether `path` lies in `<toolchains>/<channel>-<host>/`.
+fn in_toolchain(path: &Path, toolchains: &Path, channel: &str) -> bool {
+    path.strip_prefix(toolchains)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+        .is_some_and(|dir| dir.starts_with(&format!("{channel}-")))
+}
+
+/// The version and absolute path of the pinned toolchain's rust-analyzer, or why it is missing.
+fn rust_analyzer_version() -> Result<(String, PathBuf), String> {
+    let path = toolchain_bin("rust-analyzer")?;
+    let out = Command::new(&path)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("run {}: {e}", path.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} --version: {}", path.display(), out.status));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
-    Ok(parse_version(&text).map(str::to_owned))
+    let version =
+        parse_version(&text).ok_or_else(|| format!("{} printed no version", path.display()))?;
+    Ok((version.to_owned(), path))
+}
+
+/// The resolved cargo: an absolute path that reported the pinned toolchain's version.
+pub struct Cargo {
+    /// Absolute path of the cargo binary.
+    pub path: PathBuf,
+    channel: String,
+}
+
+impl Cargo {
+    /// A command for this cargo. `RUSTUP_TOOLCHAIN` pins every rustup proxy it reaches (such as
+    /// `rustc` run in a dependency's directory, where rust-toolchain.toml is out of sight) to the
+    /// pinned toolchain, as the rustup proxy itself does when it starts cargo.
+    pub fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.path);
+        cmd.env("RUSTUP_TOOLCHAIN", &self.channel);
+        cmd
+    }
+}
+
+/// The cargo every xtask child runs: the cargo that invoked xtask (`$CARGO`, set by cargo for
+/// `cargo run` and aliases such as `cargo xtask`), else the pinned toolchain's cargo resolved
+/// through rustup. It must be an absolute path and report the pinned toolchain's version, so a
+/// `cargo` earlier on `PATH`, or a cargo of another toolchain, never stands in for it.
+pub fn cargo() -> Res<Cargo> {
+    let channel = toolchain_channel()?;
+    let path = match env::var_os("CARGO") {
+        Some(c) => PathBuf::from(c),
+        None => toolchain_bin("cargo")?,
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "CARGO={} is not an absolute path; xtask never looks cargo up on PATH",
+            path.display()
+        ));
+    }
+    let out = Command::new(&path)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("run {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text.strip_prefix("cargo ").and_then(parse_version);
+    if !out.status.success() || version != Some(channel.as_str()) {
+        return Err(format!(
+            "{} reports {:?}; the pinned toolchain is {channel}",
+            path.display(),
+            text.trim()
+        ));
+    }
+    Ok(Cargo { path, channel })
 }
 
 fn install() -> Res<()> {
@@ -330,8 +443,15 @@ fn install() -> Res<()> {
                 if !features.is_empty() {
                     args.extend(["--features", joined.as_str()]);
                 }
-                println!("{:<14} cargo {}", tool.name, args.join(" "));
-                let status = Command::new("cargo")
+                let cargo = cargo()?;
+                println!(
+                    "{:<14} {} {}",
+                    tool.name,
+                    cargo.path.display(),
+                    args.join(" ")
+                );
+                let status = cargo
+                    .command()
                     .args(&args)
                     .status()
                     .map_err(|e| format!("run cargo install: {e}"))?;
@@ -526,6 +646,58 @@ mod tests {
                 "101 /Users/x/.rustup/toolchains/1.96.0/bin/cargo build --manifest-path /src/klein-rs/Cargo.toml",
                 "102 rustc --crate-name klein_core /src/klein-rs/crates/core/src/lib.rs",
             ]
+        );
+    }
+
+    #[test]
+    fn tools_toolchain_bin_is_in_pinned_toolchain() {
+        let channel = toolchain_channel().unwrap();
+        let cargo = toolchain_bin("cargo").unwrap();
+        assert!(cargo.is_absolute(), "{}", cargo.display());
+        let dir = cargo
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        assert!(
+            dir.starts_with(&format!("{channel}-")),
+            "{}",
+            cargo.display()
+        );
+        assert!(toolchain_bin("no-such-component-binary").is_err());
+    }
+
+    #[test]
+    fn tools_in_toolchain() {
+        let tc = Path::new("/h/.rustup/toolchains");
+        let ok = Path::new("/h/.rustup/toolchains/1.99.0-aarch64-apple-darwin/bin/rust-analyzer");
+        assert!(in_toolchain(ok, tc, "1.99.0"));
+        for bad in [
+            "/h/.rustup/toolchains/1.97.0-aarch64-apple-darwin/bin/rust-analyzer",
+            "/h/.rustup/toolchains/1.99.0/bin/rust-analyzer",
+            "/h/.rustup/toolchains/1.99.01-x/bin/rust-analyzer",
+            "/tmp/fakes/rust-analyzer",
+            "/h/.cargo/bin/rust-analyzer",
+        ] {
+            assert!(!in_toolchain(Path::new(bad), tc, "1.99.0"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tools_cargo_pins_toolchain_for_children() {
+        let channel = toolchain_channel().unwrap();
+        let cargo = cargo().unwrap();
+        assert!(cargo.path.is_absolute(), "{}", cargo.path.display());
+        let cmd = cargo.command();
+        assert_eq!(cmd.get_program(), cargo.path.as_os_str());
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert_eq!(
+            envs,
+            [(
+                std::ffi::OsStr::new("RUSTUP_TOOLCHAIN"),
+                Some(std::ffi::OsStr::new(channel.as_str()))
+            )]
         );
     }
 

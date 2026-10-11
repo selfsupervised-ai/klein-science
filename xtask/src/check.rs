@@ -3,21 +3,26 @@
 //!
 //! `check no-corpus` (CONF-02, CLAUDE.md rule 6) keeps corpus, golden and vector bytes out of git:
 //! git holds recipes, manifests and aggregate scores, and the bytes live in the artifact store.
+//!
+//! It judges the git repository of the current directory (not the tree xtask was compiled
+//! from), and the bytes git would commit: each index entry by its staged blob, never by the
+//! working copy, plus each untracked, non-ignored file (what `git add` stages next). An entry it
+//! cannot size fails the check rather than being skipped.
 
-use std::collections::BTreeSet;
+use std::env;
 use std::fs;
-use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
 
 use clap::Subcommand;
 
 use crate::Res;
-use crate::store::workspace_root;
 
 /// `cargo xtask check ...`
 #[derive(Subcommand)]
 pub enum CheckCmd {
-    /// Fail when a tracked, staged or untracked (non-ignored) file looks like corpus bytes.
+    /// Fail when a staged (index) blob or an untracked, non-ignored file looks like corpus bytes.
     NoCorpus,
 }
 
@@ -41,43 +46,25 @@ const PAYLOAD_EXT: [&str; 10] = [
 ];
 /// Extensions allowed under `conformance/golden/` (manifests and notes only).
 const GOLDEN_EXT: [&str; 2] = ["json", "md"];
+/// Extensions allowed under `conformance/corpora/` (fetch recipes and notes only, rule 6).
+const CORPORA_EXT: [&str; 2] = ["toml", "md"];
 
 fn no_corpus() -> Res<ExitCode> {
-    let root = workspace_root();
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()
-        .map_err(|e| format!("run git ls-files: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("git ls-files: {}", out.status));
-    }
-    let paths: BTreeSet<String> = out
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .collect();
-    let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
-        // A tracked file deleted in the working tree has no bytes to check.
-        if let Ok(meta) = fs::metadata(root.join(&path)) {
-            files.push((path, meta.len()));
-        }
-    }
+    let root = repo_root()?;
+    let mut files = index_files(&root)?;
+    let staged = files.len();
+    files.extend(untracked_files(&root)?);
     let found = violations(&files);
     for v in &found {
         println!("{v}");
     }
     if found.is_empty() {
-        println!("no-corpus: {} files checked, no violations", files.len());
+        println!(
+            "no-corpus: {} files checked ({staged} index entries, {} untracked) in {}, no violations",
+            files.len(),
+            files.len() - staged,
+            root.display()
+        );
         Ok(ExitCode::SUCCESS)
     } else {
         eprintln!(
@@ -88,11 +75,170 @@ fn no_corpus() -> Res<ExitCode> {
     }
 }
 
-/// The violations among `(path, size)` pairs, sorted by path.
+/// Runs `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
+fn git_out(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// The top level of the git work tree of the current directory: the guard judges the
+/// repository it is asked about, not the tree xtask was compiled from.
+fn repo_root() -> Res<PathBuf> {
+    let cwd = env::current_dir().map_err(|e| format!("current directory: {e}"))?;
+    let out = git_out(&cwd, &["rev-parse", "--show-toplevel"])?;
+    let top = String::from_utf8(out).map_err(|e| format!("git rev-parse: {e}"))?;
+    let top = top.trim_end_matches(['\n', '\r']);
+    if top.is_empty() {
+        return Err(format!("{} is not inside a git work tree", cwd.display()));
+    }
+    Ok(PathBuf::from(top))
+}
+
+/// Every index entry as `(path, staged blob size)`: the bytes the next commit holds, whatever
+/// the working copy says. An entry that is not a readable blob (a submodule, a missing object)
+/// is an error: what cannot be sized cannot be judged.
+fn index_files(root: &Path) -> Res<Vec<(String, u64)>> {
+    let listing = git_out(root, &["ls-files", "-z", "--stage"])?;
+    let mut entries = Vec::new();
+    for record in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        // `<mode> SP <object> SP <stage> TAB <path>`
+        let record = String::from_utf8_lossy(record);
+        let malformed = || format!("git ls-files --stage: malformed record {record:?}");
+        let (meta, path) = record.split_once('\t').ok_or_else(malformed)?;
+        let mut fields = meta.split(' ');
+        let (Some(mode), Some(oid)) = (fields.next(), fields.next()) else {
+            return Err(malformed());
+        };
+        if mode == "160000" {
+            return Err(format!(
+                "no-corpus: {path}: index entry is a submodule (mode 160000) with no blob to \
+                 judge; corpora are fetch recipes, not submodules"
+            ));
+        }
+        entries.push((path.to_owned(), oid.to_owned()));
+    }
+    let sizes = blob_sizes(root, &entries)?;
+    entries
+        .into_iter()
+        .zip(sizes)
+        .map(|((path, oid), size)| {
+            size.map_err(|why| format!("no-corpus: {path}: staged object {oid} {why}"))
+                .map(|s| (path, s))
+        })
+        .collect()
+}
+
+/// The size of each entry's object, in order, from one `git cat-file --batch-check`. An object
+/// that is missing or not a blob yields `Err(reason)` in its slot.
+fn blob_sizes(root: &Path, entries: &[(String, String)]) -> Res<Vec<Result<u64, String>>> {
+    let input: String = entries.iter().map(|(_, oid)| format!("{oid}\n")).collect();
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("run git cat-file: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file: no stdin")?;
+    // Write from a thread: cat-file answers line by line, so a large index would otherwise fill
+    // the stdout pipe while this side is still writing.
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git cat-file: {e}"))?;
+    writer
+        .join()
+        .map_err(|_| "git cat-file: writer thread panicked".to_owned())?
+        .map_err(|e| format!("git cat-file: write: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git cat-file: {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let sizes: Vec<Result<u64, String>> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| {
+            let mut f = line.split(' ');
+            match (f.next(), f.next(), f.next()) {
+                (Some(_), Some("blob"), Some(size)) => size
+                    .parse::<u64>()
+                    .map_err(|e| format!("has an unreadable size {size:?}: {e}")),
+                (Some(_), Some("missing"), None) => {
+                    Err("is missing from the object store".to_owned())
+                }
+                (Some(_), Some(kind), _) => Err(format!("is a {kind}, not a blob")),
+                _ => Err(format!("is unreadable ({line:?})")),
+            }
+        })
+        .collect();
+    if sizes.len() != entries.len() {
+        return Err(format!(
+            "git cat-file: {} answers for {} index entries",
+            sizes.len(),
+            entries.len()
+        ));
+    }
+    Ok(sizes)
+}
+
+/// Untracked, non-ignored files as `(path, size)`: what `git add` stages next. They have no
+/// index bytes, so the working copy is judged, and one that cannot be read is an error. An
+/// embedded repository (listed with a trailing `/`) holds none of this repository's bytes; it is
+/// named, not judged.
+fn untracked_files(root: &Path) -> Res<Vec<(String, u64)>> {
+    let listing = git_out(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let mut files = Vec::new();
+    for raw in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = String::from_utf8_lossy(raw).into_owned();
+        if path.ends_with('/') {
+            println!("no-corpus: note: {path} is an embedded repository, not judged");
+            continue;
+        }
+        // `symlink_metadata`: git stores a symlink as its target string, not the bytes it names.
+        let meta = fs::symlink_metadata(root.join(&path))
+            .map_err(|e| format!("no-corpus: untracked {path}: {e}"))?;
+        if !(meta.is_file() || meta.is_symlink()) {
+            return Err(format!(
+                "no-corpus: untracked {path} is neither a file nor a symlink"
+            ));
+        }
+        files.push((path, meta.len()));
+    }
+    Ok(files)
+}
+
+/// The violations among `(path, size)` pairs, sorted by path, each reported once (a path can
+/// appear more than once, e.g. in several merge stages).
 pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     let mut sorted: Vec<&(String, u64)> = files.iter().collect();
     sorted.sort();
-    let mut out = Vec::new();
+    sorted.dedup();
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |v: String| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
     for (path, size) in sorted {
         let p = Path::new(path);
         let ext = p
@@ -102,21 +248,26 @@ pub fn violations(files: &[(String, u64)]) -> Vec<String> {
             .to_ascii_lowercase();
         let in_testdata = p.components().any(|c| c.as_os_str() == "testdata");
         if *size > MAX_FILE && !SIZE_EXEMPT.contains(&path.as_str()) {
-            out.push(format!(
+            push(format!(
                 "{path}: {size} bytes, above the {MAX_FILE}-byte limit"
             ));
         }
         if !in_testdata && PAYLOAD_EXT.contains(&ext.as_str()) {
-            out.push(format!("{path}: .{ext} payload outside testdata/"));
+            push(format!("{path}: .{ext} payload outside testdata/"));
         }
         if in_testdata && *size > MAX_TESTDATA {
-            out.push(format!(
+            push(format!(
                 "{path}: {size} bytes under testdata/, above the {MAX_TESTDATA}-byte limit"
             ));
         }
         if p.starts_with("conformance/golden") && !GOLDEN_EXT.contains(&ext.as_str()) {
-            out.push(format!(
+            push(format!(
                 "{path}: conformance/golden/ holds only .json and .md manifests"
+            ));
+        }
+        if p.starts_with("conformance/corpora") && !CORPORA_EXT.contains(&ext.as_str()) {
+            push(format!(
+                "{path}: conformance/corpora/ holds only .toml recipes and .md notes"
             ));
         }
     }
@@ -197,6 +348,38 @@ mod tests {
                 "conformance/golden/cases.txt: conformance/golden/ holds only .json and .md manifests",
                 "conformance/golden/witness.jsonl: .jsonl payload outside testdata/",
                 "conformance/golden/witness.jsonl: conformance/golden/ holds only .json and .md manifests",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_corpus_corpora_extensions() {
+        let tree = files(&[
+            ("conformance/corpora/rfc8785.toml", 10),
+            ("conformance/corpora/README.md", 10),
+            ("conformance/corpora/leak.bin", 1),
+        ]);
+        assert_eq!(
+            violations(&tree),
+            [
+                "conformance/corpora/leak.bin: conformance/corpora/ holds only .toml recipes and .md notes"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_corpus_reports_each_violation_once() {
+        // One path in two merge stages: the size differs, the extension rule is shared.
+        let tree = files(&[
+            ("data/x.jsonl", 1),
+            ("data/x.jsonl", MAX_FILE + 1),
+            ("data/x.jsonl", 1),
+        ]);
+        assert_eq!(
+            violations(&tree),
+            [
+                "data/x.jsonl: .jsonl payload outside testdata/",
+                "data/x.jsonl: 262145 bytes, above the 262144-byte limit",
             ]
         );
     }
