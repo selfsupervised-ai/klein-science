@@ -23,7 +23,8 @@
 //!
 //! `git`, which the repository guards depend on, is a system tool in the same table
 //! ([`Install::System`]): xtask does not install it, but runs it only from a fixed list of
-//! absolute paths, and only once it reports at least the minimum version ([`git`]). `curl`,
+//! absolute paths, and only once it reports at least the minimum version ([`git`]). `docker`,
+//! which the offline oracle runs in, is pinned the same way ([`docker`]). `curl`,
 //! `tar` and `ps` stay trusted system tools found on `PATH` (operator decision, 2026-10-11).
 
 use std::env;
@@ -214,6 +215,23 @@ pub const TOOLS: &[Tool] = &[
         ]),
         probe: &["--version"],
     },
+    Tool {
+        name: "docker",
+        bin: "docker",
+        // The client the oracle runner's flags were verified against (`image inspect --platform`,
+        // `run --pull=never --init`); an older client is unverified, so it is refused.
+        version: "28.3.3",
+        // Docker Desktop's symlink and app bundle on macOS, Homebrew, then the Linux package,
+        // frozen as absolute paths so no `PATH` entry can stand in for docker.
+        install: Install::System(&[
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+            "/usr/bin/docker",
+        ]),
+        // `docker --version` prints `28.3.3,`; the bare client version needs a template.
+        probe: &["version", "--format", "{{.Client.Version}}"],
+    },
 ];
 
 /// `$CARGO_HOME/bin` (default `$HOME/.cargo/bin`).
@@ -295,7 +313,15 @@ fn installed_version(tool: &Tool) -> Res<Option<String>> {
 /// The absolute path of the pinned git, resolved and version-checked once per process.
 pub fn git_path() -> Res<PathBuf> {
     static GIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    GIT.get_or_init(resolve_git).clone()
+    GIT.get_or_init(|| resolve_system("git")).clone()
+}
+
+/// A command for the pinned docker CLI, resolved and version-checked once per process like
+/// [`git`]. Every docker that xtask runs starts here.
+pub fn docker() -> Res<Command> {
+    static DOCKER: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    let path = DOCKER.get_or_init(|| resolve_system("docker")).clone()?;
+    Ok(Command::new(path))
 }
 
 /// A command for the pinned git. Every git that xtask runs starts here.
@@ -322,17 +348,19 @@ pub fn git_output(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
     Ok(out.stdout)
 }
 
-fn resolve_git() -> Res<PathBuf> {
+/// The first existing absolute path of the system tool `name` in [`TOOLS`], once it reports at
+/// least the pinned minimum version. Never a `PATH` lookup.
+fn resolve_system(name: &str) -> Res<PathBuf> {
     let tool = TOOLS
         .iter()
-        .find(|t| t.name == "git")
-        .ok_or("git is missing from the pin table")?;
+        .find(|t| t.name == name)
+        .ok_or_else(|| format!("{name} is missing from the pin table"))?;
     let Install::System(paths) = tool.install else {
-        return Err("git must be a system tool in the pin table".to_owned());
+        return Err(format!("{name} must be a system tool in the pin table"));
     };
     let path = locate(tool)?.ok_or_else(|| {
         format!(
-            "git: none of {} exists; install git >= {}",
+            "{name}: none of {} exists; install {name} >= {}",
             paths.join(", "),
             tool.version
         )
@@ -340,7 +368,7 @@ fn resolve_git() -> Res<PathBuf> {
     match probe_version(tool, &path)? {
         Some(v) if satisfies(tool, &v) => Ok(path),
         found => Err(format!(
-            "{} reports version {}; xtask needs git >= {}",
+            "{} reports version {}; xtask needs {name} >= {}",
             path.display(),
             found.as_deref().unwrap_or("none"),
             tool.version
@@ -950,6 +978,7 @@ mod tests {
                 ("ast-grep", "0.45.3"),
                 ("tree-sitter-cli", "0.27.0"),
                 ("git", "2.39.0"),
+                ("docker", "28.3.3"),
             ]
         );
         for tool in TOOLS {

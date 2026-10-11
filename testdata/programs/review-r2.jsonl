@@ -1,0 +1,6 @@
+{"case_id": "7928b0453cd075f8e0f9ce094a6606ed913df7bb98c6174e51aae27aaea7e11d", "code": "import os\nclass Hidden(Exception):\n    def __str__(self):\n        os._exit(0)\nraise Hidden()\n"}
+{"case_id": "073edf412e377e30a18c30ba80c215df5f54603f4998e7ef4cf6989cde7eb894", "code": "class Raising(Exception):\n    def __str__(self):\n        raise RuntimeError('no')\nraise Raising()\n"}
+{"case_id": "5c5550ac8ccc4fbbdd9636451b4a51963caeca270a64c2e1c257b1eb2c29ecfe", "code": "class Looping(Exception):\n    def __str__(self):\n        while True:\n            pass\nraise Looping()\n"}
+{"case_id": "2406d85eb1cfbe89690ca4c0ef5f03ae2dc411be8c47301b039dc73bdd2d53a0", "code": "import os\nclass Meta(type):\n    @property\n    def __name__(cls):\n        os._exit(0)\nclass Sneaky(Exception, metaclass=Meta):\n    pass\nraise Sneaky('x')\n"}
+{"case_id": "90d0272c325244d942adfb52a6b78b38db031913b35dfa6db48a7ac11eb98079", "code": "import os, sys\nprint('a')\nsys.stdout.flush()\nos._exit(0)\nprint('b')\n"}
+{"case_id": "b894d728effef470a6e088ea8b26d2627954c2c42c22d1c4b314813303aa942c", "code": "print(\"r2 control\")\n"}

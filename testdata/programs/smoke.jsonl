@@ -1,0 +1,8 @@
+{"case_id": "b80792336156c7b0f7fe02eeef24610d2d52a10d1810397744471d1dc5738180", "code": "print(\"hello\")\n"}
+{"case_id": "d21fd02d59c2896f36c7c37bf113f7ef9c47aa3cf6c468cc153115af25f29ea7", "code": "raise ValueError(\"boom\")\n"}
+{"case_id": "d8b5c4b6751d495e5ffef53e4af21891adb500da0df28dc19727ca0cda213d8b", "code": "while True:\n    pass\n"}
+{"case_id": "81c5650cbe6eaa6b1404c6fec036026cbec2512a5518c5fab8461b1e1eb43446", "code": "import time\ntime.sleep(10**6)\n"}
+{"case_id": "e4a4074b6d3ca6e48e1d78a5c84854ff50d969a90b23558de28b6428e7b0a6d7", "code": "print(\"x\" * (2 * 1024 * 1024))\n"}
+{"case_id": "4a42a4f7f0b95fedd4262ca65723c21d47ae7e26a95220df9592ed25bded3278", "code": "import sys\nsys.exit(3)\n"}
+{"case_id": "e9bc520dceaaa5d5dc48801421e5f5c20473c49ceda6aca289c3e674dbf46b2c", "code": "print({\"alpha\", \"beta\", \"gamma\"})\n"}
+{"case_id": "6e1ec5eb696b3a88ff28ea1a1a5d5e5704eac149efdfbcc5396cfc308d34b653", "code": "print(\"𝑥\")\n"}
