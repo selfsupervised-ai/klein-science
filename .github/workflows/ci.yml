@@ -1,0 +1,94 @@
+# klein-science CI on the Klein VM (D-01, D-04).
+#
+# The `ci` job runs `cargo xtask ci`, the same command a developer runs on the Mac: every Phase 1
+# guard, including `release dist --twice` (two builds of the committed tree from different paths
+# must give identical artifact digests) and the zero-import and relaxed-SIMD gates.
+#
+# Trust boundary (research Pitfall G, T-01-24). The runner is self-hosted on the shared Klein VM
+# and this repository is public. The workflow therefore runs only on a push to main and on a
+# manual dispatch, never on an event a fork or an outside contributor can raise. The runner
+# carries the dedicated `klein-science` label, runs as an unprivileged user in a runner group
+# limited to this repository, and the repository requires approval for all outside
+# collaborators (plan 01-14).
+#
+# Permissions (T-01-26). Every job reads contents only, except `publish-dist`, which may write
+# packages. The only credential is the workflow's own GITHUB_TOKEN, which reaches oras on stdin
+# and is never echoed.
+#
+# Concurrency (research Pitfall H). One run at a time on the VM, never cancelled midway; inside a
+# run, `cargo xtask` also waits for any klein-rs build (the heavy-job guard).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: klein-science-vm
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    runs-on: [self-hosted, linux, x64, klein-science]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: tools install
+        run: cargo xtask tools install
+      - name: tools check
+        run: cargo xtask tools check
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  publish-dist:
+    needs: ci
+    runs-on: [self-hosted, linux, x64, klein-science]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: tools install
+        run: cargo xtask tools install
+      - name: tools check
+        run: cargo xtask tools check
+      - name: oras login
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" \
+            | "${CARGO_HOME:-$HOME/.cargo}/bin/oras" login ghcr.io \
+                --username "$GITHUB_ACTOR" --password-stdin
+      # The same two-path build and gates as the ci job, so the published digests.json itself
+      # records "reproducible":true for exactly the bytes it lists.
+      - name: release dist --twice
+        run: cargo xtask release dist --twice
+      - name: store put and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          digests=()
+          while IFS= read -r -d '' file; do
+            digest=$(cargo xtask store put "$file")
+            echo "sha256:$digest $file"
+            digests+=("$digest")
+          done < <(find target/dist -type f -print0 | sort -z)
+          cargo xtask store push "${digests[@]}"
+          # For plan 01-16's cross-host check (D-07).
+          echo "DIGESTS_JSON_SHA256=$(cargo xtask store put target/dist/digests.json)"
+      - name: oras logout
+        if: always()
+        shell: bash
+        run: '"${CARGO_HOME:-$HOME/.cargo}/bin/oras" logout ghcr.io || true'
