@@ -11,7 +11,7 @@
 //! Only the artifacts of this compile are read, never a directory listing, so a stale `.d` file
 //! left in the target directory by an earlier compile is never judged.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -49,13 +49,18 @@ pub fn compile_inputs(root: &Path, target_dir: &Path) -> Res<Vec<PathBuf>> {
             out.status
         ));
     }
-    let mut dep_files = BTreeSet::new();
+    // Each dep-info file, with the target source (`src_path`) of every artifact it belongs to.
+    let mut dep_files: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let msg: Value = serde_json::from_str(line)
             .map_err(|e| format!("provenance: cargo message {line:?}: {e}"))?;
         if msg.get("reason").and_then(Value::as_str) != Some("compiler-artifact") {
             continue;
         }
+        let src = msg
+            .pointer("/target/src_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("provenance: compiler-artifact without src_path: {line}"))?;
         let files = msg
             .get("filenames")
             .and_then(Value::as_array)
@@ -64,19 +69,25 @@ pub fn compile_inputs(root: &Path, target_dir: &Path) -> Res<Vec<PathBuf>> {
             let file = file
                 .as_str()
                 .ok_or_else(|| format!("provenance: non-string artifact filename in {line}"))?;
-            dep_files.insert(dep_info_path(Path::new(file))?);
+            dep_files
+                .entry(dep_info_path(Path::new(file))?)
+                .or_default()
+                .insert(PathBuf::from(src));
         }
     }
     if dep_files.is_empty() {
         return Err("provenance: cargo check reported no compiler artifacts".to_owned());
     }
     let mut inputs = BTreeSet::new();
-    for dep in &dep_files {
+    for (dep, srcs) in &dep_files {
         let text = fs::read_to_string(dep)
             .map_err(|e| format!("provenance: dep-info {}: {e}", dep.display()))?;
-        inputs.extend(
-            parse_dep_info(&text).map_err(|e| format!("provenance: {}: {e}", dep.display()))?,
-        );
+        let listed =
+            parse_dep_info(&text).map_err(|e| format!("provenance: {}: {e}", dep.display()))?;
+        for src in srcs {
+            require_source(dep, &listed, root, src)?;
+        }
+        inputs.extend(listed);
     }
     Ok(inputs.into_iter().collect())
 }
@@ -187,9 +198,29 @@ fn split_words(line: &str) -> Result<Vec<String>, String> {
 }
 
 /// Checks that one artifact's dep-info inputs (as written, relative to `root`) include the
-/// artifact's own target source `src` (cargo's `src_path`). (RED stub: accepts anything.)
-pub fn require_source(_dep: &Path, _inputs: &[PathBuf], _root: &Path, _src: &Path) -> Res<()> {
-    Ok(())
+/// artifact's own target source `src` (cargo's `src_path`), compared as real paths (review W3).
+/// An empty, comment-only or phony-only dep-info, or one for some other source, fails closed:
+/// what it omits cannot be judged.
+pub fn require_source(dep: &Path, inputs: &[PathBuf], root: &Path, src: &Path) -> Res<()> {
+    let real = |p: &Path| {
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        };
+        fs::canonicalize(&abs).unwrap_or(abs)
+    };
+    let want = real(src);
+    if inputs.iter().any(|i| real(i) == want) {
+        Ok(())
+    } else {
+        Err(format!(
+            "provenance: dep-info {} does not list its artifact's source {}; an incomplete \
+             dep-info cannot be judged",
+            dep.display(),
+            src.display()
+        ))
+    }
 }
 
 #[cfg(test)]
