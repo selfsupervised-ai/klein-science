@@ -439,6 +439,16 @@ fn write_digests(tc: &Toolchain, dist: &Path, built: &Built, reproducible: bool)
     Ok(())
 }
 
+/// The zero-import gate (D-16). Not implemented yet (RED).
+fn gate_imports(_wasm_tools: &Path, _artifact: &Path) -> Res<()> {
+    Ok(())
+}
+
+/// The relaxed-SIMD gate. Not implemented yet (RED).
+fn gate_relaxed(_wasm_tools: &Path, _artifact: &Path) -> Res<()> {
+    Ok(())
+}
+
 /// The SHA-256 of a file, as lowercase hex.
 fn file_sha256(path: &Path) -> Res<String> {
     let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -547,5 +557,113 @@ mod tests {
         assert!(contains(b"abc/Users/x/def", b"/Users/x"));
         assert!(!contains(b"abc", b"abcd"));
         assert!(!contains(b"abc", b""));
+    }
+
+    /// A fresh scratch directory per test, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir =
+                env::temp_dir().join(format!("ksci-xtask-gates-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wasm_tools() -> PathBuf {
+        pinned_tool("wasm-tools").unwrap()
+    }
+
+    /// The fixture `name` of xtask/tests/fixtures/gates, assembled by `wasm-tools parse` into
+    /// `dir`.
+    fn assemble(dir: &Scratch, name: &str) -> PathBuf {
+        let wat = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("gates")
+            .join(name);
+        let wasm = dir.0.join(name).with_extension("wasm");
+        let mut parse = Command::new(wasm_tools());
+        parse.arg("parse").arg(&wat).arg("-o").arg(&wasm);
+        run_checked(&mut parse, "wasm-tools parse").unwrap();
+        wasm
+    }
+
+    /// The shipped component of this checkout; it must have been built.
+    fn dist_component() -> PathBuf {
+        let path = workspace::root()
+            .unwrap()
+            .join("target")
+            .join("dist")
+            .join(COMPONENT);
+        assert!(
+            path.is_file(),
+            "{} is missing; run: cargo xtask release dist",
+            path.display()
+        );
+        path
+    }
+
+    #[test]
+    fn gate_imports_rejects_fixture() {
+        let dir = Scratch::new("imports");
+        let wasm = assemble(&dir, "imports.wat");
+        let err = gate_imports(&wasm_tools(), &wasm).expect_err("a component with an import");
+        assert!(err.contains("import f: func();"), "{err}");
+    }
+
+    #[test]
+    fn gate_imports_accepts_dist() {
+        gate_imports(&wasm_tools(), &dist_component()).unwrap();
+    }
+
+    #[test]
+    fn gate_relaxed_rejects_fixture() {
+        let dir = Scratch::new("relaxed");
+        let wasm = assemble(&dir, "relaxed-simd.wat");
+        let err = gate_relaxed(&wasm_tools(), &wasm).expect_err("a module using relaxed SIMD");
+        assert!(err.contains("relaxed SIMD"), "{err}");
+    }
+
+    #[test]
+    fn gate_relaxed_accepts_dist() {
+        let component = dist_component();
+        gate_relaxed(&wasm_tools(), &component).unwrap();
+        // The core module inside it, extracted on its own.
+        let dir = Scratch::new("unbundle");
+        let mut unbundle = Command::new(wasm_tools());
+        unbundle
+            .args(["component", "unbundle", "--threshold", "0", "--module-dir"])
+            .arg(&dir.0)
+            .arg(&component)
+            .arg("-o")
+            .arg(dir.0.join("outer.wasm"));
+        run_checked(&mut unbundle, "wasm-tools component unbundle").unwrap();
+        let mut modules = 0;
+        for entry in fs::read_dir(&dir.0).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("unbundled-module")
+            {
+                gate_relaxed(&wasm_tools(), &path).unwrap();
+                modules += 1;
+            }
+        }
+        assert!(
+            modules >= 1,
+            "no core module unbundled from {}",
+            component.display()
+        );
     }
 }
