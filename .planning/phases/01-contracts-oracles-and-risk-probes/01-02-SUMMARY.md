@@ -480,8 +480,223 @@ For each witness the core of the fix was reverted, the tests run, and the file r
   copied to another checkout would read the original tree's files. This is the same class of hole as R1's root
   problem.
 
+Both items were decided on 2026-10-11 ("pin git, trust the rest"; one runtime workspace resolver) and are fixed
+below as G and W.
+
 ### Commits
 
 - `5aa8310` `test(01-02)`: reproduce no-corpus, ci and tools-check bypasses (review R1–R3)
 - `dee1f84` `fix(01-02)`: guards judge staged bytes and run pinned binaries by absolute path (review R1–R3)
 - `f10ab20` `test(01-02)`: no-corpus fails closed on an index entry whose blob is missing (review R1)
+
+### Follow-up review: R1', R2', R3', G and W (2026-10-11)
+
+A second review pass found five more items. Four are fixed and one is accepted.
+
+| Item | Status | What |
+|---|---|---|
+| R1' | must-fix, fixed | the no-corpus policy paths compared letter case exactly |
+| R2' | hardening, fixed | `host::cargo()` trusted any absolute `$CARGO` that printed the pinned version |
+| R3' | accepted risk, not fixed | fake `CARGO_HOME`/`RUSTUP_HOME` can satisfy `toolchain_bin` |
+| G | operator decision, fixed | `git` was found on `PATH` |
+| W | operator decision, fixed | the compile-time `workspace_root()` was still used by store, host and ci |
+
+Each fix went the same way as R1–R3. The tests were written first and seen RED on the unfixed code (commit
+`b57a2ea`). Then came the fix, then mutation witnesses on the fixed code. The R1 tests now run in temporary repositories
+shaped like a klein-science workspace, because W makes every guard require one. `ci_never_runs_cargo_from_path` is
+replaced by `ci_rejects_cargo_that_is_not_the_pinned_toolchain_file`: a stub `$CARGO` used to be accepted, and must
+now be rejected.
+
+On the final tree:
+- `cargo test --workspace --locked` passes (36 + 6 + 26 + 15 + 5 tests). The RFC 8785 vectors were fetched first.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo fmt --all --check` are clean.
+- `cargo xtask ci` reports "all 6 steps passed", with nextest at 83/83. The tools check line reads
+  `git >=2.39.0 2.55.0 ok (/opt/homebrew/bin/git)`.
+
+#### R1': no-corpus policy paths were case-sensitive
+
+- **Counter-example:** in a fresh repository on this case-insensitive Mac, staging `Conformance/Corpora/vectors.bin`
+  (1 KiB) and `Conformance/GOLDEN/cases.txt` gave "no violations" and exit 0.
+- **Fix:** `violations()` matches the policy directories and extensions on the ASCII-lowercased path. A case variant
+  gets a directory's **restrictions, never its exemptions**:
+  - `Conformance/Corpora/` and `CONFORMANCE/golden/` get the corpora and golden extension rules;
+  - `TestData/` gets the 64 KiB testdata limit, but not the payload-extension exemption;
+  - only the exact names `Cargo.lock` and `LICENSE` are exempt from the size limit.
+- **Unicode (chosen: ASCII folding only).** Every policy name is pure ASCII. NFC/NFD normalisation never adds or
+  removes an ASCII letter, so a normalisation variant cannot spell a policy name. What is left is non-ASCII
+  case-folding aliases that a case-insensitive file system may treat as the same letter: the Kelvin sign K→k, the long
+  s ſ→s, and the ligature ﬆ→st.
+  - None of them occurs in `conformance`, `corpora` or `golden`.
+  - `testdata` contains an `s`, so a `teſtdata/` directory might alias `testdata/` on disk. It would then escape only
+    the 64 KiB testdata limit. The 256 KiB limit and the payload rule still apply, and the exemption needs the exact
+    name.
+  - Handling these aliases would need APFS's exact folding table, which is not available here as an oracle, so
+    they are not handled.
+
+#### R2': `$CARGO` must be the pinned toolchain's cargo file
+
+- **Counter-example:** a stub `$CARGO` that prints `cargo 1.99.0` and exits 0 was accepted: `ci: all 6 steps passed`
+  with nothing run.
+- **Fix:** `cargo()` always resolves the pinned cargo through `toolchain_bin("cargo")`, which is canonical and checked
+  to lie in the pinned toolchain's directory. When `$CARGO` is set, `check_cargo_env` requires it to be absolute and
+  to canonicalise to that same path. Otherwise ci stops before the first step, with an error that names both files:
+  `CARGO=<given> is <canonical>, not the pinned toolchain's cargo <pinned>`.
+  - This also refuses a stale `$CARGO` from another toolchain.
+  - A symlink to the pinned cargo is accepted.
+  - A copy or a hard link is a different path, so it is refused, which is the stricter choice.
+  - The version check stays as a check on the toolchain file itself.
+- **Positive tests:**
+  - `tools_cargo_env_must_be_the_pinned_file` accepts the real toolchain cargo and a symlink to it.
+  - `tools_cargo_pins_toolchain_for_children` runs `cargo()` with the `$CARGO` that cargo test sets.
+  - `cargo xtask ci` above ran through the real `$CARGO`.
+
+#### R3': fake `CARGO_HOME` / `RUSTUP_HOME`: accepted risk (out of the threat model)
+
+- **Finding (the reviewer's; not re-run here):** pointing `CARGO_HOME` at a directory with a fake `bin/rustup`, and `RUSTUP_HOME` at a matching fake
+  `toolchains/<channel>-<host>/` tree, satisfies `toolchain_bin`, and with it `tools check` and `cargo()`.
+- **Decision (operator and orchestrator, 2026-10-11): not fixed.**
+  - These variables are the legitimate, documented way to relocate rustup and cargo.
+  - Whoever controls them already controls every binary xtask could run.
+  - The guards defend against accidental shadowing (`PATH` order, stale installs, a `$CARGO` from another toolchain),
+    not against a hostile environment.
+- No code change was made, and no test pins this behaviour.
+
+#### G: `git` is pinned ("pin git, trust the rest")
+
+- **Counter-example:** a fake `git` first on `PATH` that answers `rev-parse --show-toplevel` truthfully and lists
+  nothing made no-corpus report `0 files checked … no violations` for a repository with a staged 300 KiB leak.
+- **Fix:**
+  - `TOOLS` gains `git` with a new install kind, `Install::System(&[...])`. xtask never installs it, and its `version`
+    is a minimum (2.39.0), not an exact pin.
+  - `host::git()` (and `git_path()`) resolves the path once per process. It takes the first existing entry of
+    `/opt/homebrew/bin/git`, `/usr/local/bin/git` and `/usr/bin/git`, runs its `--version`, and requires at least
+    2.39.0. It fails closed with a message naming the path and the version found.
+  - `host::git_output()` is the one runner for git commands. Every git in xtask goes through it or through
+    `host::git()`.
+  - `tools check` prints a `git >=2.39.0 <found> ok (<path>)` line, and no-corpus prints the git path it used.
+  - `tools install` refuses to install a system tool, and names the paths it looked at.
+- **Why a fixed list of absolute paths:**
+  - `command -v` is itself a `PATH` lookup, which is the hole being closed.
+  - The list is the default system `PATH` order on both macOS (Homebrew on Apple silicon, then Intel) and Linux,
+    frozen as absolute paths. An unmodified shell would pick the same git, and no `PATH` entry can stand in for it.
+  - On this Mac it resolves Homebrew git 2.55.0, ahead of Apple git 2.50.1 at `/usr/bin/git`. On a Linux VM it
+    resolves `/usr/local/bin/git` if present, else the distro's `/usr/bin/git`.
+  - The first existing path is taken whatever its version, so the choice never depends on what a binary prints.
+- **Why minimum 2.39.0:**
+  - It is a floor, not a feature need: every git command xtask runs (`rev-parse --show-toplevel`,
+    `ls-files -z --stage`, `ls-files --others --exclude-standard`, `cat-file --batch-check=<format>`) is far older.
+  - It admits both gits on the Mac, Debian bookworm and trixie (2.39 and 2.47), and Ubuntu 24.04 (2.43). It rejects
+    an ancient git or a stand-in that prints no version.
+  - A security-based minimum was rejected because distributions backport fixes without changing the version string.
+  - The VM's distribution is not recorded in the planning docs. If its git is older, ci stops with a clear message
+    and the floor can be revisited.
+- **`curl`, `tar` and `ps` stay trusted system tools found on `PATH`** (operator decision). They are untouched, and the
+  `host.rs` module docs now say so. `tools guard` still runs the program the operator names, by design.
+
+#### W: one runtime workspace resolver
+
+- **Counter-examples:**
+  - The binary run in a second clone, whose `rust-toolchain.toml` names `ksci-second-clone`, printed the build tree's
+    channel (`rust-analyzer 1.99.0 1.99.0 ok`).
+  - `store fetch` from the second clone wrote to `<build worktree>/target/corpora/w-probe-manual/probe.txt`
+    (reproduced by hand).
+  - `tools check` in a temporary directory outside any git repository exited 0.
+- **Fix:** a new module, `xtask/src/workspace.rs`, provides `workspace::root()`, the single resolver. It is resolved
+  once per process.
+  - It takes the pinned git's `rev-parse --show-toplevel` of the current directory.
+  - `check_workspace` then requires a `rust-toolchain.toml` and a `Cargo.toml` whose `[workspace] members` lists
+    `xtask`.
+  - Anything else fails closed, with `<cwd> is not inside a klein-science checkout: …` or
+    `<top> is not a klein-science workspace: <what is missing>`.
+  - `store::workspace_root()` and `check::repo_root()` are removed.
+  - `store::target_dir()` and `corpora_dir()` now return `Res<PathBuf>`. They resolve the workspace only when
+    `CARGO_TARGET_DIR` or `KSCI_CORPORA` does not override it, so `store put/get/push` work anywhere.
+  - `host::toolchain_channel()`, `check no-corpus` and `ci` (the root is resolved before the cargo) all use
+    `workspace::root()`.
+- **Behaviour change:** `check no-corpus` now refuses a git repository that is not a klein-science workspace. Before,
+  it judged any repository.
+
+#### RED evidence (commit `b57a2ea`, run against the unfixed code)
+
+- **`cargo test -p xtask`, unit tests: 1 of 21 failed.** `no_corpus_policy_case_variants` returned only
+  `["crates/x/TestData/x.jsonl: .jsonl payload outside testdata/"]`. Missing were the `Conformance/Corpora`,
+  `CONFORMANCE/golden` and `TestData/big.json` violations.
+- **`--test review_bypass`: 5 of 15 failed, all on assertions.**
+  - `no_corpus_policy_dirs_ignore_case`: "no-corpus passed: … 4 files checked (2 index entries, 2 untracked) …, no
+    violations".
+  - `no_corpus_never_runs_git_from_path`: "no-corpus ran the git found on PATH (…/fakes/git -C … rev-parse
+    --show-toplevel)". The output was `0 files checked (0 index entries, 0 untracked) … no violations`.
+  - `ci_rejects_cargo_that_is_not_the_pinned_toolchain_file`: exit 0, with every step run by
+    `…/recording-cargo`, and `ci: all 6 steps passed`.
+  - `workspace_is_the_checkout_xtask_runs_in`: the rust-analyzer line showed `1.99.0` from the build tree, not
+    `ksci-second-clone`.
+  - `workspace_outside_a_checkout_fails_closed`: `["tools", "check"]` in `$TMPDIR/…/plain` passed (exit 0).
+
+#### Mutation witnesses (on the fixed code)
+
+For each witness the fix was reverted in place, `cargo test -p xtask --no-fail-fast` was run, and the file was restored
+with `git checkout -- xtask/src`. `git status` was clean after every mutation.
+
+| # | Mutation | Tests that fail |
+|---|---|---|
+| M1'a | Golden and corpora prefixes matched on the exact-case path | `no_corpus_policy_case_variants`, `no_corpus_policy_dirs_ignore_case` |
+| M1'b | Testdata limit on the exact-case path | `no_corpus_policy_case_variants` |
+| M1'c | Testdata exemption on the folded path | `no_corpus_policy_case_variants` |
+| MGa | `git()` is `Command::new("git")` | `no_corpus_never_runs_git_from_path`, `tools_git_is_pinned_by_absolute_path` |
+| MGb | `version_at_least` always true | `tools_version_at_least` |
+| MGc | System tools compared for equality, not as a minimum | 17 tests, among them every no-corpus integration test (`/opt/homebrew/bin/git reports version 2.55.0; xtask needs git >= 2.39.0`) and `tools_git_is_pinned_by_absolute_path` |
+| MWa | `root()` skips `check_workspace` | `workspace_outside_a_checkout_fails_closed` |
+| MWb | `root()` back to the compile-time `CARGO_MANIFEST_DIR` parent | 11 integration tests, among them both `workspace_*` tests and every no-corpus test |
+| MWc | `xtask` member not required | `workspace_markers`, `workspace_outside_a_checkout_fails_closed` |
+| MR2'a | Identity check in `check_cargo_env` off | `ci_rejects_cargo_that_is_not_the_pinned_toolchain_file`, `tools_cargo_env_must_be_the_pinned_file` |
+| MR2'b | `$CARGO` used as given | `ci_rejects_cargo_that_is_not_the_pinned_toolchain_file`, `ci_rejects_relative_cargo` (the version probe ran the `PATH` stub) |
+
+R1's earlier witness M2b (version check off) is no longer caught by `ci_rejects_cargo_of_another_toolchain`: that stub
+is now refused by the identity check first. The version check remains as a check on the toolchain file itself.
+
+#### Code oracles (rule 7)
+
+The `LSP` tool was not available to this executor, so rule 7's fallback, `cargo check --workspace --all-targets`
+enumeration, stands in for rust-analyzer. ast-grep 0.45.3 is the tree-sitter oracle.
+
+- **Compiler.** `workspace_root` was removed from the pre-W tree (`84e774d`) in a scratch export, and
+  `cargo check --workspace --all-targets --locked` was run there. It reported:
+  - `ci.rs:11` and `host.rs:40`: unresolved import `crate::store::workspace_root`. These are the imports behind the
+    calls at `ci.rs:55` and `host.rs:298`.
+  - `store.rs:323`: `workspace_root` not found. That is the call in `target_dir`.
+
+  On the final tree, `cargo check --workspace --all-targets --locked` is clean.
+- **ast-grep `workspace_root($$$)`.**
+  - Before: `ci.rs:55`, `host.rs:298`, `store.rs:327`, plus test-only `review_bypass.rs:50, 271, 396, 531, 607`.
+  - After: test-only hits only. That is the test file's own `workspace_root()` helper, built from
+    `CARGO_MANIFEST_DIR`, which locates this source tree's fixtures.
+  - `workspace::root($$$)` after: `ci.rs:51`, `check.rs:53`, `store.rs:322`, `host.rs:425`.
+- **ast-grep `env!("CARGO_MANIFEST_DIR")`.**
+  - Before: `store.rs:319` (runtime), `review_bypass.rs:35` (test fixtures) and `crates/ksci-wire/tests/rfc8785.rs:26`.
+  - After: the `store.rs` hit is gone. The two test hits remain on purpose:
+    - `review_bypass.rs:35` locates fixtures, beside `CARGO_BIN_EXE_xtask` (`review_bypass.rs:31`), which locates the
+      binary under test.
+    - `rfc8785.rs:26` is outside xtask and was not touched. Under `cargo test` it names the same checkout's
+      `target/corpora`.
+- **ast-grep `Command::new($X)`.**
+  - Before (`b57a2ea`, `src`): bare `"git"` at `check.rs:80` and `check.rs:148`.
+  - After (`src`), no bare `git`:
+    - `host.rs:303` (`git()`, the pinned path) and `host.rs:279` (`probe_version`, a located absolute path);
+    - `host.rs:453` (rustup), `:490` (rust-analyzer), `:515` (`Cargo::command`), `:534` (the cargo version probe) and
+      `store.rs:496` (oras), all absolute paths;
+    - the trusted system tools `store.rs:647` (`curl`), `host.rs:653` (`tar`) and `host.rs:747` (`ps`);
+    - `host.rs:778` (`tools guard`, the operator's program).
+  - Git call sites after: `host::git()` at `check.rs:118`, `host.rs:308` (inside `git_output`), and
+    `host::git_output` at `check.rs:84`, `check.rs:179` and `workspace.rs:32`.
+  - Tests: `review_bypass.rs:87` still runs `git` from `PATH`. That is test setup only (it creates the temporary
+    repositories) and never judges anything. `review_bypass.rs:306` runs rustup by absolute path.
+  - `$P::Command::new($X)` has no hits.
+
+#### Commits (follow-up)
+
+- `b57a2ea` `test(01-02)`: reproduce case-variant corpora, stub CARGO, PATH git and build-tree workspace bypasses
+  (review R1', R2', G, W)
+- `e0fc5a7` `fix(01-02)`: no-corpus policy directories match any letter case (review R1')
+- `84e774d` `fix(01-02)`: pin git in the tool table and run it only by absolute path (review G)
+- `16a68b3` `fix(01-02)`: one runtime workspace resolver replaces the compile-time workspace_root (review W)
+- `458a62e` `fix(01-02)`: `$CARGO` must canonicalise to the pinned toolchain's cargo (review R2')
