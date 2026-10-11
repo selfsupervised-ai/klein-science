@@ -19,8 +19,15 @@
 //!
 //! # Threat model of `check provenance`
 //!
-//! **Guaranteed.** For the tree as compiled during the check, every file rustc reads in those two
-//! compiles is, by its content at the time it was judged (right after the compile that read it):
+//! **Trusted.** The check trusts the dep-info records the compiler writes into its own dedicated
+//! target directory (`target/provenance`) as the list of files rustc read. It detects only two
+//! kinds of bad dep-info: (a) a shape it does not recognise, and (b) a file that does not list
+//! its artifact's root source (`src_path`). It does not detect a dep-info file that has been
+//! edited to drop other lines.
+//!
+//! **Guaranteed.** For the tree as compiled during the check, and given those dep-info records,
+//! every file rustc reads in those two compiles is, by its content at the time it was judged
+//! (right after the compile that read it):
 //! - a regular `.rs` file in the repository whose first line is a valid provenance header
 //!   (`original`, `paper doi:…`, or a `port` of a project in [`PORT_POLICY`] with its SPDX and a
 //!   `Project:` block in NOTICE); or
@@ -31,8 +38,8 @@
 //!   are gated by cargo-deny, not by this check.
 //!
 //! Anything else (a headerless or malformed source, a file outside those places, workspace
-//! build-script output, an unresolvable input, an incomplete or unrecognised dep-info file, a
-//! failed compile) fails the check. Every `.py` file under `standin/` has a valid header, and
+//! build-script output, an unresolvable input, a dep-info file of unrecognised shape or without
+//! its artifact's root source, a failed compile) fails the check. Every `.py` file under `standin/` has a valid header, and
 //! `standin/` holds no symbolic link.
 //!
 //! **Out of scope.**
@@ -43,6 +50,9 @@
 //! - Targets and cfgs other than the host compile and the wasm32-wasip2 R0 compile.
 //! - A local actor changing files after a compile's inputs are judged, or between this check and
 //!   a later build: the check judges the tree as compiled during the check, nothing more.
+//! - Tampering with `target/provenance` during the check, for example editing a dep-info file
+//!   between the compile and its read to drop a module's line: the compiler's records there are
+//!   trusted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

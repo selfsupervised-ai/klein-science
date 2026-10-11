@@ -443,7 +443,7 @@ The re-review of the dep-info rework (Codex gpt-6-astra) returned FAIL with 1 cr
 - Fix: `under_testdata` looks at ancestor directories only.
 - Witness `provenance_testdata_rule_needs_a_testdata_directory` (`include_bytes!("testdata")` reading the file `crates/k/src/testdata`): exit 0, then exit 1, `outside testdata/`.
 
-**W3: an empty or partial `.d` gave no inputs silently** (`3647dc4`).
+**W3: an empty `.d`, or one without its artifact's root source, was accepted silently** (`3647dc4`; scope narrowed in review round 4: other dropped lines are not detected).
 - Fix: `compile_inputs` keeps cargo's `target.src_path` for each artifact. `require_source` requires that artifact's dep-info to list it, comparing real paths, or it errors naming the `.d` file.
 - Witness: the unit test `depinfo_requires_the_artifact_source` covers an empty list and a different source. RED against the stub, which accepted anything; GREEN after. The real tree and every scratch workspace still pass.
 
@@ -530,7 +530,13 @@ Every real dep-info file still parses: check provenance gives rc 0 on the real t
 
 This section is the scope that future reviews of the check are held to. The same text is the doc comment at the top of `xtask/src/check.rs`.
 
-**What the check guarantees.** It judges the tree as compiled during the check, in two compiles: the host compile of the whole workspace (all targets, all features) and the wasm32-wasip2 compile of the declared R0 crates' libs. Every file rustc reads in those compiles is judged by its content right after the compile that read it, and must be one of:
+**What the check trusts.** The check trusts the dep-info records that the compiler writes into its own dedicated target directory, `target/provenance`, as the list of files rustc read. It detects only two kinds of bad dep-info:
+- (a) a shape it does not recognise;
+- (b) a file that does not list its artifact's root source (`src_path`).
+
+It does not detect a dep-info file that has been edited to drop other lines (narrowed in review round 4).
+
+**What the check guarantees,** given those records. It judges the tree as compiled during the check, in two compiles: the host compile of the whole workspace (all targets, all features) and the wasm32-wasip2 compile of the declared R0 crates' libs. Every file rustc reads in those compiles is judged by its content right after the compile that read it, and must be one of:
 - a regular `.rs` file in the repository whose first line is a valid provenance header: `original`, `paper doi:…`, or a `port` of a project in `PORT_POLICY` with the policy's SPDX and a `Project:` block in NOTICE;
 - non-Rust data under a `testdata/` directory of the repository;
 - a gated dependency's file: registry sources, git checkouts, the pinned toolchain's sysroot, or the `OUT_DIR` output of a registry or git package's build script, exactly as cargo reported it, with no symbolic link from the repository down to it. cargo-deny gates these dependencies' licences.
@@ -540,7 +546,7 @@ Everything else fails the check. That includes:
 - an input anywhere else;
 - workspace build-script output;
 - an input that cannot be resolved;
-- an incomplete or unrecognised dep-info file;
+- a dep-info file of unrecognised shape, or one without its artifact's root source;
 - a failed compile.
 
 On the Python side, every `.py` file under `standin/` (ignored files included) has a valid header, and `standin/` holds no symbolic link.
@@ -551,5 +557,6 @@ On the Python side, every `.py` file under `standin/` (ignored files included) h
 - **Python outside `standin/`.** No compiler records what Python imports.
 - **Other targets and cfgs.** Targets and cfgs other than the host compile and the wasm32-wasip2 R0 compile are not judged, for example an R2 Linux-only cfg checked from the Mac.
 - **Changes after judging.** A local actor who changes files after a compile's inputs are judged, or between this check and a later build, is not detected. The check judges the tree as compiled during the check, nothing more.
+- **Tampering with `target/provenance` during the check.** For example, someone could edit a dep-info file between the compile and its read to drop a module's line. The compiler's records in that directory are trusted.
 
 **Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0. nextest ran 130 tests with 130 passing. `check provenance` reported `13 Rust sources rustc read (host, all targets; wasm32-wasip2, R0 libs) and 0 standin files judged`. rust-analyzer was unavailable throughout, so every-site claims rest on the clippy compile of all targets plus ast-grep.
