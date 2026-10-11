@@ -27,7 +27,7 @@ Lean guest engine lands (Phase 5).
 
 | Phase | Operator milestone | Passes when | Size [U] (SS §5) |
 |---|---|---|---|
-| 1 | M0 | baseline measured; klein-rs requests filed | 2–3 plans (widened by the research) |
+| 1 | M0 | baseline measured; klein-rs requests filed | 18 plans in 8 waves (widened by the research) |
 | 2 | M1 | SymPy `core` tests | ~20k LOC |
 | 3 | M2 | ≥ 60% of TIR; SymPy `polys`/`ntheory` tests | ~35k LOC |
 | 4 | M3 | ≥ 90% of TIR | ~30k LOC |
@@ -95,7 +95,27 @@ Wasmtime pin) are measured and filed as klein-rs requests.
 - Also measure, on the oracle, the share of TIR definite integrals that SymPy routes through `meijerint`. It decides
   whether Meijer G leaves the v2 tail.
 
-**Plans**: TBD
+**Plans**: 18 plans in 8 waves
+
+Plans:
+- [ ] 01-01-PLAN.md — ksci-wire: canonical node table, string numerals, JCS, SHA-256 identity, envelopes (wave 1)
+- [ ] 01-02-PLAN.md — xtask spine: recipe fetch, artifact-store client, pinned host tools, heavy-job guard, RFC 8785 vectors, no-corpus (wave 2)
+- [ ] 01-03-PLAN.md — determinism and licence guards: clippy, cargo-deny, provenance headers and NOTICE, each seen RED (wave 3)
+- [ ] 01-04-PLAN.md — ksci-ops and the R2 worker: `science.cas.canonicalize`, logical step budget, stdio frames (wave 3)
+- [ ] 01-05-PLAN.md — digest-pinned SymPy oracle image, hardened program runner, introspection table (wave 3)
+- [ ] 01-06-PLAN.md — WIT tool and zero-import R0 component; R0 (Wasmtime 46.0.1 and 49.0.2) == R2; fuel and memory host errors (wave 4)
+- [ ] 01-07-PLAN.md — TIR corpus by recipe, extraction, stratified hash-ranked ~1k golden slice (wave 4)
+- [ ] 01-08-PLAN.md — Python JCS mirror, `_tool` and `host_shim`; three-way differential with rfc8785 (wave 4)
+- [ ] 01-09-PLAN.md — reproducible dist (two clean builds), zero-import and relaxed-SIMD gates, VM CI workflow (wave 5)
+- [ ] 01-10-PLAN.md — reproducible goldens: 4 hash seeds x 2 runs x 2 platforms, adjudication queue (wave 5)
+- [ ] 01-11-PLAN.md — fixed-box manifest and CubeCL Metal probe (mulhi, u64, Montgomery, fast-math, watchdog) (wave 5)
+- [ ] 01-12-PLAN.md — stand-in import surface (902 names, sympy.abc) and Monty-subset lint (wave 5)
+- [ ] 01-13-PLAN.md — three-level runner and the M0 baseline (proxy) (wave 6)
+- [ ] 01-14-PLAN.md — go-live: VM runner, green CI, private GHCR publish and round trip (wave 6)
+- [ ] 01-15-PLAN.md — Seatbelt minimum rules by ablation, D1 draft, per-box budget ratification (wave 6)
+- [ ] 01-16-PLAN.md — signed klein.plugin.v1 bundle: capability manifests, Mac Keychain signing, verify_strict (wave 7)
+- [ ] 01-17-PLAN.md — TIR and OMR protocol census (dynamic and static), meijerint share, D4 draft (wave 7)
+- [ ] 01-18-PLAN.md — D6 draft; operator files D1, D4 and D6; ratification recorded (wave 8)
 
 ### Phase 2: Core Expressions
 **Goal**: An LLM's SymPy program that builds expressions, evaluates numbers and functions, substitutes, expands,
@@ -364,7 +384,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Contracts, Oracles and Risk Probes | 0/TBD | Not started | - |
+| 1. Contracts, Oracles and Risk Probes | 0/18 | Planned | - |
 | 2. Core Expressions | 0/TBD | Not started | - |
 | 3. Polynomials, Number Theory and Algebraic Solve | 0/TBD | Not started | - |
 | 4. Solve, Simplify, Assumptions and Piecewise | 0/TBD | Not started | - |
