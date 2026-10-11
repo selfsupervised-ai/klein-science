@@ -456,12 +456,7 @@ fn envelope_noncanonical() {
         format!(
             r#"{{"v":1,"args":{{"expr":{X2_PLUS_1_CANONICAL}}},"budget":{{"steps":"100"}},"op":"science.cas.canonicalize"}}"#
         ),
-        // A duplicated key.
-        canonical.replacen(
-            r#""op":"science.cas.canonicalize""#,
-            r#""op":"science.cas.canonicalize","op":"science.cas.canonicalize""#,
-            1,
-        ),
+        // (A duplicated key is rejected earlier, as DuplicateKey: see duplicate_key_envelope.)
         // An unnecessary escape.
         canonical.replacen("science.cas", r"\u0073cience.cas", 1),
         // Assumption keys out of order inside the table.
@@ -578,6 +573,224 @@ fn envelope_response_shape() {
     assert_eq!(
         Response::from_slice(exhausted.as_bytes()),
         Ok(exhausted_response())
+    );
+}
+
+/// A response document in JCS key order. `identity` and `result` are raw JSON (a quoted string, a table or `null`).
+fn response_json(identity: &str, class: &str, result: &str, status: &str) -> String {
+    format!(
+        r#"{{"identity":{identity},"numeric_class":"{class}","result":{result},"status":"{status}","v":1}}"#
+    )
+}
+
+fn response_rejected(json: &str) -> WireError {
+    match Response::from_slice(json.as_bytes()) {
+        Ok(r) => panic!("{json} should be rejected, decoded as {r:?}"),
+        Err(e) => e,
+    }
+}
+
+fn invalid_response(path: &str) -> impl Fn(&WireError) -> bool + '_ {
+    move |e| matches!(e, WireError::InvalidResponse { path: p, .. } if p == path)
+}
+
+const INT_1: &str = r#"{"nodes":[["Int","1"]],"root":0,"v":1}"#;
+
+/// Review F1: a response must be internally consistent, not merely well-typed.
+#[test]
+fn envelope_response_invariants() {
+    let x2 = format!(r#""{X2_PLUS_1_IDENTITY}""#);
+    let int1_identity = table(INT_1).identity();
+    let int1 = format!(r#""{int1_identity}""#);
+    let zeros = format!(r#""{}""#, "0".repeat(64));
+    // The reviewer's counter-example: a wrong numeric class and an all-zero identity.
+    let counter = response_json(&zeros, "approx", INT_1, "exact");
+    assert_eq!(
+        counter,
+        r#"{"identity":"0000000000000000000000000000000000000000000000000000000000000000","numeric_class":"approx","result":{"nodes":[["Int","1"]],"root":0,"v":1},"status":"exact","v":1}"#
+    );
+    let cases: Vec<(String, Box<dyn Fn(&WireError) -> bool>)> = vec![
+        (counter, Box::new(invalid_response("/numeric_class"))),
+        // numeric_class is "exact" in Phase 1, whatever the status.
+        (
+            response_json(&x2, "approx", X2_PLUS_1_CANONICAL, "exact"),
+            Box::new(invalid_response("/numeric_class")),
+        ),
+        (
+            response_json("null", "approx", "null", "fuel_exhausted"),
+            Box::new(invalid_response("/numeric_class")),
+        ),
+        (
+            response_json("null", "", "null", "fuel_exhausted"),
+            Box::new(invalid_response("/numeric_class")),
+        ),
+        // identity is the identity of result: all zeros, another valid table's identity, upper-case hex.
+        (
+            response_json(&zeros, "exact", INT_1, "exact"),
+            Box::new(|e| matches!(e, WireError::IdentityMismatch { .. })),
+        ),
+        (
+            response_json(&int1, "exact", X2_PLUS_1_CANONICAL, "exact"),
+            Box::new(|e| matches!(e, WireError::IdentityMismatch { .. })),
+        ),
+        (
+            response_json(
+                &format!(r#""{}""#, X2_PLUS_1_IDENTITY.to_uppercase()),
+                "exact",
+                X2_PLUS_1_CANONICAL,
+                "exact",
+            ),
+            Box::new(|e| matches!(e, WireError::IdentityMismatch { .. })),
+        ),
+        // status exact needs a result and its identity.
+        (
+            response_json("null", "exact", "null", "exact"),
+            Box::new(invalid_response("/result")),
+        ),
+        (
+            response_json("null", "exact", X2_PLUS_1_CANONICAL, "exact"),
+            Box::new(invalid_response("/identity")),
+        ),
+        (
+            response_json(&x2, "exact", "null", "exact"),
+            Box::new(invalid_response("/result")),
+        ),
+        // status fuel_exhausted carries neither.
+        (
+            response_json(&x2, "exact", X2_PLUS_1_CANONICAL, "fuel_exhausted"),
+            Box::new(invalid_response("/result")),
+        ),
+        (
+            response_json(&x2, "exact", "null", "fuel_exhausted"),
+            Box::new(invalid_response("/identity")),
+        ),
+        // The result is in canonical form: the same expression with an unreachable node, under its true identity.
+        (
+            response_json(
+                &x2,
+                "exact",
+                r#"{"nodes":[["Sym","x",{}],["Int","2"],["Pow",0,1],["Int","1"],["Add",2,3],["Sym","y",{}]],"root":4,"v":1}"#,
+                "exact",
+            ),
+            Box::new(invalid_response("/result")),
+        ),
+    ];
+    for (json, expected) in &cases {
+        let err = response_rejected(json);
+        assert!(expected(&err), "{json}: {err:?}");
+    }
+    // The two valid shapes still decode, and the constructors produce them.
+    let ok = response_json(&int1, "exact", INT_1, "exact");
+    assert_eq!(
+        Response::from_slice(ok.as_bytes()).map(|r| r.identity),
+        Ok(Some(int1_identity))
+    );
+    let dirty = table(
+        r#"{"nodes":[["Int","2"],["Sym","x",{}],["Pow",1,0],["Int","1"],["Add",2,3],["Sym","y",{}]],"root":4,"v":1}"#,
+    );
+    assert_eq!(Response::exact(&dirty), exact_response());
+    assert_eq!(Response::fuel_exhausted(), exhausted_response());
+    for response in [Response::exact(&dirty), Response::fuel_exhausted()] {
+        assert_eq!(Response::from_slice(&response.to_jcs()), Ok(response));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review F2: a repeated object key is rejected at any depth, never resolved by "last one wins".
+
+fn duplicate(path: &str) -> WireError {
+    WireError::DuplicateKey { path: path.into() }
+}
+
+#[test]
+fn duplicate_key_table() {
+    // The reviewer's counter-example: the second "nodes" used to win silently.
+    assert_eq!(
+        rejected(r#"{"nodes":[["Int","999"]],"nodes":[["Int","1"]],"root":0,"v":1}"#),
+        duplicate("/nodes")
+    );
+    // A repeat with the same value is still a repeat.
+    assert_eq!(
+        rejected(r#"{"nodes":[["Int","1"]],"root":0,"root":0,"v":1}"#),
+        duplicate("/root")
+    );
+    // Nested inside a node's assumptions.
+    assert_eq!(
+        rejected(&doc(r#"["Sym","x",{"real":true,"real":false}]"#, 0)),
+        duplicate("/nodes/0/2/real")
+    );
+    // Keys are compared after unescaping: "v" is "v".
+    assert_eq!(
+        rejected(r#"{"nodes":[["Int","1"]],"root":0,"v":1,"v":1}"#),
+        duplicate("/v")
+    );
+    // Through serde as well: a Table inside any serde_json document.
+    let err = serde_json::from_str::<Table>(
+        r#"{"nodes":[["Int","999"]],"nodes":[["Int","1"]],"root":0,"v":1}"#,
+    )
+    .expect_err("duplicate nodes key");
+    assert!(
+        err.to_string().contains("duplicate object key at /nodes"),
+        "{err}"
+    );
+}
+
+#[test]
+fn duplicate_key_envelope() {
+    let canonical = request_json(r#""100""#);
+    // A repeated envelope key.
+    let op = canonical.replacen(
+        r#""op":"science.cas.canonicalize""#,
+        r#""op":"science.cas.canonicalize","op":"science.cas.canonicalize""#,
+        1,
+    );
+    assert_eq!(request_rejected(&op), duplicate("/op"));
+    // A repeated key inside an argument table.
+    let root = canonical.replacen(r#""root":4"#, r#""root":4,"root":4"#, 1);
+    assert_eq!(request_rejected(&root), duplicate("/args/expr/root"));
+    // A repeated argument name.
+    let args = canonical.replacen(r#"{"expr":"#, &format!(r#"{{"expr":{INT_1},"expr":"#), 1);
+    assert_eq!(request_rejected(&args), duplicate("/args/expr"));
+    // Responses: a repeated status, and a repeated key inside the result table.
+    let response = String::from_utf8(exact_response().to_jcs()).expect("utf-8");
+    let status = response.replacen(
+        r#""status":"exact""#,
+        r#""status":"exact","status":"exact""#,
+        1,
+    );
+    assert_eq!(response_rejected(&status), duplicate("/status"));
+    let nodes = response.replacen(r#"{"nodes":"#, r#"{"nodes":[],"nodes":"#, 1);
+    assert_eq!(response_rejected(&nodes), duplicate("/result/nodes"));
+}
+
+/// Nesting is bounded explicitly at MAX_DEPTH, below serde_json's own recursion limit (128).
+#[test]
+fn duplicate_key_depth_bound() {
+    // doc, nodes, node and assumptions are 4 levels; k more arrays inside an assumption value.
+    let nested = |k: usize| {
+        doc(
+            &format!(r#"["Sym","x",{{"a":{}{}}}]"#, "[".repeat(k), "]".repeat(k)),
+            0,
+        )
+    };
+    let at_limit = nested(ksci_wire::MAX_DEPTH - 4);
+    assert!(
+        matches!(rejected(&at_limit), WireError::Shape { .. }),
+        "depth MAX_DEPTH parses and fails on its schema"
+    );
+    let over = nested(ksci_wire::MAX_DEPTH - 3);
+    let mut path = "/nodes/0/2/a".to_owned();
+    for _ in 0..ksci_wire::MAX_DEPTH - 4 {
+        path.push_str("/0");
+    }
+    assert_eq!(rejected(&over), WireError::TooDeep { path });
+    // Far past serde_json's limit: still the typed error, and no stack overflow.
+    let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
+    assert_eq!(
+        Table::from_slice(deep.as_bytes()),
+        Err(WireError::TooDeep {
+            path: "/0".repeat(ksci_wire::MAX_DEPTH)
+        })
     );
 }
 

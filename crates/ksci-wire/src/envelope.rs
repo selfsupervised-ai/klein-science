@@ -93,6 +93,16 @@ pub struct Response {
 }
 
 impl Response {
+    /// An exact response carrying `result` in canonical form and its identity.
+    pub fn exact(_result: &Table) -> Response {
+        unimplemented!("review F1 skeleton")
+    }
+
+    /// A response for a request whose step budget ran out.
+    pub fn fuel_exhausted() -> Response {
+        unimplemented!("review F1 skeleton")
+    }
+
     /// The response's JCS bytes, the bytes that are hashed.
     pub fn to_jcs(&self) -> Vec<u8> {
         to_jcs(self).expect("a response always encodes")

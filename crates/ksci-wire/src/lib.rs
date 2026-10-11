@@ -32,6 +32,10 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// Documents longer than this are rejected before parsing.
 pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Arrays and objects may nest at most this deep. The deepest valid document, a request whose argument table holds a
+/// symbol with assumptions, nests 6 deep.
+pub const MAX_DEPTH: usize = 32;
+
 /// An index into a table's `nodes`.
 ///
 /// It deliberately has no ordering: node indices are positions in one particular table, never a structural order.
@@ -236,6 +240,18 @@ pub enum WireError {
     /// The bytes are not JSON (including invalid UTF-8 and lone surrogate escapes).
     #[error("not JSON: {0}")]
     NotJson(String),
+    /// An object repeats a key (compared after unescaping). JSON parsers disagree on which copy wins, so none does.
+    #[error("duplicate object key at {path}")]
+    DuplicateKey {
+        /// JSON pointer to the repeated key.
+        path: String,
+    },
+    /// Arrays and objects nest deeper than [`MAX_DEPTH`].
+    #[error("nesting deeper than {MAX_DEPTH} at {path}")]
+    TooDeep {
+        /// JSON pointer to the first array or object past the limit.
+        path: String,
+    },
     /// A JSON number where only a numeral string, name or object may appear.
     #[error("JSON number not allowed at {path}")]
     JsonNumberNotAllowed {
@@ -292,6 +308,22 @@ pub enum WireError {
     /// A request whose bytes differ from its own JCS re-encoding.
     #[error("document is not in canonical (JCS) form")]
     NonCanonical,
+    /// A response whose fields contradict each other or the contract (status, numeric class, result presence).
+    #[error("invalid response at {path}: {reason}")]
+    InvalidResponse {
+        /// JSON pointer to the offending field.
+        path: String,
+        /// The rule that was broken.
+        reason: &'static str,
+    },
+    /// A response whose `identity` is not the identity of its `result`.
+    #[error("response identity {claimed} is not the result's identity {actual}")]
+    IdentityMismatch {
+        /// The identity the response carries.
+        claimed: String,
+        /// The identity of the response's result table.
+        actual: String,
+    },
     /// The JCS encoder failed.
     #[error("encode: {0}")]
     Encode(String),
