@@ -302,3 +302,7 @@ None.
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+All 9 created files exist on disk. Commits f028a33, 95fd7ef, 205b855 and f40cf3e are on the branch. The working tree is clean.
