@@ -4,20 +4,20 @@
 //! `check no-corpus` (CONF-02, CLAUDE.md rule 6) keeps corpus, golden and vector bytes out of git:
 //! git holds recipes, manifests and aggregate scores, and the bytes live in the artifact store.
 //!
-//! It judges the git repository of the current directory (not the tree xtask was compiled
-//! from), and the bytes git would commit: each index entry by its staged blob, never by the
+//! It judges the klein-science checkout of the current directory ([`workspace::root`], never
+//! the tree xtask was compiled from), and the bytes git would commit: each index entry by its staged blob, never by the
 //! working copy, plus each untracked, non-ignored file (what `git add` stages next). An entry it
 //! cannot size fails the check rather than being skipped.
 
-use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::path::Path;
+use std::process::{ExitCode, Stdio};
 
 use clap::Subcommand;
 
 use crate::Res;
+use crate::{host, workspace};
 
 /// `cargo xtask check ...`
 #[derive(Subcommand)]
@@ -50,7 +50,7 @@ const GOLDEN_EXT: [&str; 2] = ["json", "md"];
 const CORPORA_EXT: [&str; 2] = ["toml", "md"];
 
 fn no_corpus() -> Res<ExitCode> {
-    let root = repo_root()?;
+    let root = workspace::root()?;
     let mut files = index_files(&root)?;
     let staged = files.len();
     files.extend(untracked_files(&root)?);
@@ -60,10 +60,12 @@ fn no_corpus() -> Res<ExitCode> {
     }
     if found.is_empty() {
         println!(
-            "no-corpus: {} files checked ({staged} index entries, {} untracked) in {}, no violations",
+            "no-corpus: {} files checked ({staged} index entries, {} untracked) in {} with {}, \
+             no violations",
             files.len(),
             files.len() - staged,
-            root.display()
+            root.display(),
+            host::git_path()?.display()
         );
         Ok(ExitCode::SUCCESS)
     } else {
@@ -75,43 +77,11 @@ fn no_corpus() -> Res<ExitCode> {
     }
 }
 
-/// Runs `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
-fn git_out(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {}: {}: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(out.stdout)
-}
-
-/// The top level of the git work tree of the current directory: the guard judges the
-/// repository it is asked about, not the tree xtask was compiled from.
-fn repo_root() -> Res<PathBuf> {
-    let cwd = env::current_dir().map_err(|e| format!("current directory: {e}"))?;
-    let out = git_out(&cwd, &["rev-parse", "--show-toplevel"])?;
-    let top = String::from_utf8(out).map_err(|e| format!("git rev-parse: {e}"))?;
-    let top = top.trim_end_matches(['\n', '\r']);
-    if top.is_empty() {
-        return Err(format!("{} is not inside a git work tree", cwd.display()));
-    }
-    Ok(PathBuf::from(top))
-}
-
 /// Every index entry as `(path, staged blob size)`: the bytes the next commit holds, whatever
 /// the working copy says. An entry that is not a readable blob (a submodule, a missing object)
 /// is an error: what cannot be sized cannot be judged.
 fn index_files(root: &Path) -> Res<Vec<(String, u64)>> {
-    let listing = git_out(root, &["ls-files", "-z", "--stage"])?;
+    let listing = host::git_output(root, &["ls-files", "-z", "--stage"])?;
     let mut entries = Vec::new();
     for record in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         // `<mode> SP <object> SP <stage> TAB <path>`
@@ -145,7 +115,7 @@ fn index_files(root: &Path) -> Res<Vec<(String, u64)>> {
 /// that is missing or not a blob yields `Err(reason)` in its slot.
 fn blob_sizes(root: &Path, entries: &[(String, String)]) -> Res<Vec<Result<u64, String>>> {
     let input: String = entries.iter().map(|(_, oid)| format!("{oid}\n")).collect();
-    let mut child = Command::new("git")
+    let mut child = host::git()?
         .arg("-C")
         .arg(root)
         .args([
@@ -206,7 +176,7 @@ fn blob_sizes(root: &Path, entries: &[(String, String)]) -> Res<Vec<Result<u64, 
 /// embedded repository (listed with a trailing `/`) holds none of this repository's bytes; it is
 /// named, not judged.
 fn untracked_files(root: &Path) -> Res<Vec<(String, u64)>> {
-    let listing = git_out(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let listing = host::git_output(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
     let mut files = Vec::new();
     for raw in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
         let path = String::from_utf8_lossy(raw).into_owned();
@@ -229,6 +199,15 @@ fn untracked_files(root: &Path) -> Res<Vec<(String, u64)>> {
 
 /// The violations among `(path, size)` pairs, sorted by path, each reported once (a path can
 /// appear more than once, e.g. in several merge stages).
+///
+/// Letter case: on a case-insensitive file system (the macOS default) `Conformance/Corpora/` is
+/// the directory `conformance/corpora/`, so the policy directories and extensions are matched on
+/// the ASCII-lowercased path. A case variant gets a directory's restrictions, never its
+/// exemptions: `TestData/` has the testdata size limit but not the payload exemption, and only
+/// the exact `Cargo.lock` and `LICENSE` are size-exempt. Every policy name is pure ASCII, and
+/// Unicode normalisation (NFC/NFD) never adds or removes an ASCII letter, so normalisation
+/// variants cannot spell one; non-ASCII case-folding aliases are not handled (see the plan
+/// SUMMARY, review fix R1').
 pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     let mut sorted: Vec<&(String, u64)> = files.iter().collect();
     sorted.sort();
@@ -241,31 +220,31 @@ pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     };
     for (path, size) in sorted {
         let p = Path::new(path);
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let in_testdata = p.components().any(|c| c.as_os_str() == "testdata");
+        let folded = path.to_ascii_lowercase();
+        let fp = Path::new(&folded);
+        let ext = fp.extension().and_then(|e| e.to_str()).unwrap_or("");
+        // Exemption: the exact name only. Restriction: any case variant.
+        let testdata_exempt = p.components().any(|c| c.as_os_str() == "testdata");
+        let testdata_limited = fp.components().any(|c| c.as_os_str() == "testdata");
         if *size > MAX_FILE && !SIZE_EXEMPT.contains(&path.as_str()) {
             push(format!(
                 "{path}: {size} bytes, above the {MAX_FILE}-byte limit"
             ));
         }
-        if !in_testdata && PAYLOAD_EXT.contains(&ext.as_str()) {
+        if !testdata_exempt && PAYLOAD_EXT.contains(&ext) {
             push(format!("{path}: .{ext} payload outside testdata/"));
         }
-        if in_testdata && *size > MAX_TESTDATA {
+        if testdata_limited && *size > MAX_TESTDATA {
             push(format!(
                 "{path}: {size} bytes under testdata/, above the {MAX_TESTDATA}-byte limit"
             ));
         }
-        if p.starts_with("conformance/golden") && !GOLDEN_EXT.contains(&ext.as_str()) {
+        if fp.starts_with("conformance/golden") && !GOLDEN_EXT.contains(&ext) {
             push(format!(
                 "{path}: conformance/golden/ holds only .json and .md manifests"
             ));
         }
-        if p.starts_with("conformance/corpora") && !CORPORA_EXT.contains(&ext.as_str()) {
+        if fp.starts_with("conformance/corpora") && !CORPORA_EXT.contains(&ext) {
             push(format!(
                 "{path}: conformance/corpora/ holds only .toml recipes and .md notes"
             ));
@@ -363,6 +342,28 @@ mod tests {
             violations(&tree),
             [
                 "conformance/corpora/leak.bin: conformance/corpora/ holds only .toml recipes and .md notes"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_corpus_policy_case_variants() {
+        // A case variant of a policy directory gets the policy's restrictions, never its
+        // exemptions: `TestData/` has the testdata size limit but no payload exemption.
+        let tree = files(&[
+            ("Conformance/Corpora/leak.bin", 1),
+            ("CONFORMANCE/golden/cases.txt", 1),
+            ("conformance/Golden/m.JSON", 1),
+            ("crates/x/TestData/big.json", MAX_TESTDATA + 1),
+            ("crates/x/TestData/x.jsonl", 1),
+        ]);
+        assert_eq!(
+            violations(&tree),
+            [
+                "CONFORMANCE/golden/cases.txt: conformance/golden/ holds only .json and .md manifests",
+                "Conformance/Corpora/leak.bin: conformance/corpora/ holds only .toml recipes and .md notes",
+                "crates/x/TestData/big.json: 65537 bytes under testdata/, above the 65536-byte limit",
+                "crates/x/TestData/x.jsonl: .jsonl payload outside testdata/",
             ]
         );
     }

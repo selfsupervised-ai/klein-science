@@ -7,6 +7,7 @@ mod check;
 mod ci;
 mod host;
 mod store;
+mod workspace;
 
 use std::process::ExitCode;
 

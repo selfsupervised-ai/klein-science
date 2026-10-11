@@ -17,21 +17,28 @@
 //! toolchain's directory, and xtask runs it by that absolute path. It must report that
 //! toolchain's version.
 //!
-//! Every cargo that xtask starts is [`cargo`]: the cargo that invoked xtask (`$CARGO`), else the
-//! pinned toolchain's cargo resolved through rustup. It must be an absolute path and report the
-//! pinned toolchain's version. No pinned binary is ever found by a `PATH` lookup.
+//! Every cargo that xtask starts is [`cargo`]: the pinned toolchain's cargo resolved through
+//! rustup. A `$CARGO` that names any other file is refused, and the cargo must report the pinned
+//! toolchain's version. No pinned binary is ever found by a `PATH` lookup.
+//!
+//! `git`, which the repository guards depend on, is a system tool in the same table
+//! ([`Install::System`]): xtask does not install it, but runs it only from a fixed list of
+//! absolute paths, and only once it reports at least the minimum version ([`git`]). `curl`,
+//! `tar` and `ps` stay trusted system tools found on `PATH` (operator decision, 2026-10-11).
 
 use std::env;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::Duration;
 
 use clap::Subcommand;
 
 use crate::Res;
-use crate::store::{self, Cache, workspace_root};
+use crate::store::{self, Cache};
+use crate::workspace;
 
 /// `cargo xtask tools ...`
 #[derive(Subcommand)]
@@ -63,6 +70,9 @@ pub enum Install {
     Crate(&'static [&'static str]),
     /// A release tarball per platform, checked against its approved SHA-256.
     Tarball(&'static [Asset]),
+    /// A system package that xtask does not install. xtask runs the first of these absolute
+    /// paths that exists, and only if it reports at least the tool's `version`.
+    System(&'static [&'static str]),
 }
 
 /// One platform's release tarball.
@@ -83,9 +93,9 @@ pub struct Asset {
 pub struct Tool {
     /// Tool name (the crate name for a crate install).
     pub name: &'static str,
-    /// Binary name in `$CARGO_HOME/bin`.
+    /// Binary name in `$CARGO_HOME/bin` (for [`Install::System`], the name on `PATH`).
     pub bin: &'static str,
-    /// Exact pinned version.
+    /// Exact pinned version; for [`Install::System`], the minimum version.
     pub version: &'static str,
     /// Install method.
     pub install: Install,
@@ -188,6 +198,22 @@ pub const TOOLS: &[Tool] = &[
         install: Install::Crate(&[]),
         probe: &["--version"],
     },
+    Tool {
+        name: "git",
+        bin: "git",
+        // A floor, not a feature need: every git command xtask runs predates it. It admits both
+        // gits on the Mac (Homebrew 2.55.0, Apple 2.50.1) and current Debian and Ubuntu LTS
+        // packages, and rejects an ancient git or a stand-in that prints no version.
+        version: "2.39.0",
+        // The default system `PATH` order on macOS (Apple silicon and Intel Homebrew first) and
+        // on Linux, frozen as absolute paths so no `PATH` entry can stand in for git.
+        install: Install::System(&[
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+            "/usr/bin/git",
+        ]),
+        probe: &["--version"],
+    },
 ];
 
 /// `$CARGO_HOME/bin` (default `$HOME/.cargo/bin`).
@@ -218,13 +244,39 @@ pub fn parse_version(output: &str) -> Option<&str> {
         })
 }
 
-/// The installed version of `tool` in `$CARGO_HOME/bin`, or `None` when it is missing.
-fn installed_version(tool: &Tool) -> Res<Option<String>> {
-    let path = tool_path(tool.bin)?;
-    if !path.is_file() {
-        return Ok(None);
+/// Whether `version` is at least `min` (both `x.y.z`); anything unparsable is not.
+pub fn version_at_least(version: &str, min: &str) -> bool {
+    fn parts(v: &str) -> Option<[u64; 3]> {
+        let mut it = v.split('.').map(|p| p.parse::<u64>().ok());
+        let parts = [it.next()??, it.next()??, it.next()??];
+        it.next().is_none().then_some(parts)
     }
-    let out = Command::new(&path)
+    matches!((parts(version), parts(min)), (Some(v), Some(m)) if v >= m)
+}
+
+/// Whether an installed version meets `tool`'s pin: equal to it, or for a system tool at least it.
+fn satisfies(tool: &Tool, installed: &str) -> bool {
+    match tool.install {
+        Install::System(_) => version_at_least(installed, tool.version),
+        Install::Crate(_) | Install::Tarball(_) => installed == tool.version,
+    }
+}
+
+/// The absolute path xtask runs `tool` from, when it exists: `$CARGO_HOME/bin/<bin>` for a tool
+/// xtask installs, the first existing path of the list for a system tool. Never a `PATH` lookup.
+fn locate(tool: &Tool) -> Res<Option<PathBuf>> {
+    match tool.install {
+        Install::System(paths) => Ok(paths.iter().map(PathBuf::from).find(|p| p.is_file())),
+        Install::Crate(_) | Install::Tarball(_) => {
+            let path = tool_path(tool.bin)?;
+            Ok(path.is_file().then_some(path))
+        }
+    }
+}
+
+/// The version `tool`'s probe prints when run from `path`.
+fn probe_version(tool: &Tool, path: &Path) -> Res<Option<String>> {
+    let out = Command::new(path)
         .args(tool.probe)
         .output()
         .map_err(|e| format!("run {}: {e}", path.display()))?;
@@ -232,9 +284,75 @@ fn installed_version(tool: &Tool) -> Res<Option<String>> {
     Ok(parse_version(&text).map(str::to_owned))
 }
 
+/// The installed version of `tool` at its [`locate`]d path, or `None` when it is missing.
+fn installed_version(tool: &Tool) -> Res<Option<String>> {
+    match locate(tool)? {
+        Some(path) => probe_version(tool, &path),
+        None => Ok(None),
+    }
+}
+
+/// The absolute path of the pinned git, resolved and version-checked once per process.
+pub fn git_path() -> Res<PathBuf> {
+    static GIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    GIT.get_or_init(resolve_git).clone()
+}
+
+/// A command for the pinned git. Every git that xtask runs starts here.
+pub fn git() -> Res<Command> {
+    Ok(Command::new(git_path()?))
+}
+
+/// Runs the pinned `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
+pub fn git_output(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
+    let out = git()?
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+fn resolve_git() -> Res<PathBuf> {
+    let tool = TOOLS
+        .iter()
+        .find(|t| t.name == "git")
+        .ok_or("git is missing from the pin table")?;
+    let Install::System(paths) = tool.install else {
+        return Err("git must be a system tool in the pin table".to_owned());
+    };
+    let path = locate(tool)?.ok_or_else(|| {
+        format!(
+            "git: none of {} exists; install git >= {}",
+            paths.join(", "),
+            tool.version
+        )
+    })?;
+    match probe_version(tool, &path)? {
+        Some(v) if satisfies(tool, &v) => Ok(path),
+        found => Err(format!(
+            "{} reports version {}; xtask needs git >= {}",
+            path.display(),
+            found.as_deref().unwrap_or("none"),
+            tool.version
+        )),
+    }
+}
+
 /// Notes (does not fail on) a different binary of the same name earlier on `PATH`.
 fn path_shadow(tool: &Tool) -> Res<Option<PathBuf>> {
-    let pinned = tool_path(tool.bin)?;
+    let Some(pinned) = locate(tool)? else {
+        return Ok(None);
+    };
     let Some(path) = env::var_os("PATH") else {
         return Ok(None);
     };
@@ -252,12 +370,21 @@ fn check() -> Res<ExitCode> {
     for tool in TOOLS {
         let installed = installed_version(tool)?;
         let shown = installed.as_deref().unwrap_or("missing");
-        let good = installed.as_deref() == Some(tool.version);
+        let good = installed.as_deref().is_some_and(|v| satisfies(tool, v));
         ok &= good;
+        let pinned = match tool.install {
+            Install::System(_) => format!(">={}", tool.version),
+            Install::Crate(_) | Install::Tarball(_) => tool.version.to_owned(),
+        };
+        let located = locate(tool)?;
+        let runs = match (&tool.install, &located) {
+            (Install::System(_), Some(path)) => format!(" ({})", path.display()),
+            _ => String::new(),
+        };
         println!(
-            "{:<14} {:<9} {:<9} {}",
+            "{:<14} {:<9} {:<9} {}{runs}",
             tool.name,
-            tool.version,
+            pinned,
             shown,
             if good { "ok" } else { "MISMATCH" }
         );
@@ -266,7 +393,7 @@ fn check() -> Res<ExitCode> {
                 "{:<14} note: PATH resolves {} first; xtask runs {}",
                 "",
                 other.display(),
-                tool_path(tool.bin)?.display()
+                located.unwrap_or_default().display()
             );
         }
     }
@@ -293,9 +420,9 @@ fn check() -> Res<ExitCode> {
     }
 }
 
-/// `toolchain.channel` from the workspace's rust-toolchain.toml.
+/// `toolchain.channel` from the rust-toolchain.toml of the checkout xtask runs in.
 pub fn toolchain_channel() -> Res<String> {
-    let path = workspace_root().join("rust-toolchain.toml");
+    let path = workspace::root()?.join("rust-toolchain.toml");
     let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let doc: toml::Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     doc.get("toolchain")
@@ -391,22 +518,19 @@ impl Cargo {
     }
 }
 
-/// The cargo every xtask child runs: the cargo that invoked xtask (`$CARGO`, set by cargo for
-/// `cargo run` and aliases such as `cargo xtask`), else the pinned toolchain's cargo resolved
-/// through rustup. It must be an absolute path and report the pinned toolchain's version, so a
-/// `cargo` earlier on `PATH`, or a cargo of another toolchain, never stands in for it.
+/// The cargo every xtask child runs: the pinned toolchain's cargo, resolved through rustup
+/// ([`toolchain_bin`]). `$CARGO` (set by cargo for `cargo run` and aliases such as `cargo xtask`)
+/// is checked when set: it must be an absolute path that canonicalises to that same file
+/// ([`check_cargo_env`]). So neither a `cargo` earlier on `PATH`, nor a stale `$CARGO` of another
+/// toolchain, nor a stand-in that prints the pinned version, ever runs. The cargo must also
+/// report the pinned toolchain's version.
 pub fn cargo() -> Res<Cargo> {
     let channel = toolchain_channel()?;
+    let pinned = toolchain_bin("cargo")?;
     let path = match env::var_os("CARGO") {
-        Some(c) => PathBuf::from(c),
-        None => toolchain_bin("cargo")?,
+        Some(c) => check_cargo_env(Path::new(&c), &pinned)?,
+        None => pinned,
     };
-    if !path.is_absolute() {
-        return Err(format!(
-            "CARGO={} is not an absolute path; xtask never looks cargo up on PATH",
-            path.display()
-        ));
-    }
     let out = Command::new(&path)
         .arg("--version")
         .output()
@@ -423,12 +547,34 @@ pub fn cargo() -> Res<Cargo> {
     Ok(Cargo { path, channel })
 }
 
+/// The pinned cargo, once `$CARGO` (given as `cargo`) is an absolute path that canonicalises to
+/// `pinned`, the canonical path of the pinned toolchain's cargo. The error names both files.
+fn check_cargo_env(cargo: &Path, pinned: &Path) -> Res<PathBuf> {
+    if !cargo.is_absolute() {
+        return Err(format!(
+            "CARGO={} is not an absolute path; xtask never looks cargo up on PATH",
+            cargo.display()
+        ));
+    }
+    let real = fs::canonicalize(cargo).map_err(|e| format!("CARGO={}: {e}", cargo.display()))?;
+    if real != pinned {
+        return Err(format!(
+            "CARGO={} is {}, not the pinned toolchain's cargo {}; run xtask through \
+             `cargo xtask` with the pinned toolchain, or unset CARGO",
+            cargo.display(),
+            real.display(),
+            pinned.display()
+        ));
+    }
+    Ok(real)
+}
+
 fn install() -> Res<()> {
     let cache = Cache::from_env()?;
     let mut guard = None;
     for tool in TOOLS {
-        if installed_version(tool)?.as_deref() == Some(tool.version) {
-            println!("{:<14} {} already installed", tool.name, tool.version);
+        if let Some(v) = installed_version(tool)?.filter(|v| satisfies(tool, v)) {
+            println!("{:<14} {v} already installed", tool.name);
             continue;
         }
         match &tool.install {
@@ -460,6 +606,16 @@ fn install() -> Res<()> {
                 }
             }
             Install::Tarball(assets) => install_tarball(&cache, tool, assets)?,
+            Install::System(paths) => {
+                return Err(format!(
+                    "{}: needs {} >= {} at one of {}; xtask does not install system tools, \
+                     install it with the system package manager",
+                    tool.name,
+                    tool.bin,
+                    tool.version,
+                    paths.join(", ")
+                ));
+            }
         }
         let now = installed_version(tool)?;
         if now.as_deref() != Some(tool.version) {
@@ -702,6 +858,66 @@ mod tests {
     }
 
     #[test]
+    fn tools_cargo_env_must_be_the_pinned_file() {
+        let pinned = toolchain_bin("cargo").unwrap();
+        assert_eq!(check_cargo_env(&pinned, &pinned).unwrap(), pinned);
+        let dir = env::temp_dir().join(format!("ksci-xtask-cargo-env-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A link to the pinned cargo names the same file.
+        #[cfg(unix)]
+        {
+            let link = dir.join("cargo-link");
+            std::os::unix::fs::symlink(&pinned, &link).unwrap();
+            assert_eq!(check_cargo_env(&link, &pinned).unwrap(), pinned);
+        }
+        // Another file is refused whatever it prints, and the error names both files.
+        let stub = dir.join("cargo");
+        fs::write(&stub, "#!/bin/sh\necho 'cargo 1.99.0'\n").unwrap();
+        let err = check_cargo_env(&stub, &pinned).unwrap_err();
+        let stub_real = fs::canonicalize(&stub).unwrap();
+        assert!(err.contains(&stub_real.display().to_string()), "{err}");
+        assert!(err.contains(&pinned.display().to_string()), "{err}");
+        assert!(check_cargo_env(&dir.join("missing"), &pinned).is_err());
+        let err = check_cargo_env(Path::new("cargo"), &pinned).unwrap_err();
+        assert!(err.contains("not an absolute path"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tools_version_at_least() {
+        assert!(version_at_least("2.39.0", "2.39.0"));
+        assert!(version_at_least("2.55.0", "2.39.0"));
+        assert!(version_at_least("10.0.0", "2.39.0"));
+        assert!(version_at_least("2.39.10", "2.39.9"));
+        for low in [
+            "2.38.9", "2.9.99", "1.99.99", "2.39", "2.39.0.1", "", "x.y.z",
+        ] {
+            assert!(!version_at_least(low, "2.39.0"), "{low}");
+        }
+    }
+
+    #[test]
+    fn tools_git_is_pinned_by_absolute_path() {
+        let git_tool = TOOLS.iter().find(|t| t.name == "git").unwrap();
+        let Install::System(paths) = git_tool.install else {
+            panic!("git must be a system tool");
+        };
+        assert!(
+            paths.iter().all(|p| Path::new(p).is_absolute()),
+            "{paths:?}"
+        );
+        let path = git_path().unwrap();
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(
+            paths.contains(&path.to_str().unwrap()),
+            "{}",
+            path.display()
+        );
+        assert_eq!(git().unwrap().get_program(), path.as_os_str());
+    }
+
+    #[test]
     fn tools_parse_version() {
         assert_eq!(
             parse_version("wasm-tools 1.261.0 (abc 2026-10-02)"),
@@ -733,6 +949,7 @@ mod tests {
                 ("uv", "0.13.0"),
                 ("ast-grep", "0.45.3"),
                 ("tree-sitter-cli", "0.27.0"),
+                ("git", "2.39.0"),
             ]
         );
         for tool in TOOLS {
