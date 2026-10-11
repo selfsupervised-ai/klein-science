@@ -102,6 +102,21 @@ pub fn invoke(request_jcs: &[u8]) -> Result<Vec<u8>, OpError> {
     Ok(response)
 }
 
+/// Split a request into pieces. Not yet implemented.
+pub fn plan(_request_jcs: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
+    Err(OpError::Internal("plan is not implemented".into()))
+}
+
+/// Run one piece. Not yet implemented.
+pub fn map(_piece: &[u8]) -> Result<Vec<u8>, OpError> {
+    Err(OpError::Internal("map is not implemented".into()))
+}
+
+/// Combine the outputs of the pieces. Not yet implemented.
+pub fn reduce(_request_jcs: &[u8], _outputs: &[Vec<u8>]) -> Result<Vec<u8>, OpError> {
+    Err(OpError::Internal("reduce is not implemented".into()))
+}
+
 /// `science.cas.canonicalize`: the canonical table of `args.expr` and its identity.
 fn canonicalize(request: &Request, budget: &mut StepBudget) -> Result<Response, OpError> {
     let args = request.args();
