@@ -424,12 +424,63 @@ fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
 }
 
 /// The exemption roots for dependency build-script output: the `OUT_DIR`s cargo reported for
-/// registry or git packages. (RED: still canonicalises through links, review C1'.)
-pub fn dependency_roots(_root: &Path, _target: &Path, reported: &[PathBuf]) -> Res<Vec<PathBuf>> {
-    reported
-        .iter()
-        .map(|dir| fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display())))
-        .collect()
+/// registry or git packages (operator decision 2026-10-11), exactly as cargo reported them,
+/// never resolved through a link (review C1').
+///
+/// Each must be a plain path (no `.` or `..`) strictly below the provenance `target` directory,
+/// and every component from the canonical repository `root` down to the `OUT_DIR` itself must be
+/// a real directory, not a symbolic link; otherwise it is an error naming the offending path.
+/// Under those conditions the reported path is its own real path, so comparing it with the real
+/// path of each compiler input cannot exempt anything outside that one directory.
+pub fn dependency_roots(root: &Path, target: &Path, reported: &[PathBuf]) -> Res<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    for dir in reported {
+        let shown = dir.display();
+        let below = dir
+            .strip_prefix(target)
+            .ok()
+            .filter(|rel| {
+                !rel.as_os_str().is_empty()
+                    && rel
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "provenance: dependency OUT_DIR {shown} is not a plain path below the \
+                     provenance target directory {}",
+                    target.display()
+                )
+            })?;
+        let from_root = target
+            .strip_prefix(root)
+            .map_err(|_| {
+                format!(
+                    "provenance: {} is not below {}",
+                    target.display(),
+                    root.display()
+                )
+            })?
+            .join(below);
+        let mut at = root.to_path_buf();
+        for part in from_root.components() {
+            at.push(part);
+            let meta = fs::symlink_metadata(&at)
+                .map_err(|e| format!("provenance: {}: {e}", at.display()))?;
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "provenance: {} is a symbolic link; a dependency OUT_DIR and every directory \
+                     above it up to the repository must be real directories (review C1')",
+                    at.display()
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(format!("provenance: {} is not a directory", at.display()));
+            }
+        }
+        roots.push(dir.clone());
+    }
+    Ok(roots)
 }
 
 /// Where a compiler input outside the repository may come from: the cargo registry sources and
@@ -875,7 +926,7 @@ mod tests {
         let (root, target, out) = exemption_tree("plain");
         assert_eq!(
             dependency_roots(&root, &target, std::slice::from_ref(&out)).unwrap(),
-            [out.clone()]
+            std::slice::from_ref(&out)
         );
         let _ = fs::remove_dir_all(&root);
     }
