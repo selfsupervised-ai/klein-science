@@ -319,6 +319,13 @@ fn provenance() -> Res<ExitCode> {
     }
 }
 
+/// Whether `rel` lies under a directory named exactly `testdata` (review W5): only ancestor
+/// directories count, never the file name itself.
+fn under_testdata(rel: &Path) -> bool {
+    rel.parent()
+        .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "testdata"))
+}
+
 /// The Rust side: every input of the workspace compile ([`depinfo::compile_inputs`]), resolved
 /// to its real path (links followed: rustc read the target), and classified.
 ///
@@ -362,10 +369,7 @@ fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
                         let bytes =
                             fs::read(&real).map_err(|e| format!("provenance: {rel}: {e}"))?;
                         Some(Entry::Bytes(bytes))
-                    } else if Path::new(&rel)
-                        .components()
-                        .any(|c| c.as_os_str() == "testdata")
-                    {
+                    } else if under_testdata(Path::new(&rel)) {
                         None
                     } else {
                         Some(Entry::Refused(
