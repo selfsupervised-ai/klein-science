@@ -14,6 +14,11 @@
 //! - G: `git` is a pinned tool, resolved by absolute path, never by a `PATH` lookup.
 //! - W: xtask acts on the klein-science checkout it runs in, and fails closed outside one.
 //!
+//! Review of plan 01-03:
+//!
+//! - W3: `check provenance` refuses a symbolic link anywhere under `crates/` or `standin/`, so a
+//!   linked directory or file cannot bring unjudged source into a compiled crate.
+//!
 //! The tests keep `CARGO_MANIFEST_DIR` (via [`workspace_root`]) only to find this source tree's
 //! own fixtures, and `CARGO_BIN_EXE_xtask` to find the binary under test.
 #![cfg(unix)]
@@ -635,4 +640,84 @@ fn workspace_outside_a_checkout_fails_closed() {
         }
     }
     let _ = fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review of plan 01-03, W3: check provenance and symbolic links
+// ---------------------------------------------------------------------------------------------
+
+/// A klein repository with a NOTICE, one headed source file in `crates/k/src/`, and a headerless
+/// `review-fixture/witness.rs` (plus a headed `headed.rs`) outside every checked tree.
+fn repo_with_outside_witness(name: &str) -> PathBuf {
+    let repo = klein_repo(name);
+    fs::write(repo.join("NOTICE"), "klein-science\n").unwrap();
+    let src = repo.join("crates/k/src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("lib.rs"), "// provenance: original\n").unwrap();
+    let fixture = repo.join("review-fixture");
+    fs::create_dir_all(&fixture).unwrap();
+    fs::write(fixture.join("witness.rs"), "pub fn witness() {}\n").unwrap();
+    fs::write(
+        fixture.join("headed.rs"),
+        "// provenance: original\npub fn headed() {}\n",
+    )
+    .unwrap();
+    repo
+}
+
+fn provenance(repo: &Path) -> Output {
+    xtask()
+        .args(["check", "provenance"])
+        .current_dir(repo)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .unwrap()
+}
+
+fn assert_symlink_rejected(out: &Output, path: &str) {
+    let shown = text(out);
+    assert!(!out.status.success(), "check provenance passed:\n{shown}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!(
+            "{path}: symbolic link inside a checked source tree"
+        )),
+        "check provenance did not name the symbolic link {path}:\n{shown}"
+    );
+}
+
+#[test]
+fn provenance_rejects_directory_symlink_in_source_tree() {
+    // Git lists a directory symlink as one extension-less path; `#[path = "imported/witness.rs"]`
+    // would compile the headerless file behind it.
+    let repo = repo_with_outside_witness("prov-dir-link");
+    std::os::unix::fs::symlink(
+        "../../../review-fixture",
+        repo.join("crates/k/src/imported"),
+    )
+    .unwrap();
+    git(&repo, &["add", "-N", "."]);
+    assert_symlink_rejected(&provenance(&repo), "crates/k/src/imported");
+}
+
+#[test]
+fn provenance_rejects_file_symlink_in_source_tree() {
+    // Even a link to a headed file is refused: links are not judged through.
+    let repo = repo_with_outside_witness("prov-file-link");
+    std::os::unix::fs::symlink(
+        "../../../review-fixture/headed.rs",
+        repo.join("crates/k/src/alias.rs"),
+    )
+    .unwrap();
+    assert_symlink_rejected(&provenance(&repo), "crates/k/src/alias.rs");
+}
+
+#[test]
+fn provenance_rejects_symlinked_standin_tree() {
+    // A link anywhere under a checked tree, the tree root included, is refused.
+    let repo = repo_with_outside_witness("prov-tree-link");
+    std::os::unix::fs::symlink("review-fixture", repo.join("standin")).unwrap();
+    git(&repo, &["add", "-N", "."]);
+    assert_symlink_rejected(&provenance(&repo), "standin");
 }
