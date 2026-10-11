@@ -29,6 +29,12 @@ pub const STEPS: &[(&str, &[&str])] = &[
             "warnings",
         ],
     ),
+    // clippy only checks, and the test builds do not link the cdylib: this step links every host
+    // artifact, ksci-component included.
+    (
+        "build",
+        &["cargo", "build", "--workspace", "--all-targets", "--locked"],
+    ),
     // LIC-01, DET-08: licences, banned crates, advisories and sources of the shipped graph
     // (deny.toml).
     (
