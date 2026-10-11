@@ -14,3 +14,12 @@
   (`$CARGO_HOME/registry/src/…` panic locations). Two dist builds in the same checkout gave the same component
   digest (`700d1968…`), but a build with another `$CARGO_HOME` or checkout path would not. Plan 01-09's
   `dist --twice` and reproducibility work owns the remap flags.
+- `cargo xtask ci` runs no host-side Python suite, so the stand-in lint and tests are not CI-gated yet
+  status: open
+  **Found by:** plan 01-12 (Task 2), out of its scope (its files do not include `xtask/`).
+  **What:** threat T-01-32's mitigation says the Monty-subset lint "runs in `cargo xtask ci` through the conformance
+  and standin suites", and plan 01-17 assumes "the host-side `unittest discover` in xtask ci". `xtask/src/ci.rs`
+  `STEPS` holds only cargo commands, and no phase-01 plan adds a Python step. The fix is one `cargo xtask` command
+  that runs `.venv/bin/python -m unittest discover` for `standin/` and `conformance/` plus
+  `PYTHONPATH=standin python -m lint standin/sympy` (with `PYTHONDONTWRITEBYTECODE=1`), and a CI step for it. It
+  needs the dev venv (`cargo xtask tools venv`) and, for `standin/tests/test_wire.py`, a release `ksci-worker`.
