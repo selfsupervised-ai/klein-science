@@ -2,7 +2,7 @@
 //! The R2 worker over real stdio: frames in, frames out, exit codes.
 
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -46,20 +46,31 @@ fn next_frame(child: &mut Child, stdout: ChildStdout) -> (ChildStdout, Option<(T
 }
 
 /// Close stdin, then the worker's exit code, its remaining stdout and its stderr.
-fn finish(mut child: Child, stdin: ChildStdin, mut stdout: ChildStdout) -> (i32, Vec<u8>, String) {
+///
+/// Every wait has the [`PATIENCE`] deadline (review N2): a worker that keeps its output open, or does not exit, after
+/// end of input is killed and the test fails instead of hanging.
+fn finish(mut child: Child, stdin: ChildStdin, stdout: ChildStdout) -> (i32, Vec<u8>, String) {
     drop(stdin);
-    let mut rest = Vec::new();
-    stdout.read_to_end(&mut rest).unwrap();
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    let code = child
-        .wait()
-        .unwrap()
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut rest = Vec::new();
+        let mut stderr = String::new();
+        let read = stdout
+            .read_to_end(&mut rest)
+            .and_then(|_| stderr_pipe.read_to_string(&mut stderr));
+        let _ = tx.send(read.map(|_| (rest, stderr)));
+    });
+    let (rest, stderr) = match rx.recv_timeout(PATIENCE) {
+        Ok(read) => read.expect("the worker's output is readable"),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the worker kept its output open {PATIENCE:?} after end of input");
+        }
+    };
+    let code = exit_within(&mut child)
         .code()
         .expect("the worker exits, not killed");
     assert!(
@@ -67,6 +78,22 @@ fn finish(mut child: Child, stdin: ChildStdin, mut stdout: ChildStdout) -> (i32,
         "the worker panicked: {stderr}"
     );
     (code, rest, stderr)
+}
+
+/// Polling step while waiting for the worker to exit. Waits count steps, so the tests read no clock.
+const TICK: Duration = Duration::from_millis(10);
+
+/// The worker's exit status, or kill it and fail if it has not exited within [`PATIENCE`].
+fn exit_within(child: &mut Child) -> ExitStatus {
+    for _ in 0..PATIENCE.as_millis() / TICK.as_millis() {
+        if let Some(status) = child.try_wait().expect("the worker's status is readable") {
+            return status;
+        }
+        thread::sleep(TICK);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("the worker did not exit within {PATIENCE:?} of end of input");
 }
 
 fn corpus() -> Vec<Vec<u8>> {
