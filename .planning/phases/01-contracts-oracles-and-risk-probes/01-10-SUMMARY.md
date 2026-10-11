@@ -291,3 +291,7 @@ None.
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+- All 4 claimed files exist; commits a21b2c3, 10c707e, 4c66004 and 80f182b are on this branch; the working tree is clean.
