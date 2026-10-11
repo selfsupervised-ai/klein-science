@@ -1,0 +1,14 @@
+# NuminaMath-TIR, fetched by recipe and never vendored (CLAUDE.md rule 6, CONF-02, D-09).
+# Source: https://huggingface.co/datasets/AI-MO/NuminaMath-TIR at the revision pinned in the upstream
+# URL below. Licence: Apache-2.0.
+# The one file: 147,342,955 bytes, 72,441 rows. Code is the ```python blocks of the `solution` column;
+# conformance/oracles/extract/extract.py turns it into programs.jsonl inside the extraction image.
+# Fetch: cargo xtask store fetch conformance/corpora/tir.toml
+
+schema = "ksci.recipe.v1"
+name = "tir"
+
+[[file]]
+path = "data/train-00000-of-00001.parquet"
+sha256 = "66163f9fdf2220fed2116142781fe7019a117191e7f08a3339a70a98401061d8"
+upstream = "https://huggingface.co/datasets/AI-MO/NuminaMath-TIR/resolve/77a91d7b7a1a98ac4b1beb7d86c09d156b935dcd/data/train-00000-of-00001.parquet"

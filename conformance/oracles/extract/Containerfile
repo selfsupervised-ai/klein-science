@@ -1,0 +1,20 @@
+# provenance: original
+# The extraction image (CONF-02, D-09): turns a pinned corpus parquet into programs.jsonl. Offline
+# only: it runs at build or test time through `cargo xtask oracle run`, and nothing from it is
+# shipped or linked (CLAUDE.md rule 3). It never produces goldens and holds no SymPy; pyarrow never
+# enters the SymPy golden image (Pitfall L).
+# Built and pinned per platform with `cargo xtask oracle build-image extract --platform <p>`.
+FROM python:3.13-slim-trixie@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
+
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 LC_ALL=C.UTF-8 TZ=UTC
+
+# Operator-approved lock (plan 01-05 Task 2): pyarrow 26.0.0, wheels only, every distribution
+# checked against its hash.
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --disable-pip-version-check --root-user-action=ignore --no-deps --require-hashes --only-binary=:all: -r /tmp/requirements.lock \
+ && rm /tmp/requirements.lock
+
+# Exactly pip and pyarrow: no SymPy, mpmath or numpy may be present in this image.
+RUN python -c "import importlib.metadata as m; names = sorted({d.metadata['Name'].lower() for d in m.distributions()}); assert names == ['pip', 'pyarrow'], names; print(names)"
+
+USER 65534:65534
