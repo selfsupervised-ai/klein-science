@@ -16,8 +16,9 @@
 //!
 //! Review of plan 01-03:
 //!
-//! - W3: `check provenance` refuses a symbolic link anywhere under `crates/` or `standin/`, so a
-//!   linked directory or file cannot bring unjudged source into a compiled crate.
+//! - W3, W3': `check provenance` judges the files rustc actually read (cargo dep-info), so no
+//!   link, `#[path]`, `include!` or ignored file brings unjudged source into a compiled crate;
+//!   the Python side walks `standin/` on disk (ignored files included) and refuses links.
 //!
 //! The tests keep `CARGO_MANIFEST_DIR` (via [`workspace_root`]) only to find this source tree's
 //! own fixtures, and `CARGO_BIN_EXE_xtask` to find the binary under test.
@@ -643,17 +644,38 @@ fn workspace_outside_a_checkout_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Review of plan 01-03, W3: check provenance and symbolic links
+// Review of plan 01-03, W3 and W3': check provenance judges what rustc read
 // ---------------------------------------------------------------------------------------------
 
-/// A klein repository with a NOTICE, one headed source file in `crates/k/src/`, and a headerless
-/// `review-fixture/witness.rs` (plus a headed `headed.rs`) outside every checked tree.
-fn repo_with_outside_witness(name: &str) -> PathBuf {
+/// A klein repository that is a real two-member cargo workspace (`crates/k` and `xtask`, no
+/// dependencies, with a lockfile), a NOTICE, and a `review-fixture/` outside every crate holding
+/// a headerless `witness.rs` and a headed `headed.rs`.
+fn provenance_repo(name: &str) -> PathBuf {
     let repo = klein_repo(name);
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\", \"xtask\"]\n",
+    )
+    .unwrap();
     fs::write(repo.join("NOTICE"), "klein-science\n").unwrap();
-    let src = repo.join("crates/k/src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("lib.rs"), "// provenance: original\n").unwrap();
+    for (dir, kind, body) in [
+        ("crates/k", "lib.rs", "// provenance: original\n"),
+        (
+            "xtask",
+            "main.rs",
+            "// provenance: original\nfn main() {}\n",
+        ),
+    ] {
+        let pkg = repo.join(dir);
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        let name = Path::new(dir).file_name().unwrap().to_str().unwrap();
+        fs::write(
+            pkg.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n"),
+        )
+        .unwrap();
+        fs::write(pkg.join("src").join(kind), body).unwrap();
+    }
     let fixture = repo.join("review-fixture");
     fs::create_dir_all(&fixture).unwrap();
     fs::write(fixture.join("witness.rs"), "pub fn witness() {}\n").unwrap();
@@ -662,7 +684,22 @@ fn repo_with_outside_witness(name: &str) -> PathBuf {
         "// provenance: original\npub fn headed() {}\n",
     )
     .unwrap();
+    let out = Command::new(env!("CARGO"))
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "generate-lockfile: {}", text(&out));
     repo
+}
+
+/// Appends `line` to `crates/k/src/lib.rs`.
+fn add_to_lib(repo: &Path, line: &str) {
+    let lib = repo.join("crates/k/src/lib.rs");
+    let mut text = fs::read_to_string(&lib).unwrap();
+    text.push_str(line);
+    text.push('\n');
+    fs::write(lib, text).unwrap();
 }
 
 fn provenance(repo: &Path) -> Output {
@@ -676,48 +713,174 @@ fn provenance(repo: &Path) -> Output {
         .unwrap()
 }
 
-fn assert_symlink_rejected(out: &Output, path: &str) {
+/// The check failed, and printed a violation line for `path` containing `reason`.
+fn assert_violation(out: &Output, path: &str, reason: &str) {
     let shown = text(out);
     assert!(!out.status.success(), "check provenance passed:\n{shown}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains(&format!(
-            "{path}: symbolic link inside a checked source tree"
-        )),
-        "check provenance did not name the symbolic link {path}:\n{shown}"
+        stdout
+            .lines()
+            .any(|l| l.starts_with(&format!("{path}: ")) && l.contains(reason)),
+        "check provenance did not report {path:?} with {reason:?}:\n{shown}"
     );
+}
+
+const NO_HEADER: &str = "no provenance header";
+const WITNESS: &str = "review-fixture/witness.rs";
+
+#[test]
+fn provenance_passes_a_clean_workspace() {
+    let repo = provenance_repo("prov-clean");
+    let out = provenance(&repo);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn provenance_rejects_headerless_module() {
+    let repo = provenance_repo("prov-plain");
+    fs::write(repo.join("crates/k/src/plain.rs"), "pub fn plain() {}\n").unwrap();
+    add_to_lib(&repo, "pub mod plain;");
+    assert_violation(&provenance(&repo), "crates/k/src/plain.rs", NO_HEADER);
 }
 
 #[test]
 fn provenance_rejects_directory_symlink_in_source_tree() {
-    // Git lists a directory symlink as one extension-less path; `#[path = "imported/witness.rs"]`
-    // would compile the headerless file behind it.
-    let repo = repo_with_outside_witness("prov-dir-link");
+    // A linked directory inside the crate; rustc reads the headerless file behind it.
+    let repo = provenance_repo("prov-dir-link");
     std::os::unix::fs::symlink(
         "../../../review-fixture",
         repo.join("crates/k/src/imported"),
     )
     .unwrap();
+    add_to_lib(&repo, "#[path = \"imported/witness.rs\"] pub mod bypass;");
     git(&repo, &["add", "-N", "."]);
-    assert_symlink_rejected(&provenance(&repo), "crates/k/src/imported");
+    assert_violation(&provenance(&repo), WITNESS, NO_HEADER);
 }
 
 #[test]
-fn provenance_rejects_file_symlink_in_source_tree() {
-    // Even a link to a headed file is refused: links are not judged through.
-    let repo = repo_with_outside_witness("prov-file-link");
+fn provenance_rejects_file_symlink_to_headerless_source() {
+    let repo = provenance_repo("prov-file-link");
+    std::os::unix::fs::symlink(
+        "../../../review-fixture/witness.rs",
+        repo.join("crates/k/src/alias.rs"),
+    )
+    .unwrap();
+    add_to_lib(&repo, "pub mod alias;");
+    assert_violation(&provenance(&repo), WITNESS, NO_HEADER);
+}
+
+#[test]
+fn provenance_judges_a_link_by_the_file_rustc_read() {
+    // A link to a headed file inside the repository passes: what rustc read carries a header.
+    let repo = provenance_repo("prov-headed-link");
     std::os::unix::fs::symlink(
         "../../../review-fixture/headed.rs",
         repo.join("crates/k/src/alias.rs"),
     )
     .unwrap();
-    assert_symlink_rejected(&provenance(&repo), "crates/k/src/alias.rs");
+    add_to_lib(&repo, "pub mod alias;");
+    let out = provenance(&repo);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn provenance_rejects_path_module_through_link_outside_crates() {
+    // Review W3' (a): the link lives outside crates/ and standin/.
+    let repo = provenance_repo("prov-path-outside");
+    std::os::unix::fs::symlink("../review-fixture", repo.join("xtask/review-link")).unwrap();
+    add_to_lib(
+        &repo,
+        "#[path = \"../../../xtask/review-link/witness.rs\"] pub mod bypass;",
+    );
+    assert_violation(&provenance(&repo), WITNESS, NO_HEADER);
+}
+
+#[test]
+fn provenance_rejects_include_through_link_outside_crates() {
+    // Review W3' (a'): the same link, reached by `include!`.
+    let repo = provenance_repo("prov-include-outside");
+    std::os::unix::fs::symlink("../review-fixture", repo.join("xtask/review-link")).unwrap();
+    add_to_lib(
+        &repo,
+        "include!(\"../../../xtask/review-link/witness.rs\");",
+    );
+    assert_violation(&provenance(&repo), WITNESS, NO_HEADER);
+}
+
+#[test]
+fn provenance_rejects_gitignored_link() {
+    // Review W3' (b): git's `--exclude-standard` hides an ignored link from a git listing.
+    let repo = provenance_repo("prov-ignored-link");
+    std::os::unix::fs::symlink(
+        "../../../review-fixture",
+        repo.join("crates/k/src/review-link"),
+    )
+    .unwrap();
+    fs::write(repo.join(".gitignore"), "/crates/k/src/review-link\n").unwrap();
+    add_to_lib(
+        &repo,
+        "#[path = \"review-link/witness.rs\"] pub mod bypass;",
+    );
+    assert_violation(&provenance(&repo), WITNESS, NO_HEADER);
+}
+
+#[test]
+fn provenance_rejects_input_outside_the_repository() {
+    let repo = provenance_repo("prov-outside-repo");
+    let outside = scratch("prov-outside-repo-files");
+    fs::write(
+        outside.join("far.rs"),
+        "// provenance: original\npub fn far() {}\n",
+    )
+    .unwrap();
+    let far = fs::canonicalize(outside.join("far.rs")).unwrap();
+    add_to_lib(
+        &repo,
+        &format!("#[path = {:?}] pub mod far;", far.display().to_string()),
+    );
+    assert_violation(
+        &provenance(&repo),
+        &far.display().to_string(),
+        "outside the repository",
+    );
+}
+
+#[test]
+fn provenance_data_inputs_only_under_testdata() {
+    let repo = provenance_repo("prov-data");
+    fs::create_dir_all(repo.join("crates/k/testdata")).unwrap();
+    fs::write(repo.join("crates/k/testdata/v.json"), "{}\n").unwrap();
+    fs::write(repo.join("crates/k/src/data.txt"), "x\n").unwrap();
+    add_to_lib(
+        &repo,
+        "pub const V: &str = include_str!(\"../testdata/v.json\");",
+    );
+    add_to_lib(&repo, "pub const D: &str = include_str!(\"data.txt\");");
+    let out = provenance(&repo);
+    assert_violation(&out, "crates/k/src/data.txt", "outside testdata/");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("crates/k/testdata/v.json"),
+        "testdata input was judged:\n{}",
+        text(&out)
+    );
 }
 
 #[test]
 fn provenance_rejects_symlinked_standin_tree() {
-    // A link anywhere under a checked tree, the tree root included, is refused.
-    let repo = repo_with_outside_witness("prov-tree-link");
+    // The Python side: a link anywhere in standin/, the tree root included, is refused.
+    let repo = provenance_repo("prov-tree-link");
     std::os::unix::fs::symlink("review-fixture", repo.join("standin")).unwrap();
     git(&repo, &["add", "-N", "."]);
-    assert_symlink_rejected(&provenance(&repo), "standin");
+    assert_violation(&provenance(&repo), "standin", "symbolic link");
+}
+
+#[test]
+fn provenance_judges_ignored_standin_files() {
+    let repo = provenance_repo("prov-standin-ignored");
+    fs::create_dir_all(repo.join("standin")).unwrap();
+    fs::write(repo.join("standin/ok.py"), "# provenance: original\n").unwrap();
+    fs::write(repo.join("standin/hidden.py"), "import os\n").unwrap();
+    fs::write(repo.join(".gitignore"), "/standin/hidden.py\n").unwrap();
+    assert_violation(&provenance(&repo), "standin/hidden.py", NO_HEADER);
 }
