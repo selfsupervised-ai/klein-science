@@ -160,7 +160,7 @@ class WireTest(unittest.TestCase):
             _wire.dumps({"a": [0.0]})
         for bad in ("\ud800", "a\udfff", {"\udc00": 1}):
             with self.subTest(value=repr(bad)):
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, "^JCS: lone surrogate U\\+D[89A-F][0-9A-F]{2} "):
                     _wire.dumps(bad)
         # Integers beyond IEEE-754's exact range would be rounded by the Rust codec, so the mirror refuses them.
         self.assertEqual(_wire.dumps(2**53 - 1), b"9007199254740991")

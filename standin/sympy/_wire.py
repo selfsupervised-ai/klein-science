@@ -18,6 +18,7 @@ This module runs inside the guest, so it keeps to the Monty subset: no classes, 
 MAX_SAFE_INT = 9007199254740991
 
 _HEX = "0123456789abcdef"
+_HEX_UPPER = "0123456789ABCDEF"
 
 _SHORT_ESCAPES = {
     '"': '\\"',
@@ -39,14 +40,28 @@ def _string(text, parts):
         elif code < 0x20:
             parts.append("\\u00" + _HEX[code >> 4] + _HEX[code & 15])
         elif code >= 0xD800 and code <= 0xDFFF:
-            raise ValueError("JCS: lone surrogate U+" + _hex4(code) + " is not a Unicode scalar value")
+            _surrogate(code)
         else:
             parts.append(ch)
     parts.append('"')
 
 
+def _surrogate(code):
+    raise ValueError("JCS: lone surrogate U+" + _hex4(code) + " is not a Unicode scalar value")
+
+
+def _check_scalars(text):
+    for ch in text:
+        code = ord(ch)
+        if code >= 0xD800 and code <= 0xDFFF:
+            _surrogate(code)
+
+
 def _hex4(code):
-    return _HEX[(code >> 12) & 15] + _HEX[(code >> 8) & 15] + _HEX[(code >> 4) & 15] + _HEX[code & 15]
+    digits = ""
+    for shift in (12, 8, 4, 0):
+        digits = digits + _HEX_UPPER[(code >> shift) & 15]
+    return digits
 
 
 def _utf16_key(key):
@@ -83,6 +98,8 @@ def _encode(value, parts):
         for key in keys:
             if not isinstance(key, str):
                 raise TypeError("JCS: object keys must be strings")
+            # Before sorting: a lone surrogate has no UTF-16 sort key.
+            _check_scalars(key)
         keys = sorted(keys, key=_utf16_key)
         parts.append("{")
         first = True
