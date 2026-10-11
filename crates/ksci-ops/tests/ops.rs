@@ -1,8 +1,8 @@
 // provenance: original
 //! The op layer's contract: the step budget, the error kinds, plan/map/reduce and the shared request corpus.
 
-use ksci_ops::{OpError, invoke, map, plan, reduce};
-use ksci_wire::{Request, Response, Status};
+use ksci_ops::{MAX_ERROR_MESSAGE_BYTES, OpError, invoke, map, plan, reduce};
+use ksci_wire::{MAX_DOCUMENT_BYTES, Request, Response, Status};
 
 /// `x**2 + 1` in canonical order: 5 reachable nodes (Sym x, Int 2, Pow, Int 1, Add).
 const X2_PLUS_1: &str =
@@ -187,4 +187,51 @@ fn requests_corpus_canonical() {
         exact > 0 && exhausted > 0,
         "the corpus covers both statuses"
     );
+}
+
+/// The message of a request that fails.
+fn error_message(request: &[u8]) -> String {
+    invoke(request)
+        .expect_err("the request fails")
+        .message()
+        .to_owned()
+}
+
+/// Review W1: an error message never echoes unbounded input. It is at most MAX_ERROR_MESSAGE_BYTES, the same for the
+/// same request, and a cut message ends with " [truncated]".
+#[test]
+fn ops_error_message_bounded() {
+    // A key echoed in a JSON pointer: a 1 MiB request, and one exactly at the document cap.
+    for size in [1 << 20, MAX_DOCUMENT_BYTES] {
+        let request = format!(r#"{{"{}":1}}"#, "~".repeat(size - 6));
+        assert_eq!(request.len(), size);
+        let message = error_message(request.as_bytes());
+        assert_eq!(
+            message.len(),
+            MAX_ERROR_MESSAGE_BYTES,
+            "a {size}-byte request"
+        );
+        assert!(message.ends_with(" [truncated]"));
+        assert_eq!(message, error_message(request.as_bytes()), "deterministic");
+    }
+    // Four-byte characters at every alignment against the bound: the cut lands on a character boundary.
+    for lead in 0..4 {
+        let key = format!("{}{}", "~".repeat(lead), "\u{1D465}".repeat(1000));
+        let message = error_message(format!(r#"{{"{key}":1}}"#).as_bytes());
+        assert!(message.len() <= MAX_ERROR_MESSAGE_BYTES, "lead {lead}");
+        assert!(message.len() > MAX_ERROR_MESSAGE_BYTES - 4, "lead {lead}");
+        assert!(message.ends_with(" [truncated]"), "lead {lead}");
+    }
+    // An unbounded operation name.
+    let op = "x".repeat(1 << 20);
+    let request = request_with(&op, &format!(r#"{{"expr":{X2_PLUS_1}}}"#), "1");
+    assert!(matches!(invoke(&request), Err(OpError::UnsupportedOp(_))));
+    assert_eq!(error_message(&request).len(), MAX_ERROR_MESSAGE_BYTES);
+    // A short message is kept whole.
+    let nope = request_with(
+        "science.cas.nope",
+        &format!(r#"{{"expr":{X2_PLUS_1}}}"#),
+        "1",
+    );
+    assert_eq!(error_message(&nope), "science.cas.nope");
 }

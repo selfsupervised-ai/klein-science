@@ -163,3 +163,19 @@ fn worker_error_tags() {
     let (code, rest, _) = finish(child, stdin, stdout);
     assert_eq!((code, rest), (0, Vec::new()));
 }
+
+/// Review W1: a request whose error text would echo 64 MiB of input still gets a bounded bad-request frame, and the
+/// worker keeps serving until the input ends.
+#[test]
+fn worker_error_frame_bounded() {
+    let (mut child, mut stdin, stdout) = spawn();
+    let request = format!(r#"{{"{}":1}}"#, "~".repeat(MAX_DOCUMENT_BYTES - 6));
+    write_request_frame(&mut stdin, request.as_bytes()).unwrap();
+    let (stdout, frame) = next_frame(&mut child, stdout);
+    let (tag, message) = frame.expect("a response frame");
+    assert_eq!(tag, TAG_BAD_REQUEST);
+    let bound = ksci_ops::MAX_ERROR_MESSAGE_BYTES;
+    assert!(message.len() <= bound, "{} bytes", message.len());
+    let (code, rest, _) = finish(child, stdin, stdout);
+    assert_eq!((code, rest), (0, Vec::new()));
+}

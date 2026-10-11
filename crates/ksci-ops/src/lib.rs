@@ -12,6 +12,9 @@ use std::ops::ControlFlow;
 
 use ksci_wire::{MAX_DOCUMENT_BYTES, Request, Response};
 
+/// The longest error message, in bytes. Not yet enforced.
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
 /// Why an operation produced no response.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum OpError {
