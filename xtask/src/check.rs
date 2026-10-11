@@ -229,6 +229,15 @@ fn untracked_files(root: &Path) -> Res<Vec<(String, u64)>> {
 
 /// The violations among `(path, size)` pairs, sorted by path, each reported once (a path can
 /// appear more than once, e.g. in several merge stages).
+///
+/// Letter case: on a case-insensitive file system (the macOS default) `Conformance/Corpora/` is
+/// the directory `conformance/corpora/`, so the policy directories and extensions are matched on
+/// the ASCII-lowercased path. A case variant gets a directory's restrictions, never its
+/// exemptions: `TestData/` has the testdata size limit but not the payload exemption, and only
+/// the exact `Cargo.lock` and `LICENSE` are size-exempt. Every policy name is pure ASCII, and
+/// Unicode normalisation (NFC/NFD) never adds or removes an ASCII letter, so normalisation
+/// variants cannot spell one; non-ASCII case-folding aliases are not handled (see the plan
+/// SUMMARY, review fix R1').
 pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     let mut sorted: Vec<&(String, u64)> = files.iter().collect();
     sorted.sort();
@@ -241,31 +250,31 @@ pub fn violations(files: &[(String, u64)]) -> Vec<String> {
     };
     for (path, size) in sorted {
         let p = Path::new(path);
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let in_testdata = p.components().any(|c| c.as_os_str() == "testdata");
+        let folded = path.to_ascii_lowercase();
+        let fp = Path::new(&folded);
+        let ext = fp.extension().and_then(|e| e.to_str()).unwrap_or("");
+        // Exemption: the exact name only. Restriction: any case variant.
+        let testdata_exempt = p.components().any(|c| c.as_os_str() == "testdata");
+        let testdata_limited = fp.components().any(|c| c.as_os_str() == "testdata");
         if *size > MAX_FILE && !SIZE_EXEMPT.contains(&path.as_str()) {
             push(format!(
                 "{path}: {size} bytes, above the {MAX_FILE}-byte limit"
             ));
         }
-        if !in_testdata && PAYLOAD_EXT.contains(&ext.as_str()) {
+        if !testdata_exempt && PAYLOAD_EXT.contains(&ext) {
             push(format!("{path}: .{ext} payload outside testdata/"));
         }
-        if in_testdata && *size > MAX_TESTDATA {
+        if testdata_limited && *size > MAX_TESTDATA {
             push(format!(
                 "{path}: {size} bytes under testdata/, above the {MAX_TESTDATA}-byte limit"
             ));
         }
-        if p.starts_with("conformance/golden") && !GOLDEN_EXT.contains(&ext.as_str()) {
+        if fp.starts_with("conformance/golden") && !GOLDEN_EXT.contains(&ext) {
             push(format!(
                 "{path}: conformance/golden/ holds only .json and .md manifests"
             ));
         }
-        if p.starts_with("conformance/corpora") && !CORPORA_EXT.contains(&ext.as_str()) {
+        if fp.starts_with("conformance/corpora") && !CORPORA_EXT.contains(&ext) {
             push(format!(
                 "{path}: conformance/corpora/ holds only .toml recipes and .md notes"
             ));
