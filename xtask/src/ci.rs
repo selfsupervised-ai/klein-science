@@ -58,7 +58,9 @@ pub const STEPS: &[(&str, &[&str])] = &[
         &["cargo", "nextest", "run", "--workspace", "--locked"],
     ),
     ("check no-corpus", &["cargo", "xtask", "check", "no-corpus"]),
-    // LIC-02: provenance headers against the licence policy and NOTICE.
+    // LIC-02: provenance headers against the licence policy and NOTICE, on the files rustc
+    // read. It runs its own all-targets, all-features `cargo check` into target/provenance, so
+    // it depends on no earlier step's build; it runs last, after the cheaper guards.
     (
         "check provenance",
         &["cargo", "xtask", "check", "provenance"],

@@ -11,18 +11,21 @@
 //!
 //! `check provenance` (LIC-02, CLAUDE.md rule 2) makes every shipped source file name where it
 //! came from: original work, a port of an allowed project (tied to [`PORT_POLICY`] and to a
-//! `Project:` block in NOTICE), or a paper by DOI. It judges the working copy of every tracked or
-//! untracked, non-ignored `.rs` file under `crates/` and `.py` file under `standin/`.
+//! `Project:` block in NOTICE), or a paper by DOI. On the Rust side it judges what rustc actually
+//! read: the inputs cargo dep-info records for a compile of the whole workspace (all targets, all
+//! features), resolved to real paths ([`depinfo`], review W3'). On the Python side it walks
+//! `standin/` on disk, ignored files included, and refuses symbolic links there.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
-use std::process::{ExitCode, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
 
 use clap::Subcommand;
 
 use crate::Res;
-use crate::{host, workspace};
+use crate::{depinfo, host, workspace};
 
 /// `cargo xtask check ...`
 #[derive(Subcommand)]
@@ -276,50 +279,19 @@ pub const PORT_POLICY: [(&str, &str); 5] = [
 /// The notice file at the workspace root that every port's upstream notice lives in.
 const NOTICE_FILE: &str = "NOTICE";
 
+/// The dedicated target directory of the provenance compile, relative to the workspace root:
+/// separate from the developer's `target/debug`, so the compile it judges is its own.
+const PROVENANCE_TARGET: &str = "target/provenance";
+
 fn provenance() -> Res<ExitCode> {
     let root = workspace::root()?;
-    // Tracked and untracked, non-ignored files: a new file cannot dodge the check by not being
-    // added yet. Scope is decided here, not by a git pathspec, so case variants are judged too.
-    let listing = host::git_output(
-        &root,
-        &[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ],
-    )?;
-    let mut paths = Vec::new();
-    for raw in listing.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let path = String::from_utf8(raw.to_vec())
-            .map_err(|_| format!("provenance: path {raw:?} is not UTF-8"))?;
-        if in_checked_tree(&path) {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    paths.dedup();
+    let root = fs::canonicalize(&root).map_err(|e| format!("{}: {e}", root.display()))?;
     let notice = fs::read_to_string(root.join(NOTICE_FILE))
         .map_err(|e| format!("provenance: {NOTICE_FILE}: {e}"))?;
-    // The working copy is judged: it is what cargo compiles. A listed file that cannot be read
-    // (a tracked file deleted from the working copy) fails the check rather than being skipped.
-    // A symbolic link anywhere in a checked tree is refused, never followed (review W3): git
-    // lists a linked directory as one extension-less path, so the source behind it would
-    // otherwise go unjudged while `#[path]` or a module file compiles it.
-    let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
-        let meta = fs::symlink_metadata(root.join(&path))
-            .map_err(|e| format!("provenance: {path}: {e}"))?;
-        if meta.is_symlink() {
-            files.push((path, Entry::Symlink));
-        } else if provenance_in_scope(&path) {
-            let bytes =
-                fs::read(root.join(&path)).map_err(|e| format!("provenance: {path}: {e}"))?;
-            files.push((path, Entry::Bytes(bytes)));
-        }
-    }
-    let found = provenance_violations(&files, &notice);
+    let mut judged = rust_inputs(&root)?;
+    let rust = judged.len();
+    judged.extend(standin_files(&root)?);
+    let found = provenance_violations(&judged, &notice);
     for v in &found {
         println!("{v}");
     }
@@ -329,56 +301,207 @@ fn provenance() -> Res<ExitCode> {
             .filter(|l| l.starts_with("Project: "))
             .count();
         println!(
-            "provenance ok, {} files checked in {}, {NOTICE_FILE} has {blocks} Project blocks",
-            files.len(),
+            "provenance ok, {rust} Rust sources rustc read and {} standin files judged in {}, \
+             {NOTICE_FILE} has {blocks} Project blocks",
+            judged.len() - rust,
             root.display()
         );
         Ok(ExitCode::SUCCESS)
     } else {
         eprintln!(
-            "error: provenance: {} violation(s); every .rs file under crates/ and .py file under \
-             standin/ starts with a provenance header, and neither tree holds a symbolic link",
+            "error: provenance: {} violation(s); every file rustc reads inside the repository is a \
+             .rs file with a provenance header (or data under testdata/), every other input comes \
+             from the cargo registry, git checkouts or the toolchain, and every .py file under \
+             standin/ has a header, with no symbolic link in standin/",
             found.len()
         );
         Ok(ExitCode::FAILURE)
     }
 }
 
-/// Whether the provenance check judges `path`: a `.rs` file under `crates/` or a `.py` file
-/// under `standin/`. As in [`violations`], directory and extension are matched on the
-/// ASCII-lowercased path, so a case variant (`Crates/x.RS`) is judged, never exempt.
-pub fn provenance_in_scope(path: &str) -> bool {
-    let folded = path.to_ascii_lowercase();
-    (folded.starts_with("crates/") && folded.ends_with(".rs"))
-        || (folded.starts_with("standin/") && folded.ends_with(".py"))
+/// The Rust side: every input of the workspace compile ([`depinfo::compile_inputs`]), resolved
+/// to its real path (links followed: rustc read the target), and classified.
+///
+/// - Inside the repository, a regular `.rs` file is judged by its header. A non-`.rs` input
+///   (`include_str!`/`include_bytes!` data) is allowed, unjudged, only under a `testdata/`
+///   directory; anywhere else it is a violation. Build-script output in the provenance target
+///   directory (`OUT_DIR`) is allowed: the build script that wrote it is itself judged.
+/// - Outside the repository, an input is allowed only under the cargo registry sources, the cargo
+///   git checkouts or the pinned toolchain's sysroot; anything else is a violation.
+///
+/// One real file read under several names is judged once, its other names noted.
+fn rust_inputs(root: &Path) -> Res<Vec<Judged>> {
+    let target = root.join(PROVENANCE_TARGET);
+    let inputs = depinfo::compile_inputs(root, &target)?;
+    let generated = fs::canonicalize(&target).map_err(|e| format!("{}: {e}", target.display()))?;
+    let external = external_roots()?;
+    let mut by_path: BTreeMap<String, Judged> = BTreeMap::new();
+    for input in inputs {
+        let written = input.display().to_string();
+        let abs = if input.is_absolute() {
+            input
+        } else {
+            root.join(&input)
+        };
+        let (path, entry) = match fs::canonicalize(&abs) {
+            Err(e) => (
+                written.clone(),
+                Some(Entry::Refused(format!(
+                    "compiler input cannot be resolved: {e}"
+                ))),
+            ),
+            Ok(real) if real.starts_with(&generated) => continue,
+            Ok(real) => match real.strip_prefix(root) {
+                Ok(rel) => {
+                    let rel = rel.display().to_string();
+                    let entry = if !real.is_file() {
+                        Some(Entry::Refused(
+                            "compiler input is not a regular file".to_owned(),
+                        ))
+                    } else if rel.to_ascii_lowercase().ends_with(".rs") {
+                        let bytes =
+                            fs::read(&real).map_err(|e| format!("provenance: {rel}: {e}"))?;
+                        Some(Entry::Bytes(bytes))
+                    } else if Path::new(&rel)
+                        .components()
+                        .any(|c| c.as_os_str() == "testdata")
+                    {
+                        None
+                    } else {
+                        Some(Entry::Refused(
+                            "non-Rust compiler input outside testdata/; include_str! and \
+                             include_bytes! data lives under a testdata/ directory"
+                                .to_owned(),
+                        ))
+                    };
+                    (rel, entry)
+                }
+                Err(_) if external.iter().any(|e| real.starts_with(e)) => continue,
+                Err(_) => (
+                    real.display().to_string(),
+                    Some(Entry::Refused(
+                        "compiler input outside the repository, the cargo registry and git \
+                         checkouts, and the toolchain sysroot"
+                            .to_owned(),
+                    )),
+                ),
+            },
+        };
+        let Some(entry) = entry else { continue };
+        let judged = by_path.entry(path.clone()).or_insert(Judged {
+            path: path.clone(),
+            entry,
+            read_as: Vec::new(),
+        });
+        if written != path && !judged.read_as.contains(&written) {
+            judged.read_as.push(written);
+        }
+    }
+    Ok(by_path.into_values().collect())
 }
 
-/// The source trees the provenance check guards, as ASCII-lowercase directory names.
-const CHECKED_TREES: [&str; 2] = ["crates", "standin"];
-
-/// Whether `path` is a checked tree itself or lies inside one (case-insensitive, as
-/// [`provenance_in_scope`]): where a symbolic link is refused.
-pub fn in_checked_tree(path: &str) -> bool {
-    let folded = path.to_ascii_lowercase();
-    CHECKED_TREES.iter().any(|tree| {
-        folded == *tree
-            || folded
-                .strip_prefix(tree)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
+/// Where a compiler input outside the repository may come from: the cargo registry sources and
+/// git checkouts under `$CARGO_HOME`, and the pinned toolchain's sysroot. Each is canonicalised;
+/// one that does not exist admits nothing.
+fn external_roots() -> Res<Vec<PathBuf>> {
+    let bin = host::bin_dir()?;
+    let home = bin
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", bin.display()))?;
+    let rustc = host::toolchain_bin("rustc")?;
+    let out = Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .map_err(|e| format!("run {}: {e}", rustc.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} --print sysroot: {}",
+            rustc.display(),
+            out.status
+        ));
+    }
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    Ok([
+        home.join("registry").join("src"),
+        home.join("git").join("checkouts"),
+        sysroot,
+    ]
+    .iter()
+    .filter_map(|p| fs::canonicalize(p).ok())
+    .collect())
 }
 
-/// One entry of a checked source tree, as the provenance check sees it.
+/// The Python side: every `.py` file under `standin/`, found by walking the directory itself
+/// (ignored files included; no git listing), in name order. A symbolic link anywhere in the
+/// tree, `standin` itself included, is refused and never followed.
+fn standin_files(root: &Path) -> Res<Vec<Judged>> {
+    let mut out = Vec::new();
+    walk_standin(root, "standin", &mut out)?;
+    Ok(out)
+}
+
+fn walk_standin(root: &Path, rel: &str, out: &mut Vec<Judged>) -> Res<()> {
+    let path = root.join(rel);
+    let meta = match fs::symlink_metadata(&path) {
+        Err(e) if rel == "standin" && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("provenance: {rel}: {e}")),
+        Ok(meta) => meta,
+    };
+    let refuse = |reason: &str| Judged {
+        path: rel.to_owned(),
+        entry: Entry::Refused(reason.to_owned()),
+        read_as: Vec::new(),
+    };
+    if meta.is_symlink() {
+        out.push(refuse(
+            "symbolic link inside standin/; provenance is judged on regular files only, so \
+             replace the link with the files it names",
+        ));
+    } else if meta.is_dir() {
+        let mut names = Vec::new();
+        for item in fs::read_dir(&path).map_err(|e| format!("provenance: {rel}: {e}"))? {
+            let item = item.map_err(|e| format!("provenance: {rel}: {e}"))?;
+            let name = item.file_name().into_string().map_err(|n| {
+                format!(
+                    "provenance: {rel}/{}: name is not UTF-8",
+                    n.to_string_lossy()
+                )
+            })?;
+            names.push(name);
+        }
+        names.sort();
+        for name in names {
+            walk_standin(root, &format!("{rel}/{name}"), out)?;
+        }
+    } else if rel.to_ascii_lowercase().ends_with(".py") {
+        let bytes = fs::read(&path).map_err(|e| format!("provenance: {rel}: {e}"))?;
+        out.push(Judged {
+            path: rel.to_owned(),
+            entry: Entry::Bytes(bytes),
+            read_as: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+/// What the provenance check found at one path.
 pub enum Entry {
-    /// The bytes of a regular in-scope file.
+    /// The bytes of a source file, judged by its header.
     Bytes(Vec<u8>),
-    /// A symbolic link (to a file or a directory): refused, never followed.
-    Symlink,
+    /// Refused outright, for this reason.
+    Refused(String),
 }
 
-/// The provenance violations among `(path, source)` pairs, judged against the NOTICE text,
-/// as `<path>: <reason>` lines sorted by path (each path judged once). A [`Entry::Symlink`] is
-/// always a violation.
+/// One judged path: repository-relative for a file in the repository, absolute otherwise.
+pub struct Judged {
+    pub path: String,
+    pub entry: Entry,
+    /// The other names rustc read this file under (through links or `..`), noted in the report.
+    pub read_as: Vec<String>,
+}
+
+/// The provenance violations among judged paths, against the NOTICE text, as `<path>: <reason>`
+/// lines sorted by path (each path judged once). An [`Entry::Refused`] is always a violation.
 ///
 /// The header is the first line, or for a `.py` file the second line when the first is a `#!`
 /// shebang or a PEP 263 coding cookie. It is one of, with `//` in Rust and `#` in Python:
@@ -388,22 +511,23 @@ pub enum Entry {
 ///
 /// A port passes only when the project is in [`PORT_POLICY`] (exact name), the SPDX equals the
 /// policy's, and the NOTICE text has a line that is exactly `Project: <project>`.
-pub fn provenance_violations(files: &[(String, Entry)], notice: &str) -> Vec<String> {
-    let mut sorted: Vec<&(String, Entry)> = files.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    sorted.dedup_by(|a, b| a.0 == b.0);
+pub fn provenance_violations(judged: &[Judged], notice: &str) -> Vec<String> {
+    let mut sorted: Vec<&Judged> = judged.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    sorted.dedup_by(|a, b| a.path == b.path);
     let mut out = Vec::new();
-    for (path, source) in sorted {
-        let reasons = match source {
-            Entry::Symlink => vec![
-                "symbolic link inside a checked source tree; provenance is judged on regular \
-                 files only, so replace the link with the files it names"
-                    .to_owned(),
-            ],
-            Entry::Bytes(bytes) => header_violations(path, bytes, notice),
+    for j in sorted {
+        let reasons = match &j.entry {
+            Entry::Refused(reason) => vec![reason.clone()],
+            Entry::Bytes(bytes) => header_violations(&j.path, bytes, notice),
+        };
+        let note = if j.read_as.is_empty() {
+            String::new()
+        } else {
+            format!(" (rustc read it as {})", j.read_as.join(", "))
         };
         for reason in reasons {
-            out.push(format!("{path}: {reason}"));
+            out.push(format!("{}: {reason}{note}", j.path));
         }
     }
     out
@@ -529,26 +653,15 @@ mod tests {
     const NOTICE_EMPTY: &str = "klein-science\n\nPorted code notices\n";
 
     fn judge(files: &[(&str, &str)], notice: &str) -> Vec<String> {
-        let files: Vec<(String, Entry)> = files
+        let judged: Vec<Judged> = files
             .iter()
-            .map(|(p, c)| ((*p).to_owned(), Entry::Bytes(c.as_bytes().to_vec())))
+            .map(|(p, c)| Judged {
+                path: (*p).to_owned(),
+                entry: Entry::Bytes(c.as_bytes().to_vec()),
+                read_as: Vec::new(),
+            })
             .collect();
-        provenance_violations(&files, notice)
-    }
-
-    #[test]
-    fn provenance_checked_trees() {
-        for inside in ["crates", "crates/k/src/imported", "Standin", "standin/a"] {
-            assert!(in_checked_tree(inside), "{inside}");
-        }
-        for outside in [
-            "cratesx/a.rs",
-            "standins",
-            "xtask/src/main.rs",
-            "review-fixture/a",
-        ] {
-            assert!(!in_checked_tree(outside), "{outside}");
-        }
+        provenance_violations(&judged, notice)
     }
 
     const SYMPY_PORT_PY: &str =
@@ -776,23 +889,6 @@ mod tests {
         );
         // A Rust file with a Python-style header has no header at all.
         assert_eq!(found[7], "crates/a/src/h.rs: no provenance header");
-    }
-
-    #[test]
-    fn provenance_scope() {
-        assert!(provenance_in_scope("crates/ksci-wire/src/lib.rs"));
-        assert!(provenance_in_scope("crates/ksci-wire/tests/contract.rs"));
-        assert!(provenance_in_scope("crates/x/src/Upper.RS"));
-        assert!(provenance_in_scope("standin/names.py"));
-        assert!(provenance_in_scope("standin/pkg/sub/mod.py"));
-        // A case variant of a scope directory is judged, never exempt.
-        assert!(provenance_in_scope("Crates/x/src/a.rs"));
-        assert!(provenance_in_scope("STANDIN/a.Py"));
-        assert!(!provenance_in_scope("xtask/src/main.rs"));
-        assert!(!provenance_in_scope("crates/ksci-wire/Cargo.toml"));
-        assert!(!provenance_in_scope("crates/x/tool.py"));
-        assert!(!provenance_in_scope("standin/x.rs"));
-        assert!(!provenance_in_scope("docs/crates/x.rs"));
     }
 
     fn files(list: &[(&str, u64)]) -> Vec<(String, u64)> {

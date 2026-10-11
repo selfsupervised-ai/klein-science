@@ -5,6 +5,7 @@
 
 mod check;
 mod ci;
+mod depinfo;
 mod host;
 mod store;
 mod workspace;
