@@ -368,6 +368,28 @@ mod tests {
     }
 
     #[test]
+    fn no_corpus_policy_case_variants() {
+        // A case variant of a policy directory gets the policy's restrictions, never its
+        // exemptions: `TestData/` has the testdata size limit but no payload exemption.
+        let tree = files(&[
+            ("Conformance/Corpora/leak.bin", 1),
+            ("CONFORMANCE/golden/cases.txt", 1),
+            ("conformance/Golden/m.JSON", 1),
+            ("crates/x/TestData/big.json", MAX_TESTDATA + 1),
+            ("crates/x/TestData/x.jsonl", 1),
+        ]);
+        assert_eq!(
+            violations(&tree),
+            [
+                "CONFORMANCE/golden/cases.txt: conformance/golden/ holds only .json and .md manifests",
+                "Conformance/Corpora/leak.bin: conformance/corpora/ holds only .toml recipes and .md notes",
+                "crates/x/TestData/big.json: 65537 bytes under testdata/, above the 65536-byte limit",
+                "crates/x/TestData/x.jsonl: .jsonl payload outside testdata/",
+            ]
+        );
+    }
+
+    #[test]
     fn no_corpus_reports_each_violation_once() {
         // One path in two merge stages: the size differs, the extension rule is shared.
         let tree = files(&[
