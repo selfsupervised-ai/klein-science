@@ -312,3 +312,75 @@ None.
 - All 10 key files exist on disk.
 - All 5 task commits (afb93f4, 50f8bb1, e337e7c, 908b09d, 36032aa) are on this branch.
 - REQUIREMENTS.md: DET-02 and DET-03 marked complete. DET-01 and DET-08 are held by the shared-ID gate until sibling plans that also declare them finish.
+
+## Review fixes
+
+Two review findings, both confirmed: on the merged code each counter-example decoded as `Ok`. Each fix went test-first:
+the RED run came first, then the fix, then a mutation witness. The suite now has 33 tests (29 + 4 new), and all pass.
+`cargo clippy -p ksci-wire --all-targets --locked -- -D warnings` and `cargo fmt --check` are clean, and
+`cargo build -p ksci-wire --target wasm32-wasip2` builds.
+
+### F1: `Response::from_slice` checked only `v`
+
+- **Counter-example (was `Ok`):**
+  `{"identity":"000…000","numeric_class":"approx","result":{"nodes":[["Int","1"]],"root":0,"v":1},"status":"exact","v":1}`
+- **Fix:** `Response::from_slice` now runs the new `Response::check`, which applies these rules:
+  - `v` is 1, and `numeric_class` is `"exact"`.
+  - Status `exact` needs a result in canonical form and exactly that result's identity.
+  - Status `fuel_exhausted` carries neither a result nor an identity.
+  - Errors: `WireError::InvalidResponse { path, reason }` for the field checks, and
+    `WireError::IdentityMismatch { claimed, actual }` for a wrong identity.
+- **Constructors:** `Response::exact(&Table)`, which canonicalises its input, and `Response::fuel_exhausted()` build
+  the two valid shapes.
+- **Strict reading:** the schema did not say that `result` must be canonical. It now does, so each outcome has one
+  response byte string.
+- **Record:** it embeds only the two digests, not a response, and it has no decode path. So nothing changed there.
+
+### F2: duplicate object keys, last one won
+
+- **Counter-example (was `Ok`):** `{"nodes":[["Int","999"]],"nodes":[["Int","1"]],"root":0,"v":1}`
+- **Fix:** one `DeserializeSeed`/`Visitor` (`Strict` in `lib.rs`) builds the `Value`. It adds no new dependencies.
+  - `parse_document` uses it, so tables, requests and responses all pass through it. `Table`'s serde `Deserialize`
+    impl uses it too.
+  - A repeated key, compared after unescaping, is `WireError::DuplicateKey { path }`.
+  - Nesting deeper than `MAX_DEPTH = 32` is `WireError::TooDeep { path }`. That is stricter than serde_json's
+    recursion limit of 128, so recursion is bounded at 32 frames. The deepest valid document nests 6 deep.
+  - Paths are assembled only while an error unwinds.
+  - The 64 MiB pre-parse cap is unchanged.
+- **Existing test changed:** `envelope_noncanonical` no longer lists the duplicated-`op` variant, because that
+  variant now fails earlier as `DuplicateKey`. The case moved to `duplicate_key_envelope`, which asserts
+  `DuplicateKey { path: "/op" }`.
+- **Schema:** `schema/expr.v1.md` now covers repeated keys, the depth cap (the section is renamed "Document size and
+  depth caps"), the Response rules and the Canonical input wording.
+
+### RED evidence (commit `a402acf`, run against the unfixed code)
+
+`cargo nextest run -p ksci-wire --no-fail-fast`: 33 run, 29 passed, 4 failed. Every failure was on an assertion. A
+type-only skeleton (the new `WireError` variants, plus `Response::exact` and `fuel_exhausted` as `unimplemented!`)
+let the tests compile.
+
+- `envelope_response_invariants`: the counter-example was "should be rejected, decoded as
+  `Response { v: 1, status: Exact, numeric_class: "approx", … identity: Some("000…000") }`".
+- `duplicate_key_table`: `{"nodes":[["Int","999"]],"nodes":[["Int","1"]],"root":0,"v":1}` should be rejected.
+- `duplicate_key_envelope`: `left: NonCanonical, right: DuplicateKey { path: "/op" }`.
+- `duplicate_key_depth_bound`: `left: Shape { path: "/nodes/0/2/a", … }`,
+  `right: TooDeep { path: "/nodes/0/2/a/0/…/0" }`.
+
+### Mutation witnesses (on the fixed code)
+
+For each witness the core of the fix was reverted, the tests run, and the file restored from a saved copy. A `diff`
+of each restored file was clean, and the full suite was green again (33/33).
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | Remove `response.check()?` from `Response::from_slice` | `envelope_response_invariants` FAIL on the counter-example (1 of 8 envelope tests) |
+| M2 | `if false && claimed != &actual` (identity check off) | FAIL: the all-zero identity with `numeric_class` `"exact"` is accepted |
+| M3 | `if false && &canonical != result` (canonical-result check off) | FAIL: the result with an unreachable `Sym y` is accepted |
+| M4 | `if false && map.contains_key(&key)` (duplicate check off) | `duplicate_key_table` and `duplicate_key_envelope` FAIL (31/33 pass) |
+| M5 | `if false && self.depth >= MAX_DEPTH` (explicit depth bound off) | `duplicate_key_depth_bound` FAIL: `Shape` instead of `TooDeep` |
+| M6 | `Table::deserialize` back to `Value::deserialize` | `duplicate_key_table` FAIL: `serde_json::from_str::<Table>` accepts the duplicate |
+
+### Commits
+
+- `a402acf` `test(01-01)`: RED witnesses for response invariants and duplicate keys (review F1/F2)
+- `e465f6a` `fix(01-01)`: enforce response invariants and reject duplicate keys (review F1/F2)
