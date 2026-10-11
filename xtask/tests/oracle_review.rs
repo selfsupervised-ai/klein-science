@@ -6,6 +6,10 @@
 //!   not discard the batch.
 //! - W3: a child that escapes the case's process group (`os.setsid`) must not outlive the case,
 //!   and must not hide the case's exception by holding the exception channel open.
+//! - R1: a case must not be able to signal the harness or a sibling case
+//!   (`review-r1-parent.jsonl`, `review-r1-sibling.jsonl`).
+//! - R2: `ok` needs positive completion evidence; an exception whose reporting runs user code
+//!   that exits, raises or loops is still an error (`review-r2.jsonl`).
 //!
 //! Ignored by default: it needs a running docker daemon and the pinned base image, and it takes
 //! the heavy-job lock, which `cargo xtask ci` already holds while it runs the test suite. Run it
@@ -137,4 +141,124 @@ fn oracle_review_cases_are_recorded_and_contained() {
     );
 
     assert_eq!(records[CONTROL]["stdout"], "control\n");
+}
+
+/// The `(status, exception)` of one record, for compact assertions.
+fn outcome(records: &BTreeMap<String, Value>, case_id: &str) -> (String, Value) {
+    let r = &records[case_id];
+    (
+        r["status"].as_str().unwrap().to_owned(),
+        r["exception"].clone(),
+    )
+}
+
+fn exception(kind: &str, message: &str) -> Value {
+    serde_json::json!({"type": kind, "message": message})
+}
+
+/// R1 (a): a case that SIGKILLs its parent (the harness) must fail itself, not the batch.
+#[test]
+#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
+fn oracle_review_case_cannot_kill_the_harness() {
+    let records = run_records("testdata/programs/review-r1-parent.jsonl", "1");
+    let killer = "91b6193b2c7d31e80bcf12b872b158c830cb1e401f4d5cac0d83d4fab843d9e0";
+    let control = "0a6569409ba2ed1338dc180c9123cb6cbfdd97db7f1b5ae9e0e518f0149ca0ac";
+    assert_eq!(
+        outcome(&records, killer),
+        (
+            "error".to_owned(),
+            exception("PermissionError", "[Errno 1] Operation not permitted")
+        )
+    );
+    assert_eq!(records[control]["stdout"], "after the parent kill\n");
+}
+
+/// R1 (b): a case that SIGSTOPs and SIGKILLs every sibling wrapper it finds in /proc must not
+/// change their records.
+#[test]
+#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
+fn oracle_review_case_cannot_signal_siblings() {
+    let records = run_records("testdata/programs/review-r1-sibling.jsonl", "4");
+    let attacker = "888f20c271bdd543b77bab2ee8db0eeb28adba696d3fd1a8665af09ea2d972c7";
+    assert_eq!(
+        records[attacker]["stdout"], "signalled 0\n",
+        "{}",
+        records[attacker]
+    );
+    for (case_id, n) in [
+        (
+            "0b8e306577734ba362b5d7a64420e59f2060fccaa89f2e76c58bdb7121a1f680",
+            0,
+        ),
+        (
+            "ac24f984c86e9969f144da95aecd087feefa21876e2beeefdde6e888025a26b1",
+            1,
+        ),
+        (
+            "81ec346cea3876111cf3ea4cf92cf4a3e6de11a5d6c7a2af519000c2e253cf01",
+            2,
+        ),
+    ] {
+        let r = &records[case_id];
+        assert_eq!(r["status"], "ok", "{r}");
+        assert_eq!(r["stdout"], format!("victim {n}\n"), "{r}");
+    }
+}
+
+/// R2: `ok` needs the completion marker, and the reporter never runs user code to name the
+/// exception type.
+#[test]
+#[ignore = "needs docker and the pinned base image; run with -- --ignored"]
+fn oracle_review_exception_reporting_cannot_hide_failure() {
+    let records = run_records("testdata/programs/review-r2.jsonl", "4");
+    let error = |kind: &str, message: &str| ("error".to_owned(), exception(kind, message));
+    // __str__ calls os._exit(0) while the exception is reported.
+    assert_eq!(
+        outcome(
+            &records,
+            "7928b0453cd075f8e0f9ce094a6606ed913df7bb98c6174e51aae27aaea7e11d"
+        ),
+        error("Hidden", "<message unavailable>")
+    );
+    // __str__ raises.
+    assert_eq!(
+        outcome(
+            &records,
+            "073edf412e377e30a18c30ba80c215df5f54603f4998e7ef4cf6989cde7eb894"
+        ),
+        error("Raising", "<unprintable>")
+    );
+    // __str__ never returns (the CPU limit ends it).
+    assert_eq!(
+        outcome(
+            &records,
+            "5c5550ac8ccc4fbbdd9636451b4a51963caeca270a64c2e1c257b1eb2c29ecfe"
+        ),
+        error("Looping", "<message unavailable>")
+    );
+    // Reading the class name through the metaclass would run os._exit(0).
+    assert_eq!(
+        outcome(
+            &records,
+            "2406d85eb1cfbe89690ca4c0ef5f03ae2dc411be8c47301b039dc73bdd2d53a0"
+        ),
+        error("Sneaky", "x")
+    );
+    // A clean exit before the program's end is not a completion.
+    let early = "90d0272c325244d942adfb52a6b78b38db031913b35dfa6db48a7ac11eb98079";
+    assert_eq!(
+        outcome(&records, early),
+        error(
+            "IncompleteExit",
+            "exit status 0 without the completion marker"
+        )
+    );
+    assert_eq!(records[early]["stdout"], "a\n");
+    assert_eq!(
+        outcome(
+            &records,
+            "b894d728effef470a6e088ea8b26d2627954c2c42c22d1c4b314813303aa942c"
+        ),
+        ("ok".to_owned(), Value::Null)
+    );
 }

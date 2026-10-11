@@ -1,0 +1,2 @@
+{"case_id": "91b6193b2c7d31e80bcf12b872b158c830cb1e401f4d5cac0d83d4fab843d9e0", "code": "import os, signal\nos.kill(os.getppid(), signal.SIGKILL)\nprint('parent survived?')\n"}
+{"case_id": "0a6569409ba2ed1338dc180c9123cb6cbfdd97db7f1b5ae9e0e518f0149ca0ac", "code": "print('after the parent kill')\n"}
