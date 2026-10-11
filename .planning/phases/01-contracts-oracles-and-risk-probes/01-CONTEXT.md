@@ -29,8 +29,8 @@ No CAS maths lands here.
 - Identity is SHA-256 of the JCS of the canonical DAG node table. CLAUDE.md rule 4 was amended to say so on 2026-10-11.
 - `fuel_exhausted` comes only from a logical step budget counted identically on R0, R1 and R2. Wasmtime fuel, memory
   caps and GPU timeouts are host errors.
-- The Wasmtime ≥ 49.0.1 request (D6). Builds use `+simd128` and never `+relaxed-simd`. CI runs R0 under Klein's current
-  pin and under ≥ 49.0.1.
+- The Wasmtime request (D6). Builds use `+simd128` and never `+relaxed-simd`. CI runs R0 under Klein's current pin
+  and under the D6 floor. **The floor is now ≥ 49.0.2 (D-17 supersedes the earlier ≥ 49.0.1).**
 - Golden bytes live in an artifact store by digest. Git holds recipes, manifests and scores.
 - Budgets are ratified per fixed box (Mac: all P-cores against one P-core, Metal against that).
 - JCS uses `serde_json_canonicalizer` =0.3.2 (the same crate and pin as klein-rs), mirrored once in Python for the
@@ -101,6 +101,24 @@ No CAS maths lands here.
 - **D-15:** **The D1 Seatbelt minimum is shown by ablation.** Start from a deny-default profile and add rules until the
   CubeCL probe passes. Then remove each rule one at a time and record that the probe goes RED. Every rule in the filed
   set carries its own RED witness.
+
+### Post-research rulings (operator, 2026-10-11, answering 01-RESEARCH.md Open Questions)
+- **D-16:** **R0 imports nothing.** The R0 component is built as std Rust on `wasm32-unknown-unknown` and wrapped with
+  `wasm-tools component new` (pinned 1.261.0). It has zero imports. A CI gate fails if the component's import list is
+  non-empty, and that gate is seen RED once on a wasip2 build. Reason: klein-rs `design/EXTENSION-PLACEMENT.md` §2 puts a
+  WASM plugin as pure computation with no I/O, and effects go only through host capabilities (one mechanism per
+  effect, replayable). Zero imports also makes `getrandom` and clock use unbuildable, so it is a free determinism
+  guard. This replaces the "`wasm32-wasip2`" wording for R0 everywhere in this phase; wasm-tools becomes part of the
+  reproducibility chain. The D6 request may say we would accept deterministic WASI, but we do not depend on it.
+- **D-17:** **The D6 floor is Wasmtime ≥ 49.0.2.** Three advisories dated 2026-10-02 (RUSTSEC-2026-0325, 0326, 0327)
+  are patched only at ≥ 49.0.2 or 48.0.4. CI's second R0 host pin is 49.0.2.
+- **D-18:** **The census runs over all ~46k SymPy-using TIR programs plus the ~10k OMR sample** (refines D-12; compute
+  only, on the VM).
+- **D-19:** **RFC 8785 test vectors are fetched by recipe**, never vendored: Cyberphone commit
+  `19d51d7fe467d4706a3ff08adf8a748f29fc21e0` with klein-rs's 18 digests, re-hashed after fetch (rule 6).
+- **D-20:** **Rationals are checked against the numeral grammar only in Phase 1.** Lowest-terms validation lands in
+  `ksci-num` in Phase 2 with its own witness, so `ksci-wire` takes no bignum dependency now. (Research recommendation,
+  taken as the default; not separately asked.)
 
 ### Claude's Discretion
 - The repo layout for unshipped tooling. Follow the ARCHITECTURE.md tree (`crates/`, `plugin/`, `xtask/`,
