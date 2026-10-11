@@ -325,8 +325,13 @@ test-harness fix, witnessed by mutation before and after.
 - **Fix, in the shared layer.** `ksci_ops::Message` has a private field, and every `OpError` variant carries one.
   `Message::new` formats into a sink that keeps at most `MAX_ERROR_MESSAGE_BYTES` (1024) bytes. A longer text keeps
   its longest prefix that ends on a character boundary and is at most 1012 bytes, then gets `" [truncated]"`. The
-  cut depends only on the text, so R0 and R2 get the same bytes. The cut happens while formatting, so the 64 MiB
-  echo is never built. `schema/expr.v1.md` gained an **Errors** section that states the kinds and the bound.
+  cut depends only on the text, so R0 and R2 get the same bytes. `schema/expr.v1.md` gained an **Errors** section
+  that states the kinds and the bound.
+- **What is bounded, and what is not.** The error message a shell returns is bounded: at most 1024 bytes, in
+  every response frame and WIT error. Intermediate error strings built upstream are not. A `WireError` from
+  ksci-wire carries its JSON pointer as a `String` that can be as long as the request, and that string exists
+  before `Message::new` cuts it. The cut happens while formatting, so `Message::new` makes no further oversized
+  copy. Bounding the upstream strings would be a ksci-wire change, and this fix does not make it.
 - **Before.** The reviewer's case was rerun on the release worker:
   - a 1 MiB key gave exit 0 and a **1048598-byte** error frame;
   - a frame of exactly 64 MiB gave **exit 1, 0 bytes on stdout, nothing on stderr**.
@@ -374,11 +379,14 @@ test-harness fix, witnessed by mutation before and after.
   - Plan 01-06 references only `OpError` and "tag-prefixed response frames", not the constants. Its `R2Worker`
     should map `Tag` to its `Outcome`.
 
-### N2: test teardown has a deadline
+### N2: test teardown waits are bounded
 
-- **Fix.** `finish` reads stdout and stderr on a helper thread with `recv_timeout(PATIENCE)`. The new
-  `exit_within` polls `try_wait` in 10 ms ticks for at most 30 s, so the tests read no clock. On expiry both kill
-  the child and fail.
+- **Fix.** `finish` reads stdout and stderr on a helper thread with `recv_timeout(PATIENCE)`.
+- The new `exit_within` polls `try_wait` up to 3000 times with a 10 ms sleep between polls. That bound counts sleeps
+  and does not measure elapsed time. The real wait is at least 30 s plus the cost of each poll; 36 s was measured.
+- When either wait runs out, the test kills the child and fails. The cleanup `child.wait()` after `kill()` is still
+  a blocking call, which reaps the killed process. So not every wait in teardown has a deadline. The two waits that
+  depend on the worker's behaviour are bounded.
 - **Witness 1: a worker that ignores EOF** (`Ok(None) => loop { park() }`), run with a 60 s nextest cap.
   - Before: `worker_error_tags` and `worker_roundtrip_matches_invoke` hit **TIMEOUT at 60 s**. Without the cap
     they would hang forever.

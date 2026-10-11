@@ -47,8 +47,10 @@ fn next_frame(child: &mut Child, stdout: ChildStdout) -> (ChildStdout, Option<(T
 
 /// Close stdin, then the worker's exit code, its remaining stdout and its stderr.
 ///
-/// Every wait has the [`PATIENCE`] deadline (review N2): a worker that keeps its output open, or does not exit, after
-/// end of input is killed and the test fails instead of hanging.
+/// Waiting for the output and waiting for the exit are each bounded (review N2). The output read uses
+/// `recv_timeout(PATIENCE)`, and the exit check polls for a bounded number of ticks (see [`exit_within`]). A worker
+/// that keeps its output open, or does not exit, after end of input is killed and the test fails instead of hanging.
+/// The cleanup `child.wait()` after `kill()` is still a blocking call: it reaps a process that was just sent SIGKILL.
 fn finish(mut child: Child, stdin: ChildStdin, stdout: ChildStdout) -> (i32, Vec<u8>, String) {
     drop(stdin);
     let mut stderr_pipe = child.stderr.take().unwrap();
@@ -80,10 +82,12 @@ fn finish(mut child: Child, stdin: ChildStdin, stdout: ChildStdout) -> (i32, Vec
     (code, rest, stderr)
 }
 
-/// Polling step while waiting for the worker to exit. Waits count steps, so the tests read no clock.
+/// Polling step while waiting for the worker to exit. The wait counts sleeps and reads no clock, so its real length is
+/// at least `PATIENCE`, plus the cost of each `try_wait` (36 s was measured for 30 s).
 const TICK: Duration = Duration::from_millis(10);
 
-/// The worker's exit status, or kill it and fail if it has not exited within [`PATIENCE`].
+/// The worker's exit status. If it has not exited after `PATIENCE / TICK` polls, kill it, reap it with a blocking
+/// `wait`, and fail.
 fn exit_within(child: &mut Child) -> ExitStatus {
     for _ in 0..PATIENCE.as_millis() / TICK.as_millis() {
         if let Some(status) = child.try_wait().expect("the worker's status is readable") {

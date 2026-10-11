@@ -24,8 +24,11 @@ const TRUNCATED: &str = " [truncated]";
 /// Error text can quote the request (a JSON pointer names a key, an unknown op is named), and a request may be
 /// 64 MiB. So a text longer than the bound keeps its longest prefix that ends on a character boundary and leaves room
 /// for `" [truncated]"`, which is appended. The cut depends only on the text, so one request always gives one error
-/// byte string. The text is cut while it is formatted, so an oversized echo is never built. The field is private:
-/// every message is bounded by construction.
+/// byte string. The field is private: every message, and so every error a shell returns, is bounded by construction.
+///
+/// What is bounded is this message. The cut happens while `Message::new` formats its argument, so formatting never
+/// builds an oversized copy here. But the value being formatted can already hold one: a `WireError` built upstream
+/// in ksci-wire carries its JSON pointer as a `String`, which may be as long as the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message(String);
 
