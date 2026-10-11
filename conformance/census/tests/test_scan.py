@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s conformance -t conformance
 """
 
 import unittest
+import warnings
 
 from census import scan
 
@@ -75,6 +76,13 @@ class ScanSyntaxError(unittest.TestCase):
 
     def test_scan_parse_valid(self):
         self.assertIsNotNone(scan.parse("import sympy\n"))
+
+    def test_scan_parse_ignores_compiler_warnings(self):
+        # An invalid escape is a SyntaxWarning; under warnings-as-errors it must not make a valid
+        # program look unparseable.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertIsNotNone(scan.parse("s = '\\('\n"))
 
 
 if __name__ == "__main__":
