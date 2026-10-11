@@ -306,3 +306,9 @@ None.
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
 *Completed: 2026-10-11*
+
+## Self-Check: PASSED
+
+- All 10 key files exist on disk.
+- All 5 task commits (afb93f4, 50f8bb1, e337e7c, 908b09d, 36032aa) are on this branch.
+- REQUIREMENTS.md: DET-02 and DET-03 marked complete. DET-01 and DET-08 are held by the shared-ID gate until sibling plans that also declare them finish.
