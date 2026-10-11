@@ -1,21 +1,34 @@
 // provenance: original
-//! `cargo xtask release dist`: the artifacts that ship, built under the heavy-job guard (D-04).
+//! `cargo xtask release dist [--twice]`: the artifacts that ship, built under the heavy-job guard
+//! (D-04) by one build function, [`build_artifacts`] (D-01).
 //!
 //! - R0: `ksci-component` built as std Rust for `wasm32-unknown-unknown` with `+simd128` only (never
 //!   relaxed SIMD), then wrapped by the pinned `wasm-tools component new`. The component imports
 //!   nothing (D-16).
 //! - R2: `ksci-worker` built for the host triple.
-//! - `digests.json`: the JCS of each artifact's SHA-256 plus the toolchain and wasm-tools versions.
+//! - `digests.json`: the JCS of each artifact's SHA-256, the host triple, the toolchain and
+//!   wasm-tools versions, and whether two builds were compared (`reproducible`).
 //!
 //! Every artifact lands under `target/dist/` of the checkout ([`workspace::root`]):
 //! `science_cas.component.wasm`, `<host-triple>/ksci-worker` and `digests.json`. The conformance
 //! host (`ksci-conform`) runs exactly these files.
 //!
-//! Each cargo build is given its rustflags explicitly as `CARGO_ENCODED_RUSTFLAGS` (research
-//! Pitfall I), so neither the caller's `RUSTFLAGS` nor its `CARGO_ENCODED_RUSTFLAGS` reaches a
-//! shipped artifact.
+//! # Reproducibility (PLUG-01, research Pitfall I)
+//!
+//! Each cargo build is given its rustflags explicitly as `CARGO_ENCODED_RUSTFLAGS`, so neither the
+//! caller's `RUSTFLAGS` nor its `CARGO_ENCODED_RUSTFLAGS` reaches a shipped artifact. The flags
+//! remap the source tree to `/src` and `$CARGO_HOME` to `/cargo` (`--remap-path-prefix`), and the
+//! target directory always lies inside the source tree, so no builder path is embedded.
+//!
+//! `dist --twice` exports the committed tree (`git ls-files`) into two fresh directories at
+//! different absolute paths, builds each into its own target directory, and compares the SHA-256
+//! of every artifact. Only when every pair matches, and no artifact holds a builder path ($HOME,
+//! either source tree, `$CARGO_HOME`), are the artifacts copied to `target/dist/` with
+//! `"reproducible":true`. A plain `dist` builds the checkout itself the same way and records
+//! `"reproducible":false`: nothing was compared.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -24,29 +37,29 @@ use clap::Subcommand;
 use serde_json::{Value, json};
 
 use crate::Res;
-use crate::host::{self, heavy_job};
+use crate::depinfo::{R0_RUSTFLAGS, R0_TARGET};
+use crate::host::{self, Cargo, heavy_job};
 use crate::workspace;
 
 /// `cargo xtask release ...`
 #[derive(Subcommand)]
 pub enum ReleaseCmd {
     /// Build the R0 component and the R2 worker into target/dist and write digests.json.
-    Dist,
+    Dist {
+        /// Build the committed tree twice, from two different absolute paths, and ship the
+        /// artifacts only if every digest matches.
+        #[arg(long)]
+        twice: bool,
+    },
 }
 
 /// Runs one `release` command.
 pub fn run(cmd: ReleaseCmd) -> Res<ExitCode> {
     match cmd {
-        ReleaseCmd::Dist => dist().map(|()| ExitCode::SUCCESS),
+        ReleaseCmd::Dist { twice: false } => dist().map(|()| ExitCode::SUCCESS),
+        ReleaseCmd::Dist { twice: true } => dist_twice(),
     }
 }
-
-/// The wasm target of the R0 core module (D-16).
-const R0_TARGET: &str = "wasm32-unknown-unknown";
-
-/// The rustflags of the R0 build: 128-bit SIMD and nothing else. Relaxed SIMD is never enabled; its
-/// results are implementation-defined and would break replay.
-const R0_RUSTFLAGS: &str = "-Ctarget-feature=+simd128";
 
 /// The shipped component's file name under `target/dist/`.
 const COMPONENT: &str = "science_cas.component.wasm";
@@ -54,86 +67,337 @@ const COMPONENT: &str = "science_cas.component.wasm";
 /// The worker's binary name.
 const WORKER: &str = "ksci-worker";
 
-fn dist() -> Res<()> {
-    let root = workspace::root()?;
-    let cargo = host::cargo()?;
-    let rustc = host::toolchain_bin("rustc")?;
-    let wasm_tools = pinned_tool("wasm-tools")?;
-    let _held = heavy_job()?;
+/// The remapped name of the source tree in every shipped artifact.
+const SRC_REMAP: &str = "/src";
 
-    let target = root.join("target");
-    let dist = target.join("dist");
-    if dist.exists() {
-        fs::remove_dir_all(&dist).map_err(|e| format!("remove {}: {e}", dist.display()))?;
+/// The remapped name of `$CARGO_HOME` (registry sources) in every shipped artifact.
+const CARGO_HOME_REMAP: &str = "/cargo";
+
+/// The separator of `CARGO_ENCODED_RUSTFLAGS`.
+const FLAG_SEP: char = '\u{1f}';
+
+/// The pinned tools every build uses, resolved and version-checked once.
+struct Toolchain {
+    cargo: Cargo,
+    wasm_tools: PathBuf,
+    rustc_vv: String,
+    wasm_tools_version: String,
+    triple: String,
+    cargo_home: PathBuf,
+}
+
+impl Toolchain {
+    fn resolve() -> Res<Toolchain> {
+        let cargo = host::cargo()?;
+        let rustc = host::toolchain_bin("rustc")?;
+        let wasm_tools = pinned_tool("wasm-tools")?;
+        let rustc_vv = output_text(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
+        let triple = host_triple(&rustc_vv)?;
+        let wasm_tools_version = output_text(
+            Command::new(&wasm_tools).arg("--version"),
+            "wasm-tools --version",
+        )?;
+        let cargo_home = host::cargo_home()?;
+        Ok(Toolchain {
+            cargo,
+            wasm_tools,
+            rustc_vv: rustc_vv.trim_end().to_owned(),
+            wasm_tools_version: wasm_tools_version.trim_end().to_owned(),
+            triple,
+            cargo_home,
+        })
     }
+}
+
+/// What one [`build_artifacts`] run produced.
+struct Built {
+    /// Every shipped artifact, by its path relative to the output directory (`/` separators).
+    artifacts: BTreeMap<String, PathBuf>,
+}
+
+/// The one build path of the shipped artifacts (D-01): builds the tree at `src_root` into
+/// `target_dir`, which must lie inside `src_root` so the source remap covers it, and writes the
+/// component and the host worker into `out_dir`.
+fn build_artifacts(
+    tc: &Toolchain,
+    src_root: &Path,
+    target_dir: &Path,
+    out_dir: &Path,
+) -> Res<Built> {
+    if !target_dir.starts_with(src_root) {
+        return Err(format!(
+            "target dir {} is outside the source tree {}; its paths would not be remapped",
+            target_dir.display(),
+            src_root.display()
+        ));
+    }
+    let remap = remap_flags(src_root, &tc.cargo_home)?;
+    if out_dir.exists() {
+        fs::remove_dir_all(out_dir).map_err(|e| format!("remove {}: {e}", out_dir.display()))?;
+    }
+    fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+    let mut artifacts = BTreeMap::new();
 
     // a. The R0 core module.
-    let mut build = cargo.command();
-    build
-        .current_dir(&root)
-        .env("CARGO_ENCODED_RUSTFLAGS", R0_RUSTFLAGS)
-        .args(["build", "--locked", "--release", "-p", "ksci-component"])
-        .args(["--target", R0_TARGET, "--target-dir"])
-        .arg(&target);
+    let mut r0_flags = remap.clone();
+    r0_flags.push(R0_RUSTFLAGS.to_owned());
+    let mut build = cargo_build(tc, src_root, target_dir, &r0_flags)?;
+    build.args(["-p", "ksci-component", "--target", R0_TARGET]);
     run_checked(&mut build, "cargo build -p ksci-component")?;
-    let core = target
+    let core = target_dir
         .join(R0_TARGET)
         .join("release")
         .join("ksci_component.wasm");
 
     // b. The component: the core module wrapped by the pinned wasm-tools.
-    fs::create_dir_all(&dist).map_err(|e| format!("create {}: {e}", dist.display()))?;
-    let component = dist.join(COMPONENT);
-    let mut wrap = Command::new(&wasm_tools);
+    let component = out_dir.join(COMPONENT);
+    let mut wrap = Command::new(&tc.wasm_tools);
     wrap.arg("component")
         .arg("new")
         .arg(&core)
         .arg("-o")
         .arg(&component);
     run_checked(&mut wrap, "wasm-tools component new")?;
+    artifacts.insert(COMPONENT.to_owned(), component);
 
     // c. The R2 worker for the host triple.
-    let rustc_vv = output_text(Command::new(&rustc).arg("-vV"), "rustc -vV")?;
-    let triple = host_triple(&rustc_vv)?;
-    let mut build = cargo.command();
-    build
-        .current_dir(&root)
-        .env("CARGO_ENCODED_RUSTFLAGS", "")
-        .args([
-            "build",
-            "--locked",
-            "--release",
-            "-p",
-            WORKER,
-            "--target-dir",
-        ])
-        .arg(&target);
+    let mut build = cargo_build(tc, src_root, target_dir, &remap)?;
+    build.args(["-p", WORKER]);
     run_checked(&mut build, "cargo build -p ksci-worker")?;
     let exe = format!("{WORKER}{}", std::env::consts::EXE_SUFFIX);
-    let worker_dir = dist.join(&triple);
+    let worker_dir = out_dir.join(&tc.triple);
     fs::create_dir_all(&worker_dir).map_err(|e| format!("create {}: {e}", worker_dir.display()))?;
     let worker = worker_dir.join(&exe);
-    let built = target.join("release").join(&exe);
+    let built = target_dir.join("release").join(&exe);
     fs::copy(&built, &worker)
         .map_err(|e| format!("copy {} to {}: {e}", built.display(), worker.display()))?;
+    artifacts.insert(format!("{}/{exe}", tc.triple), worker);
 
-    // d. digests.json, in JCS.
-    let wasm_tools_version = output_text(
-        Command::new(&wasm_tools).arg("--version"),
-        "wasm-tools --version",
-    )?;
-    let mut artifacts = BTreeMap::new();
-    for path in [&component, &worker] {
-        let rel = relative(&dist, path)?;
+    Ok(Built { artifacts })
+}
+
+/// A `cargo build --locked --release` of the tree at `src_root` into `target_dir`, with exactly
+/// `rustflags` as `CARGO_ENCODED_RUSTFLAGS`.
+fn cargo_build(
+    tc: &Toolchain,
+    src_root: &Path,
+    target_dir: &Path,
+    rustflags: &[String],
+) -> Res<Command> {
+    if let Some(flag) = rustflags.iter().find(|f| f.contains(FLAG_SEP)) {
+        return Err(format!("rustflag {flag:?} contains the 0x1f separator"));
+    }
+    let encoded = rustflags.join(&FLAG_SEP.to_string());
+    let mut cmd = tc.cargo.command();
+    cmd.current_dir(src_root)
+        .env("CARGO_ENCODED_RUSTFLAGS", encoded)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env_remove("RUSTFLAGS")
+        .args(["build", "--locked", "--release"]);
+    Ok(cmd)
+}
+
+/// The `--remap-path-prefix` flags for a build of `src_root`: the source tree to [`SRC_REMAP`] and
+/// `cargo_home` to [`CARGO_HOME_REMAP`], each under its given and its canonical spelling.
+fn remap_flags(src_root: &Path, cargo_home: &Path) -> Res<Vec<String>> {
+    let mut flags = Vec::new();
+    for (from, to) in [(cargo_home, CARGO_HOME_REMAP), (src_root, SRC_REMAP)] {
+        if !from.is_absolute() {
+            return Err(format!("{} is not an absolute path", from.display()));
+        }
+        let mut spellings = vec![from.to_path_buf()];
+        if let Ok(real) = fs::canonicalize(from)
+            && real != from
+        {
+            spellings.push(real);
+        }
+        for path in spellings {
+            let text = path
+                .to_str()
+                .ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
+            if text.contains('=') {
+                return Err(format!("{text} contains '='; it cannot be remapped"));
+            }
+            flags.push(format!("--remap-path-prefix={text}={to}"));
+        }
+    }
+    Ok(flags)
+}
+
+/// `dist`: one build of the checkout itself, into `target/dist-build`.
+fn dist() -> Res<()> {
+    let root = workspace::root()?;
+    let tc = Toolchain::resolve()?;
+    let _held = heavy_job()?;
+    let target = root.join("target");
+    let dist = target.join("dist");
+    let built = build_artifacts(&tc, &root, &target.join("dist-build"), &dist)?;
+    write_digests(&tc, &dist, &built, false)?;
+    Ok(())
+}
+
+/// `dist --twice`: two builds of the committed tree from two different absolute paths; the
+/// artifacts ship only when every digest matches and no artifact holds a builder path.
+fn dist_twice() -> Res<ExitCode> {
+    let root = workspace::root()?;
+    let tc = Toolchain::resolve()?;
+    let _held = heavy_job()?;
+    let changed = host::git_output(&root, &["status", "--porcelain", "--untracked-files=no"])?;
+    if !changed.is_empty() {
+        return Err(format!(
+            "dist --twice builds exactly what is committed, and tracked files have uncommitted \
+             changes:\n{}",
+            String::from_utf8_lossy(&changed).trim_end()
+        ));
+    }
+    let tmp = env::temp_dir();
+    let copies = [
+        (tmp.join("ksci-repro-a"), PathBuf::from("src")),
+        (tmp.join("ksci-repro-b"), Path::new("nested").join("src")),
+    ];
+    let mut runs = Vec::new();
+    for (base, src) in &copies {
+        if base.exists() {
+            fs::remove_dir_all(base).map_err(|e| format!("remove {}: {e}", base.display()))?;
+        }
+        let src_root = base.join(src);
+        export_tree(&root, &src_root)?;
+        let src_root =
+            fs::canonicalize(&src_root).map_err(|e| format!("{}: {e}", src_root.display()))?;
+        println!("dist --twice: building {}", src_root.display());
+        let out = base.join("dist");
+        let built = build_artifacts(&tc, &src_root, &src_root.join("target"), &out)?;
+        runs.push((src_root, built));
+    }
+
+    // Compare every artifact's digest across the two builds.
+    let (a, b) = (&runs[0], &runs[1]);
+    let names: Vec<&String> = a.1.artifacts.keys().collect();
+    if names != b.1.artifacts.keys().collect::<Vec<_>>() {
+        return Err("the two builds produced different artifact sets".to_owned());
+    }
+    let mut same = true;
+    for name in &names {
+        let da = file_sha256(&a.1.artifacts[*name])?;
+        let db = file_sha256(&b.1.artifacts[*name])?;
+        println!("dist --twice: {name}\n  a sha256:{da}\n  b sha256:{db}");
+        if da != db {
+            eprintln!("dist --twice: DIFFERENT digests for {name}");
+            same = false;
+        }
+    }
+    if !same {
+        eprintln!(
+            "dist --twice: the builds differ; both trees are kept under {}",
+            tmp.display()
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // No builder path in any artifact.
+    let mut needles: Vec<String> = Vec::new();
+    if let Some(home) = env::var_os("HOME").and_then(|h| h.into_string().ok())
+        && home.len() > 1
+    {
+        needles.push(home);
+    }
+    needles.extend(
+        runs.iter()
+            .filter_map(|(src, _)| src.to_str().map(str::to_owned)),
+    );
+    needles.extend(tc.cargo_home.to_str().map(str::to_owned));
+    for path in a.1.artifacts.values() {
         let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let digest = ksci_wire::sha256_hex(&bytes);
-        println!("sha256:{digest} target/dist/{rel}");
-        artifacts.insert(rel, Value::String(digest));
+        for needle in &needles {
+            if contains(&bytes, needle.as_bytes()) {
+                eprintln!(
+                    "dist --twice: {} contains the builder path {needle}",
+                    path.display()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    // Ship the compared bytes.
+    let dist = root.join("target").join("dist");
+    if dist.exists() {
+        fs::remove_dir_all(&dist).map_err(|e| format!("remove {}: {e}", dist.display()))?;
+    }
+    let mut shipped = BTreeMap::new();
+    for (name, path) in &a.1.artifacts {
+        let to = dist.join(name);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        fs::copy(path, &to)
+            .map_err(|e| format!("copy {} to {}: {e}", path.display(), to.display()))?;
+        shipped.insert(name.clone(), to);
+    }
+    write_digests(&tc, &dist, &Built { artifacts: shipped }, true)?;
+    for (base, _) in &copies {
+        fs::remove_dir_all(base).map_err(|e| format!("remove {}: {e}", base.display()))?;
+    }
+    println!("dist --twice: reproducible, {} artifacts", names.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Copies every tracked file (`git ls-files -z`) of `root` to the same path under `to`, which
+/// must not exist yet. Symbolic links are recreated as links.
+fn export_tree(root: &Path, to: &Path) -> Res<()> {
+    if to.exists() {
+        return Err(format!("{} already exists", to.display()));
+    }
+    fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    let listed = host::git_output(root, &["ls-files", "-z"])?;
+    for rel in listed.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+        let rel = std::str::from_utf8(rel).map_err(|e| format!("git ls-files: {e}"))?;
+        let from = root.join(rel);
+        let dest = to.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let meta = fs::symlink_metadata(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+        if meta.file_type().is_symlink() {
+            let link = fs::read_link(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+            symlink(&link, &dest)?;
+        } else if meta.is_file() {
+            fs::copy(&from, &dest)
+                .map_err(|e| format!("copy {} to {}: {e}", from.display(), dest.display()))?;
+        } else {
+            return Err(format!("{rel}: tracked entry is neither a file nor a link"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink(link: &Path, dest: &Path) -> Res<()> {
+    std::os::unix::fs::symlink(link, dest).map_err(|e| format!("link {}: {e}", dest.display()))
+}
+
+#[cfg(not(unix))]
+fn symlink(_link: &Path, dest: &Path) -> Res<()> {
+    Err(format!(
+        "{}: symbolic links are not exported on this host",
+        dest.display()
+    ))
+}
+
+/// Writes `digests.json` (JCS) into `dist` for `built`, whose artifacts lie under `dist`.
+fn write_digests(tc: &Toolchain, dist: &Path, built: &Built, reproducible: bool) -> Res<()> {
+    let mut artifacts = BTreeMap::new();
+    for (name, path) in &built.artifacts {
+        let digest = file_sha256(path)?;
+        println!("sha256:{digest} target/dist/{name}");
+        artifacts.insert(name.clone(), Value::String(digest));
     }
     let record = json!({
         "artifacts": artifacts,
-        "rustc -vV": rustc_vv.trim_end(),
-        "wasm-tools --version": wasm_tools_version.trim_end(),
+        "host": tc.triple,
+        "reproducible": reproducible,
+        "rustc -vV": tc.rustc_vv,
+        "wasm-tools --version": tc.wasm_tools_version,
     });
     let jcs = ksci_wire::to_jcs(&record).map_err(|e| format!("digests.json: {e}"))?;
     let digests = dist.join("digests.json");
@@ -143,6 +407,17 @@ fn dist() -> Res<()> {
         ksci_wire::sha256_hex(&jcs)
     );
     Ok(())
+}
+
+/// The SHA-256 of a file, as lowercase hex.
+fn file_sha256(path: &Path) -> Res<String> {
+    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(ksci_wire::sha256_hex(&bytes))
+}
+
+/// Whether `needle` (non-empty) occurs in `hay`.
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The absolute path of a tool in [`host::TOOLS`], once it reports exactly its pinned version.
@@ -171,18 +446,6 @@ fn host_triple(rustc_vv: &str) -> Res<String> {
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "rustc -vV printed no host: line".to_owned())
-}
-
-/// `path` relative to `dir`, with `/` separators.
-fn relative(dir: &Path, path: &Path) -> Res<String> {
-    let rel = path
-        .strip_prefix(dir)
-        .map_err(|_| format!("{} is not under {}", path.display(), dir.display()))?;
-    let parts: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    Ok(parts.join("/"))
 }
 
 /// Runs `cmd`, inheriting stdio; a non-zero exit is an error naming `what`.
@@ -223,5 +486,27 @@ mod tests {
     fn release_r0_never_relaxed_simd() {
         assert!(R0_RUSTFLAGS.contains("+simd128"));
         assert!(!R0_RUSTFLAGS.contains("relaxed"));
+    }
+
+    #[test]
+    fn release_remap_flags_cover_src_and_cargo_home() {
+        let flags = remap_flags(Path::new("/x/src"), Path::new("/h/.cargo")).unwrap();
+        assert!(
+            flags.contains(&"--remap-path-prefix=/x/src=/src".to_owned()),
+            "{flags:?}"
+        );
+        assert!(
+            flags.contains(&"--remap-path-prefix=/h/.cargo=/cargo".to_owned()),
+            "{flags:?}"
+        );
+        assert!(remap_flags(Path::new("rel"), Path::new("/h")).is_err());
+        assert!(remap_flags(Path::new("/a=b"), Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn release_contains_finds_needles() {
+        assert!(contains(b"abc/Users/x/def", b"/Users/x"));
+        assert!(!contains(b"abc", b"abcd"));
+        assert!(!contains(b"abc", b""));
     }
 }

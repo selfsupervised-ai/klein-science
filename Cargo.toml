@@ -8,8 +8,9 @@ rust-version = "1.99.0"
 license = "Apache-2.0"
 publish = false
 
-# The crates whose lib targets go into the R0 (wasm32-wasip2) component: the one declared list.
-# `cargo xtask check provenance` compiles exactly these for wasm32-wasip2 and judges what rustc
+# The crates whose lib targets go into the R0 component (wasm32-unknown-unknown with +simd128,
+# wrapped by `wasm-tools component new`, D-16): the one declared list.
+# `cargo xtask check provenance` compiles exactly these for that target and judges what rustc
 # read. A plan that adds an R0 crate (ksci-ops) adds it here.
 [workspace.metadata.ksci]
 r0-crates = ["ksci-component", "ksci-ops", "ksci-wire"]

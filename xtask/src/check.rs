@@ -13,8 +13,8 @@
 //! came from: original work, a port of an allowed project (tied to [`PORT_POLICY`] and to a
 //! `Project:` block in NOTICE), or a paper by DOI. On the Rust side it judges what rustc actually
 //! read: the inputs cargo dep-info records for two compiles, the host compile of the whole
-//! workspace (all targets, all features) and the wasm32-wasip2 compile of the declared R0 crates'
-//! libs, resolved to real paths ([`depinfo`], review W3'). On the Python side it walks
+//! workspace (all targets, all features) and the shipped R0 compile (wasm32-unknown-unknown with
+//! `+simd128`, [`depinfo::R0_TARGET`]) of the declared R0 crates' libs, resolved to real paths ([`depinfo`], review W3'). On the Python side it walks
 //! `standin/` on disk, ignored files included, and refuses symbolic links there.
 //!
 //! # Threat model of `check provenance`
@@ -48,7 +48,7 @@
 //! - `include!` of a file under `testdata/`: dep-info does not record which macro read a file,
 //!   and testdata inputs are data, not judged as source.
 //! - Python outside `standin/`: no compiler records what Python imports.
-//! - Targets and cfgs other than the host compile and the wasm32-wasip2 R0 compile.
+//! - Targets and cfgs other than the host compile and the wasm32-unknown-unknown R0 compile.
 //! - A local actor changing files after a compile's inputs are judged, or between this check and
 //!   a later build: the check judges the tree as compiled during the check, nothing more.
 //! - Tampering with `target/provenance` during the check, for example editing a dep-info file
@@ -341,8 +341,9 @@ fn provenance() -> Res<ExitCode> {
             .filter(|l| l.starts_with("Project: "))
             .count();
         println!(
-            "provenance ok, {rust} sources rustc read (host, all targets; wasm32-wasip2, R0 \
-             libs) and {} standin files judged in {}, {NOTICE_FILE} has {blocks} Project blocks",
+            "provenance ok, {rust} sources rustc read (host, all targets; {}, R0 libs) and {} \
+             standin files judged in {}, {NOTICE_FILE} has {blocks} Project blocks",
+            depinfo::R0_TARGET,
             standin.len(),
             root.display()
         );
@@ -380,7 +381,8 @@ fn under_testdata(rel: &Path) -> bool {
 }
 
 /// The Rust side: two compiles, the host compile of the whole workspace ([`depinfo::HOST`]) and
-/// the R0 compile for wasm32-wasip2 ([`depinfo::r0_selection`]), so code behind a wasm-only cfg
+/// the R0 compile ([`depinfo::r0_selection`] for [`depinfo::R0_TARGET`] with
+/// [`depinfo::R0_RUSTFLAGS`], the compile `release dist` ships), so code behind a wasm-only cfg
 /// is read and judged too. Each compile's inputs are classified, read and judged immediately
 /// after that compile and before the next one starts (review W-A): a build script that rewrites
 /// a source between the two compiles cannot have one compile's bytes judged in place of the
@@ -392,8 +394,8 @@ fn rust_compiles(root: &Path, notice: &str) -> Res<(usize, Vec<(String, String)>
     let r0 = depinfo::r0_selection(root)?;
     let mut sources = BTreeSet::new();
     let mut found = Vec::new();
-    for selection in [host, r0] {
-        let compiled = depinfo::compile_inputs(root, &target, &selection)?;
+    for (selection, rustflags) in [(host, ""), (r0, depinfo::R0_RUSTFLAGS)] {
+        let compiled = depinfo::compile_inputs(root, &target, &selection, rustflags)?;
         let exempt = dependency_roots(root, &target, &compiled.dependency_out_dirs)?;
         let judged = classify_inputs(root, &compiled.inputs, &exempt, &external)?;
         found.extend(violation_lines(&judged, notice));

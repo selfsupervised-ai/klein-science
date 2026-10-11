@@ -247,13 +247,18 @@ pub const TOOLS: &[Tool] = &[
     },
 ];
 
-/// `$CARGO_HOME/bin` (default `$HOME/.cargo/bin`).
-pub fn bin_dir() -> Res<PathBuf> {
+/// `$CARGO_HOME` (default `$HOME/.cargo`): the pinned tools and the registry sources.
+pub fn cargo_home() -> Res<PathBuf> {
     if let Some(home) = env::var_os("CARGO_HOME") {
-        return Ok(PathBuf::from(home).join("bin"));
+        return Ok(PathBuf::from(home));
     }
     let home = env::var_os("HOME").ok_or("neither CARGO_HOME nor HOME is set")?;
-    Ok(PathBuf::from(home).join(".cargo").join("bin"))
+    Ok(PathBuf::from(home).join(".cargo"))
+}
+
+/// `$CARGO_HOME/bin` (default `$HOME/.cargo/bin`).
+pub fn bin_dir() -> Res<PathBuf> {
+    Ok(cargo_home()?.join("bin"))
 }
 
 /// The absolute path of a pinned tool's binary. Every xtask call of a pinned tool goes here.
