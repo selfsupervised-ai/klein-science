@@ -146,7 +146,7 @@ trusted.**
   - Yanked crates are denied, and so are unknown registries and git sources.
   - getrandom and rand are already in `Cargo.lock` through proptest (a dev-dependency). The clean tree still passes, which shows that `exclude-dev` works.
 - **`cargo xtask check provenance` (LIC-02).**
-  - It lists files with `git ls-files -z --cached --others --exclude-standard`, then filters in Rust: `.rs` under `crates/`, `.py` under `standin/`, both case-insensitive.
+  - As first built, it listed files with `git ls-files`. Since review fix W3' it judges the Rust files rustc actually read, taken from cargo dep-info for an all-targets, all-features workspace compile, and walks `standin/` on disk for `.py` files. See "Review fixes".
   - The header is line 1, or line 2 of a `.py` file whose first line is a shebang or a PEP 263 coding cookie. It has one of three forms: `original`, `port <project>@<tag>:<path> (<SPDX>)` or `paper doi:<doi>`.
   - `PORT_POLICY` sets sympy, mpmath, diofant and fricas to BSD-3-Clause, and symengine to MIT.
   - A port also needs an exact `Project: <project>` line in NOTICE.
@@ -364,4 +364,63 @@ fails after, and every mutation was reverted afterwards. `git status --porcelain
   - After: **rc=1**, with `crates/ksci-wire/src/imported: symbolic link inside a checked source tree; ...`.
   - Reverted with `git reset` on the intent-to-add entries, removal of the link and fixture, and `git checkout -- crates/ksci-wire/src/lib.rs`.
 
-**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 98 tests with 98 passing. Clippy and fmt are clean. rust-analyzer was still unavailable in this session, so structural checks used ast-grep (`provenance_violations` and `Entry::*` call sites, and the `store::Source` clash) together with the full clippy compile.
+**Tree after W1 to W3.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0, and nextest ran 98 tests with 98 passing. Clippy and fmt are clean. rust-analyzer was still unavailable in this session, so structural checks used ast-grep (`provenance_violations` and `Entry::*` call sites, and the `store::Source` clash) together with the full clippy compile.
+
+### Second review: W3' (supersedes the W3 mechanism)
+
+The re-review confirmed that W1 and W2 are closed: the orchestrator re-ran both oracles and got rc 2, and the clean tree gave rc 0. W3 was only partly closed. Two escapes remained, both because the check used git locations:
+- **(a)** A link outside `crates/`, `xtask/review-link -> ../review-fixture`, reached from ksci-wire by `#[path = "../../../xtask/review-link/witness.rs"]`. **(a')** is the same link reached by `include!`.
+- **(b)** A link inside `crates/` that is listed in `.gitignore`, so `--exclude-standard` hid it.
+
+The operator ruled on 2026-10-11 that the check must judge what rustc actually read.
+
+**Mechanism** (`9743790`, fix; RED `c38ca11`, test).
+- **The compile.** The new `xtask/src/depinfo.rs` runs one `cargo check --workspace --all-targets --all-features --locked --message-format=json-render-diagnostics --target-dir target/provenance` with the pinned cargo, as the rest of xtask does.
+  - For every `compiler-artifact` this compile reports, fresh or rebuilt, it reads rustc's dep-info file. That covers workspace crates, dependencies, proc macros and build scripts.
+  - The `.d` file sits next to the artifact: `lib<crate>-<hash>.rmeta` maps to `<crate>-<hash>.d`, and `build/<pkg>-<hash>/build-script-build` maps to `build_script_build-<hash>.d`.
+  - The `.d` files are never found by listing a directory, so stale ones left by earlier compiles are never read. A missing `.d` file, or a failed compile, is an error.
+- **Classification.** Each input path is canonicalised, which follows links, because rustc read the target.
+  - Inside the repository, a regular `.rs` file is judged with the same header parser, `PORT_POLICY` and NOTICE cross-check as before.
+  - Outside the repository, an input is allowed only under `$CARGO_HOME/registry/src`, `$CARGO_HOME/git/checkouts` or the pinned toolchain's sysroot. Anything else is a violation that names the absolute path.
+- **The rule for non-`.rs` inputs in the repository (decided here).** Data read through `include_str!` or `include_bytes!` is allowed, and not judged as source, only under a `testdata/` directory. That matches the existing no-corpus convention. A non-`.rs` input anywhere else in the repository is a violation: `non-Rust compiler input outside testdata/`.
+  - Build-script output under the provenance target directory (`OUT_DIR`) is allowed. The build script that wrote it is itself a judged input.
+- **Reporting.** A violation names the real file and the names rustc used for it, for example `review-fixture/witness.rs: no provenance header (rustc read it as crates/ksci-wire/src/review-link/witness.rs)`. Output is sorted by path.
+- **Python side.** It now walks `standin/` on disk, so ignored files are included and there is no git listing. Symbolic links anywhere in `standin/`, the root included, are still refused. The header rules are unchanged.
+- **One mechanism.** The git-listing path for `.rs` files was removed, together with `provenance_in_scope`, `in_checked_tree`, `CHECKED_TREES`, `Entry::Symlink` and their unit tests.
+  - Every-site evidence: after the removal, ast-grep finds no occurrence of any of these names, and the workspace clippy compile is clean.
+  - The workspace compile also covers xtask. Its 8 sources carry headers, and judging it costs nothing.
+- **Changed behaviour on purpose.** A link to a *headed* file inside the repository now passes, because the check judges the content rustc read. The W3 test that expected that case to be refused was rewritten to link a headerless file instead.
+
+**Witnesses.** 12 integration tests in `xtask/tests/review_bypass.rs` each build a real two-member cargo workspace in a scratch repository, about 1.3 s per test.
+
+| Case | Test | Before (code at c38ca11) | After (9743790) |
+|---|---|---|---|
+| (a) `#[path]` through a link outside crates/ | `provenance_rejects_path_module_through_link_outside_crates` | exit 0, passed (RED) | exit 1, `review-fixture/witness.rs: no provenance header` |
+| (a') `include!` through that link | `provenance_rejects_include_through_link_outside_crates` | exit 0 (RED) | exit 1, same |
+| (b) gitignored link in crates/ | `provenance_rejects_gitignored_link` | exit 0 (RED) | exit 1, same |
+| directory link in crates/ plus `#[path]` | `provenance_rejects_directory_symlink_in_source_tree` | exit 1, but naming the link rather than the file read (RED on the assertion) | exit 1, names `review-fixture/witness.rs` |
+| `.rs` file link to a headerless file | `provenance_rejects_file_symlink_to_headerless_source` | exit 1, naming the link (RED on the assertion) | exit 1, names the target |
+| link to a headed file (must pass) | `provenance_judges_a_link_by_the_file_rustc_read` | exit 1 (RED) | exit 0 |
+| input outside the repository | `provenance_rejects_input_outside_the_repository` | exit 0 (RED) | exit 1, `outside the repository` |
+| non-`.rs` input outside testdata/ | `provenance_data_inputs_only_under_testdata` | exit 0 (RED) | exit 1 for `src/data.txt`; `testdata/v.json` not reported |
+| ignored `standin/*.py` without a header | `provenance_judges_ignored_standin_files` | exit 0 (RED) | exit 1 |
+| headerless ordinary module | `provenance_rejects_headerless_module` | exit 1 (already green) | exit 1 |
+| symlinked `standin` root | `provenance_rejects_symlinked_standin_tree` | exit 1 (already green) | exit 1 |
+| clean workspace | `provenance_passes_a_clean_workspace` | exit 0 (already green) | exit 0 |
+
+- **RED run** at c38ca11: nextest exited 100, with 9 of 12 failing on their assertions. Six showed `check provenance passed ... exit status: 0`, two `did not report "review-fixture/witness.rs"`, and one, the headed-link case, an unexpected exit 1. There was no setup fault.
+- **GREEN run:** 12 of 12 pass. Two new depinfo unit tests (`.d` parsing including escaped spaces and comments, and the artifact-to-`.d` mapping for each artifact kind) also pass.
+- **The reviewer's oracles on the real tree, after the fix:**
+  - (a) `#[path]` through `xtask/review-link`: rc=1.
+  - (a') `include!` through the same link: rc=1.
+  - (b) `crates/ksci-wire/src/review-link` listed in `.gitignore`: rc=1.
+  - Each reported `review-fixture/witness.rs: no provenance header (rustc read it as …)`.
+  - All mutations were reverted and the clean tree's rc was 0.
+  - The real-tree "before" numbers come from the RED tests above, which run the same constructions against the old binary. I did not rebuild the old binary separately.
+
+**Residual risks, recorded rather than hidden.**
+- **Host cfg only.** The dep-info compile covers only the host target's cfg. A module behind, for example, `#[cfg(target_arch = "wasm32")]` is not read by the host compile, so it is not judged. A second compile for `wasm32-wasip2` (shipped crates only) would close this for R0. It is not done here, because test-only crates such as proptest and rusty-fork are not known to build for wasip2.
+- **testdata/ inputs are not judged.** An `include!` (not `include_str!`) of a file under `testdata/` would compile unjudged code. dep-info does not say which macro read a file.
+- **The Python side has no dep-info equivalent.** A `.py` file outside `standin/`, imported through `sys.path` tricks, is not seen.
+
+**Final tree.** `cargo xtask ci` passed: `ci: all 8 steps passed`, exit 0. nextest ran 107 tests with 107 passing. `check provenance` reported `13 Rust sources rustc read and 0 standin files judged`. It runs last in ci, with its own compile into `target/provenance`, which took about 4 s on a warm cache. rust-analyzer was unavailable, so every-site claims rest on the clippy and compile enumeration plus ast-grep.
