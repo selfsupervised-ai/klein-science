@@ -13,11 +13,12 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{ExitCode, Stdio};
 
 use clap::Subcommand;
 
 use crate::Res;
+use crate::host;
 
 /// `cargo xtask check ...`
 #[derive(Subcommand)]
@@ -60,10 +61,12 @@ fn no_corpus() -> Res<ExitCode> {
     }
     if found.is_empty() {
         println!(
-            "no-corpus: {} files checked ({staged} index entries, {} untracked) in {}, no violations",
+            "no-corpus: {} files checked ({staged} index entries, {} untracked) in {} with {}, \
+             no violations",
             files.len(),
             files.len() - staged,
-            root.display()
+            root.display(),
+            host::git_path()?.display()
         );
         Ok(ExitCode::SUCCESS)
     } else {
@@ -75,9 +78,9 @@ fn no_corpus() -> Res<ExitCode> {
     }
 }
 
-/// Runs `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
+/// Runs the pinned `git -C <dir> <args>` and returns its stdout; a non-zero exit is an error.
 fn git_out(dir: &Path, args: &[&str]) -> Res<Vec<u8>> {
-    let out = Command::new("git")
+    let out = host::git()?
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -145,7 +148,7 @@ fn index_files(root: &Path) -> Res<Vec<(String, u64)>> {
 /// that is missing or not a blob yields `Err(reason)` in its slot.
 fn blob_sizes(root: &Path, entries: &[(String, String)]) -> Res<Vec<Result<u64, String>>> {
     let input: String = entries.iter().map(|(_, oid)| format!("{oid}\n")).collect();
-    let mut child = Command::new("git")
+    let mut child = host::git()?
         .arg("-C")
         .arg(root)
         .args([
