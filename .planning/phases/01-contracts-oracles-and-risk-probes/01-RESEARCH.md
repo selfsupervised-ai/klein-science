@@ -795,9 +795,11 @@ Measure:
 | A10 | Upstream `pydantic-monty` 1.1.0 latency is representative of Klein's future embedding | DEP-01 | Label as proxy evidence |
 | A11 | RFC 8785 vectors are "third-party corpus bytes" under rule 6, so fetched by recipe | DET-01 | If the operator allows vendoring, simplify |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **R0 build path and import policy (blocks `ksci-component`).**
+All five were ruled by the operator on 2026-10-11 and recorded in 01-CONTEXT.md as D-16..D-20.
+
+1. **R0 build path and import policy (blocks `ksci-component`).** RESOLVED by D-16: option (b), zero imports.
    - Known: std wasip2 = 14 WASI imports; zero imports is achievable (no_std, or std on `wasm32-unknown-unknown` +
      `wasm-tools component new`); `serde_json_canonicalizer` needs std.
    - Unclear: whether Klein will link deterministic WASI for plugins or require zero imports.
@@ -807,12 +809,12 @@ Measure:
        adds wasm-tools to the reproducibility chain, and makes `getrandom` unbuildable (a free guard);
      - (c) no_std: blocked by the JCS crate.
    - Recommendation: **(b)**, pending operator ruling. Raise it as a checkpoint before Plan 2.
-2. **D6 floor:** ≥ 49.0.2 vs the locked "≥ 49.0.1". Recommend ≥ 49.0.2 (Pitfall B).
-3. **Rational lowest-terms enforcement:** needs bignum gcd. Recommend grammar-only validation in Phase 1 and
+2. **D6 floor:** RESOLVED by D-17: ≥ 49.0.2. ≥ 49.0.2 vs the locked "≥ 49.0.1". Recommend ≥ 49.0.2 (Pitfall B).
+3. **Rational lowest-terms enforcement:** RESOLVED by D-20: grammar only in Phase 1. needs bignum gcd. Recommend grammar-only validation in Phase 1 and
    lowest-terms validation in `ksci-num` (Phase 2) with a witness. Otherwise `ksci-wire` takes `dashu-int` now.
-4. **Census population for TIR:** the full ~46k SymPy programs (about 2 h on the VM) vs the 1k slice. Recommend full
+4. **Census population for TIR:** RESOLVED by D-18: full TIR plus the 10k OMR sample. the full ~46k SymPy programs (about 2 h on the VM) vs the 1k slice. Recommend full
    TIR plus the 10k OMR sample. It is compute-only and gives a stronger D4 table.
-5. **RFC 8785 vectors in git** (A11): recipe at Cyberphone `19d51d7fe467d4706a3ff08adf8a748f29fc21e0` with
+5. **RFC 8785 vectors in git** (A11): RESOLVED by D-19: fetched by recipe. recipe at Cyberphone `19d51d7fe467d4706a3ff08adf8a748f29fc21e0` with
    klein-rs's 18 digests. Spot-checked in this session: `input/values.json c4a041b5…`, `output/values.json 2d5e01a3…`,
    `input/weird.json a3a90526…`, `output/weird.json 6af595a9…` all match.
 
