@@ -555,13 +555,17 @@ const HARDENING: &[&str] = &[
     "--cap-add=SETGID",
     "--cap-add=KILL",
     "--security-opt=no-new-privileges",
-    "--pids-limit=512",
     "--memory=8g",
     "--user",
     "0:0",
     "--hostname",
     "ksci-oracle",
 ];
+
+/// The container's task limit (`--pids-limit`). It is the one source: the same value reaches the
+/// container as `KSCI_PIDS_LIMIT`, and run_programs.py sizes its worker count and per-case
+/// RLIMIT_NPROC so that the budget can never be exceeded (review round 3).
+const PIDS_LIMIT: u32 = 512;
 
 /// The trusted entry point that drops to the harness identity, then runs the script in-process.
 const LAUNCHER: &str = "/opt/ksci/conformance/oracles/launch.py";
@@ -587,6 +591,9 @@ fn run_argv(
 ) -> Res<Vec<OsString>> {
     let mut argv: Vec<OsString> = vec!["run".into(), "--platform".into(), platform.into()];
     argv.extend(HARDENING.iter().map(OsString::from));
+    argv.push(format!("--pids-limit={PIDS_LIMIT}").into());
+    argv.push("-e".into());
+    argv.push(format!("KSCI_PIDS_LIMIT={PIDS_LIMIT}").into());
     let mount = |source: &Path, target: &str, readonly: bool| -> Res<OsString> {
         let src = source
             .to_str()
@@ -951,6 +958,8 @@ mod tests {
         ] {
             assert!(argv.contains(&flag), "{flag} missing from {argv:?}");
         }
+        // One source for the task limit: the flag and the value the harness budgets against.
+        assert!(argv.contains(&"KSCI_PIDS_LIMIT=512"), "{argv:?}");
         let after = |flag: &str| argv[argv.iter().position(|a| *a == flag).unwrap() + 1];
         // Root at start, but only to hand exactly three capabilities to the launcher (review R1).
         assert_eq!(after("--user"), "0:0");

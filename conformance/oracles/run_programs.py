@@ -15,9 +15,14 @@ ptrace the harness or a sibling, and cannot read their /proc/<pid>/environ, fd o
 and outputs live under /harness, a tmpfs of mode 0700 owned by the harness, which cases cannot
 even traverse. /proc itself stays enumerable: remounting it with hidepid=2 needs CAP_SYS_ADMIN
 (EPERM, measured), so cases still see other pids, their command lines (the wrapper argv; program
-text travels on a pipe) and /proc/<pid>/stat. RLIMIT_NPROC per case uid bounds how many of the
-container's pids one case can take. /tmp is shared (mode 1777, sticky): a case cannot change or
-remove another case's files there, but can read the world-readable ones.
+text travels on a pipe) and /proc/<pid>/stat. /tmp is shared (mode 1777, sticky): a case
+cannot change or remove another case's files there, but can read the world-readable ones.
+
+Task budget (review round 3). Every task counts against the container's --pids-limit, which
+xtask passes as KSCI_PIDS_LIMIT. Each case uid gets a fixed RLIMIT_NPROC (NPROC_PER_CASE), and
+--jobs is clamped so the harness's own threads plus every concurrent case's maximum always fit
+(pid_budget). So cases cannot starve each other or the harness of tasks, and what a case may
+start never depends on --jobs. The requested and effective worker counts go into run.json.
 
 Input: JSON Lines, one object per line, exactly {"case_id": <sha256 hex of the UTF-8 code>,
 "code": <str>}. Several --input files are unioned by case_id.
@@ -65,11 +70,12 @@ hardened container (measured), and granting them would weaken the sandbox.
 A case is classified only from complete channels: if stdout or the exception channel has not
 reached EOF after the sweep, the case is an error (HarnessError), never ok.
 
-Failures. Per case, any failure of the harness itself (spawn, read, classification) is recorded
-as that case's HarnessError; one case never discards the batch (review W2). Batch-fatal, with
-no records written: invalid input or arguments (exit 2), --require-sympy-env unmet (exit 3),
-this process cannot become a subreaper or lacks the harness identity (exit 4), and failing to
-write the outputs.
+Failures. Per case, any failure of the harness itself (spawn, thread start, read,
+classification) ends the case and everything it started, and is recorded as that case's
+HarnessError; one case never discards the batch (review W2, round 3). Batch-fatal, with no
+records written: invalid input or arguments (exit 2), --require-sympy-env unmet (exit 3), this
+process cannot become a subreaper, lacks the harness identity, or has no usable KSCI_PIDS_LIMIT
+(exit 4), and failing to write the outputs.
 
 Exit status: 0 after a run (whatever the cases did), 2 for invalid input or arguments, 3 when
 --require-sympy-env is given and the ground types or the mpmath backend are not "python", 4
@@ -112,8 +118,21 @@ HARNESS_CAPS = (1 << 5) | (1 << 6) | (1 << 7)  # CAP_KILL, CAP_SETGID, CAP_SETUI
 # collisions in case_id order (assign_case_ids).
 CASE_ID_BASE = 100000
 CASE_ID_SPAN = 1 << 24
-# Pids one case may hold (RLIMIT_NPROC per case uid), shared out of the container's 512.
-PIDS_FOR_CASES = 448
+# The container's task budget (review round 3). Every task in the container counts against
+# --pids-limit, which xtask passes as KSCI_PIDS_LIMIT (one source). The budget is an invariant
+# checked at startup:
+#   HARNESS_TASKS_FIXED + jobs * (HARNESS_TASKS_PER_JOB + NPROC_PER_CASE) <= KSCI_PIDS_LIMIT
+# - HARNESS_TASKS_FIXED: the init process, the harness's main thread, and headroom.
+# - HARNESS_TASKS_PER_JOB: a pool worker thread, plus the case's feeder and status-reader
+#   threads.
+# - NPROC_PER_CASE: RLIMIT_NPROC of a case's uid (the wrapper, its threads and descendants).
+#   It is a constant, so what a case may start never depends on --jobs, and neither do its
+#   records.
+# A larger --jobs is clamped to the largest that fits; the requested and effective values are
+# recorded in run.json.
+HARNESS_TASKS_FIXED = 8
+HARNESS_TASKS_PER_JOB = 3
+NPROC_PER_CASE = 64
 # Longest exception message recorded, in characters.
 MESSAGE_CAP = 65536
 # Placeholder messages (review R2).
@@ -482,9 +501,6 @@ def run_case(code, env, limits, case_uid):
         except OSError:
             pass
 
-    feeder = threading.Thread(target=feed, daemon=True)
-    feeder.start()
-
     exc = {"chunks": [], "size": 0, "eof": False}
 
     def drain_exc():
@@ -501,9 +517,9 @@ def run_case(code, env, limits, case_uid):
         finally:
             os.close(exc_r)
 
+    feeder = threading.Thread(target=feed, daemon=True)
     exc_reader = threading.Thread(target=drain_exc, daemon=True)
-    exc_reader.start()
-
+    started = {"feeder": False, "exc_reader": False}
     captured = bytearray()
     truncated = False
     eof = False
@@ -512,7 +528,13 @@ def run_case(code, env, limits, case_uid):
     wait_status = None
     rusage = None
     closed_by = None
+    # From here on every failure, including a thread that cannot start, ends the case and
+    # everything it started, and is recorded as this case's HarnessError (review round 3).
     try:
+        feeder.start()
+        started["feeder"] = True
+        exc_reader.start()
+        started["exc_reader"] = True
         out_fd = proc.stdout.fileno()
         os.set_blocking(out_fd, False)
         deadline = time.monotonic() + WALL_FACTOR * cpu
@@ -561,6 +583,11 @@ def run_case(code, env, limits, case_uid):
             with SPAWN_LOCK:
                 LIVE.discard(proc.pid)
             contained = sweep_strays()
+        # A thread that never started never took ownership of its pipe end.
+        if not started["feeder"]:
+            os.close(code_w)
+        if not started["exc_reader"]:
+            os.close(exc_r)
         proc.returncode = os.waitstatus_to_exitcode(wait_status)
         proc.stdout.close()
     # Every writer is dead, so the status channel reaches EOF unless containment failed.
@@ -644,6 +671,31 @@ def sympy_facts():
     }
 
 
+def pid_budget(jobs_requested):
+    """The task budget for this run (see HARNESS_TASKS_FIXED): the container limit from
+    KSCI_PIDS_LIMIT and the effective worker count, `--jobs` clamped to the largest that fits.
+    Batch-fatal (exit 4) when the limit is missing or not even one worker fits."""
+    raw = os.environ.get("KSCI_PIDS_LIMIT")
+    if raw is None or not raw.isdigit():
+        fail(4, f"KSCI_PIDS_LIMIT must give the container's --pids-limit (got {raw!r})")
+    limit = int(raw)
+    per_job = HARNESS_TASKS_PER_JOB + NPROC_PER_CASE
+    jobs_max = (limit - HARNESS_TASKS_FIXED) // per_job
+    if jobs_max < 1:
+        fail(4, f"a pids limit of {limit} fits no worker ({HARNESS_TASKS_FIXED} + {per_job} needed)")
+    jobs = min(jobs_requested, jobs_max)
+    assert HARNESS_TASKS_FIXED + jobs * per_job <= limit
+    return {
+        "limit": limit,
+        "harness_tasks_fixed": HARNESS_TASKS_FIXED,
+        "harness_tasks_per_job": HARNESS_TASKS_PER_JOB,
+        "nproc_per_case": NPROC_PER_CASE,
+        "jobs_requested": jobs_requested,
+        "jobs_max": jobs_max,
+        "jobs_effective": jobs,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", action="append", required=True)
@@ -680,18 +732,20 @@ def main():
     if problem:
         fail(4, f"cannot isolate cases: {problem}")
     case_uids = assign_case_ids(cases)
+    pids = pid_budget(args.jobs)
+    jobs = pids["jobs_effective"]
     limits = {
         "cpu_seconds": args.cpu_seconds,
         "wall_seconds": WALL_FACTOR * args.cpu_seconds,
         "mem_bytes": args.mem_bytes,
         "fsize_bytes": FSIZE_BYTES,
         "stdout_cap_bytes": STDOUT_CAP,
-        "nproc_per_case": max(16, PIDS_FOR_CASES // args.jobs),
+        "nproc_per_case": NPROC_PER_CASE,
         "prelude": args.prelude,
     }
 
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = {
             pool.submit(run_case_recorded, code, env, limits, case_uids[case_id]): case_id
             for case_id, code in cases.items()
@@ -711,7 +765,8 @@ def main():
         "machine": platform.machine(),
         "python_hash_seed": env["PYTHONHASHSEED"],
         "env": {name: os.environ.get(name) for name in COPIED_ENV},
-        "jobs": args.jobs,
+        "jobs": jobs,
+        "pids": pids,
         "limits": limits,
         "inputs": inputs,
         "cases": len(results),
