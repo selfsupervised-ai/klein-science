@@ -43,4 +43,9 @@ fn to_wit(error: OpError) -> Error {
     }
 }
 
+// The exported symbols are the component's core-module ABI, so only a wasm32 build defines them.
+// Their component-model names (`klein:science/cas@0.1.0#invoke`) also break a native link: the
+// macOS linker's exported-symbols list cuts them at the `#`. The bindings and the `Guest` impl
+// above still compile and lint on every target, and the wasm32 output is unchanged.
+#[cfg(target_arch = "wasm32")]
 export!(Cas);
