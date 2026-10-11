@@ -377,11 +377,14 @@ fn numerals_encoding() {
         WireError::NotJson(_)
     ));
     // No Unicode normalisation: "x" and "x" + U+0301 are different names.
-    let pair = table(&doc(r#"["Sym","x",{}],["Sym","x́",{}],["Add",0,1]"#, 2));
+    let pair = table(&doc(
+        r#"["Sym","x",{}],["Sym","x\u0301",{}],["Add",0,1]"#,
+        2,
+    ));
     assert_eq!(pair.canonicalize().nodes().len(), 3);
     assert_ne!(
         table(&doc(r#"["Sym","x",{}]"#, 0)).identity(),
-        table(&doc(r#"["Sym","x́",{}]"#, 0)).identity()
+        table(&doc(r#"["Sym","x\u0301",{}]"#, 0)).identity()
     );
     // Object keys are written in JCS order.
     let sym = table(&doc(r#"["Sym","x",{"real":true,"positive":false}]"#, 0));
@@ -460,7 +463,7 @@ fn envelope_noncanonical() {
             1,
         ),
         // An unnecessary escape.
-        canonical.replacen("science.cas", r"science.cas", 1),
+        canonical.replacen("science.cas", r"\u0073cience.cas", 1),
         // Assumption keys out of order inside the table.
         canonical.replacen(
             r#"["Sym","x",{}]"#,
@@ -511,8 +514,12 @@ fn envelope_steps() {
 #[test]
 fn envelope_request_rejects_bad_contents() {
     // A version other than 1.
-    let v2 = request_json(r#""1""#).replacen(r#","v":1}"#, r#","v":2}"#, 1);
-    assert!(v2.ends_with(r#""v":2}"#));
+    let with_envelope_end = |end: &str| {
+        let json = request_json(r#""1""#);
+        let head = json.strip_suffix(r#""v":1}"#).expect("request ends with v");
+        format!("{head}{end}")
+    };
+    let v2 = with_envelope_end(r#""v":2}"#);
     assert_eq!(
         request_rejected(&v2),
         WireError::Version { path: "/v".into() }
@@ -525,15 +532,15 @@ fn envelope_request_rejects_bad_contents() {
             path: "/args/expr/nodes/1/1".into()
         }
     );
-    // A cyclic argument table, an unknown key and a missing budget.
+    // A cyclic argument table, an unknown envelope key and a missing budget, each in canonical form.
     let cyclic = request_json(r#""1""#).replacen(r#"["Pow",0,1]"#, r#"["Pow",4,1]"#, 1);
-    let extra = request_json(r#""1""#).replacen(r#","v":1}"#, r#","v":1,"x":true}"#, 1);
+    let extra = with_envelope_end(r#""v":1,"x":true}"#);
     let missing = format!(
         r#"{{"args":{{"expr":{X2_PLUS_1_CANONICAL}}},"op":"science.cas.canonicalize","v":1}}"#
     );
     for json in [cyclic, extra, missing] {
         assert!(
-            !matches!(request_rejected(&json), WireError::NonCanonical),
+            matches!(request_rejected(&json), WireError::Envelope(_)),
             "{json}"
         );
     }

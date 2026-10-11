@@ -85,7 +85,7 @@ an assumption value, a bare node), or a non-integer, negative or too-large numbe
 ## Strings and encoding
 
 - Documents are UTF-8 JSON. A lone surrogate escape such as `"\ud800"` is not valid JSON text and is rejected.
-- Names are compared as exact UTF-8 bytes. There is no Unicode normalisation: `"x"` and `"x́"` are different
+- Names are compared as exact UTF-8 bytes. There is no Unicode normalisation: `"x"` and `"x\u0301"` are different
   names.
 - Object keys are written in RFC 8785 order (UTF-16 code units). Assumption keys are ASCII, so this is byte order.
 
@@ -127,4 +127,63 @@ with identity `37f7939bd191aa48173b1b6a45838b6b246aeb8a001d276f9b1c2798342cb964`
 ## Document size cap
 
 A document longer than 64 MiB (`MAX_DOCUMENT_BYTES` = 67108864 bytes) is rejected before it is parsed. A document
-of exactly 64 MiB passes the size check.
+of exactly 64 MiB passes the size check. The cap applies to tables, requests and responses alike.
+
+## Envelopes
+
+A tool call exchanges a request and a response. Both are JCS documents, and both are hashed. A record pairs their
+digests with provenance, which is never inside the hashed bytes.
+
+### Request
+
+```json
+{"args":{"<name>":<table>, ...},"budget":{"steps":"<steps>"},"op":"<operation>","v":1}
+```
+
+- `args` maps argument names to node tables (the shape above), for example `{"expr":<table>}`.
+- `budget.steps` is the logical step budget, a step-budget numeral string (`0` to `18446744073709551615`). A JSON
+  number here is rejected.
+- `op` names the operation, for example `science.cas.canonicalize`.
+- `v` is exactly `1`. Unknown keys are rejected at every level.
+
+### Response
+
+```json
+{"identity":"<hex>"|null,"numeric_class":"exact","result":<table>|null,"status":"exact"|"fuel_exhausted","v":1}
+```
+
+- `status` is `exact`, or `fuel_exhausted` when the logical step budget ran out.
+- `numeric_class` is `exact` in Phase 1.
+- `result` is the result table and `identity` its identity; both are `null` when there is no result.
+- The keys are always present, and unknown keys (such as `provenance`) are rejected.
+
+Example: the response for `x**2 + 1` with an exact result is
+
+```json
+{"identity":"37f7939bd191aa48173b1b6a45838b6b246aeb8a001d276f9b1c2798342cb964","numeric_class":"exact","result":{"nodes":[["Sym","x",{}],["Int","2"],["Pow",0,1],["Int","1"],["Add",2,3]],"root":4,"v":1},"status":"exact","v":1}
+```
+
+and a budget-exhausted response is
+`{"identity":null,"numeric_class":"exact","result":null,"status":"fuel_exhausted","v":1}`.
+
+### Record
+
+```json
+{"provenance":{"backend":"...","device":"...","driver":"...","impl":"...","wall_ms":"<decimal>"},"request_digest":"<hex>","response_digest":"<hex>"}
+```
+
+`request_digest` and `response_digest` are lowercase-hex SHA-256 of the request and response bytes. Every
+provenance field is a string, including `wall_ms`. Two records of the same request and response have the same
+digests whatever their provenance.
+
+### Canonical input
+
+A request is accepted only if its bytes equal their own JCS re-encoding. Any other spelling (whitespace, key order,
+a duplicated key, an unnecessary escape, a trailing newline) is rejected as `NonCanonical`, so each request has
+exactly one byte string and one digest. Responses are read back under the same rule.
+
+### What is hashed
+
+Only request bytes and response bytes are hashed. Provenance lives only in the record, and the request and response
+schemas reject a `provenance` key, so implementation, backend, device, driver and wall time can never change a
+digest.

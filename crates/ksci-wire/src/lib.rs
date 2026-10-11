@@ -286,6 +286,9 @@ pub enum WireError {
         /// A node on the cycle.
         node: u32,
     },
+    /// An envelope that does not match its schema (missing or unknown field, wrong type, bad argument table).
+    #[error("bad envelope: {0}")]
+    Envelope(String),
     /// A request whose bytes differ from its own JCS re-encoding.
     #[error("document is not in canonical (JCS) form")]
     NonCanonical,
