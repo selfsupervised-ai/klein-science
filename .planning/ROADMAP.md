@@ -96,7 +96,7 @@ Wasmtime pin) are measured and filed as klein-rs requests.
 - Also measure, on the oracle, the share of TIR definite integrals that SymPy routes through `meijerint`. It decides
   whether Meijer G leaves the v2 tail.
 
-**Plans**: 5/18 plans executed in 8 waves
+**Plans**: 8/18 plans executed in 8 waves
 
 Plans:
 **Wave 1**
@@ -111,9 +111,9 @@ Plans:
 - [x] 01-05-PLAN.md — digest-pinned SymPy oracle image, hardened program runner, introspection table (wave 3)
 
 **Wave 4** *(blocked on Wave 3 completion)*
-- [ ] 01-06-PLAN.md — WIT tool and zero-import R0 component; R0 (Wasmtime 46.0.1 and 49.0.2) == R2; fuel and memory host errors (wave 4)
-- [ ] 01-07-PLAN.md — TIR corpus by recipe, extraction, stratified hash-ranked ~1k golden slice (wave 4)
-- [ ] 01-08-PLAN.md — Python JCS mirror, `_tool` and `host_shim`; three-way differential with rfc8785 (wave 4)
+- [x] 01-06-PLAN.md — WIT tool and zero-import R0 component; R0 (Wasmtime 46.0.1 and 49.0.2) == R2; fuel and memory host errors (wave 4)
+- [x] 01-07-PLAN.md — TIR corpus by recipe, extraction, stratified hash-ranked ~1k golden slice (wave 4)
+- [x] 01-08-PLAN.md — Python JCS mirror, `_tool` and `host_shim`; three-way differential with rfc8785 (wave 4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 - [ ] 01-09-PLAN.md — reproducible dist (two clean builds), zero-import and relaxed-SIMD gates, VM CI workflow (wave 5)
@@ -405,7 +405,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Contracts, Oracles and Risk Probes | 5/18 | In Progress | - |
+| 1. Contracts, Oracles and Risk Probes | 8/18 | In Progress | - |
 | 2. Core Expressions | 0/TBD | Not started | - |
 | 3. Polynomials, Number Theory and Algebraic Solve | 0/TBD | Not started | - |
 | 4. Solve, Simplify, Assumptions and Piecewise | 0/TBD | Not started | - |
