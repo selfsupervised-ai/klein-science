@@ -61,7 +61,7 @@ Wasmtime pin) are measured and filed as klein-rs requests.
   1. The same expression built in two different orders gets the same identity (SHA-256 over the JCS of the canonical
      DAG node table). Every numeric leaf on the wire is a tagged string, special values are named atoms, provenance
      travels in an envelope outside the hashed bytes, and the RFC 8785 test vectors pass.
-  2. CI builds the `wasm32-wasip2` component and the native worker reproducibly (two clean builds give the same
+  2. CI builds the zero-import WASM component (D-16) and the native worker reproducibly (two clean builds give the same
      digests). It emits the `klein.plugin.v1` manifest and a raw detached Ed25519 signature that passes `verify_strict`,
      and one trivial operation through the WIT tool returns byte-identical JCS from R0 and R2. The signature check and
      the R0-versus-R2 compare were each seen RED on a deliberate perturbation.
@@ -79,13 +79,13 @@ Wasmtime pin) are measured and filed as klein-rs requests.
      and watchdog limit, each under a fixed-box manifest. The operator has ratified per-box budgets (Mac: all P-cores
      against one P-core, Metal against that). Three requests are filed against klein-rs with the operator's approval:
      the TIR protocol census (widened Monty, D4), the measured minimum Seatbelt rules for Metal (input to D1), and the
-     Wasmtime ≥ 49.0.1 request (D6).
+     Wasmtime ≥ 49.0.2 request (D6).
 
 **Klein-core dependencies**: this phase files D1, D4 and D6. Nothing here is blocked.
 - D4 (Monty): the stand-in runs under the CPython `host_shim`, and the baseline is labelled proxy.
 - D3 (`PluginArchive`): CI verifies the signature and digest itself. Installing the bundle into Klein waits for D3.
 - D1 (`ComputeDevice`): the probe runs natively outside `ProcessSandbox`. Its Seatbelt measurement is the D1 input.
-- D6 (Wasmtime): CI runs R0 under Klein's current pin and under ≥ 49.0.1. Builds use `+simd128`, never `+relaxed-simd`.
+- D6 (Wasmtime): CI runs R0 under Klein's current pin and under ≥ 49.0.2. Builds use `+simd128`, never `+relaxed-simd`.
 
 **Research flag**: needed.
 - Seatbelt plus Metal minimum rules (no authoritative Apple source).
@@ -325,7 +325,7 @@ operator opens the next cycle (REQUIREMENTS.md v2, TAIL-01 to TAIL-08):
 
    Until it lands, the stand-in and every TIR pass rate run under the CPython `host_shim` and are labelled proxy.
 5. **D5. `lean.certify`** and the Lean guest engine (Klein 04.1).
-6. **D6. Wasmtime ≥ 49.0.1** (operator 2026-10-11; filed in Phase 1 as DEP-03): move Klein's pin from 46.0.1 to ≥ 49.0.1.
+6. **D6. Wasmtime ≥ 49.0.2** (operator 2026-10-11, floor raised from 49.0.1 by D-17; filed in Phase 1 as DEP-03): move Klein's pin from 46.0.1 to ≥ 49.0.2.
    The current pin is affected by RUSTSEC-2026-0222/0223 and by the 0316 fuel bypass. The request also sets
    `relaxed_simd_deterministic(true)` and `cranelift_nan_canonicalization(true)` for science components and keeps
    `consume_fuel` on.
@@ -344,7 +344,7 @@ What each request blocks, and the labelled proxy used until it lands:
 | D3 `PluginArchive` | installing the bundles into Klein by digest (Phase 1 onward; all three bundles in Phase 5) | CI verifies the signature (`verify_strict`) and digest itself |
 | D4 component kinds + Monty | in-Klein stand-in execution and every TIR number (Phases 2–6); the Data kind for the simplify strategy (Phase 4); the Skill/Harness kinds for `science.prover` (Phase 5) | CPython `host_shim`, numbers labelled proxy; the strategy as digest-pinned files in `science.cas` |
 | D5 `lean.certify` | **hard block** on the Phase 5 Lean-loop gate (`kleinCall`, `polyrith` in Klein); in-Klein certificate checks from Phase 3 | pinned offline Lean + Mathlib toolchain at test time (not accepted for the Phase 5 gate) |
-| D6 Wasmtime ≥ 49.0.1 | trusting R0 under Klein's pin (advisories incl. the fuel bypass); R0 float NaN behaviour (Phase 5) | `+simd128` only; logical step budget; CI runs both pins |
+| D6 Wasmtime ≥ 49.0.2 | trusting R0 under Klein's pin (advisories incl. the fuel bypass); R0 float NaN behaviour (Phase 5) | `+simd128` only; logical step budget; CI runs both pins |
 
 ## Infrastructure (operator 2026-10-11: local GPU first, remote GPU later)
 

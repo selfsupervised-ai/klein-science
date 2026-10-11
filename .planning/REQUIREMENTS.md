@@ -61,12 +61,12 @@ v1 = milestones M0–M5 (roadmap phases 1–6). M6, the parity long tail, is v2.
       import, bigints).
 - [ ] **DEP-02**: The measured minimum macOS Seatbelt rules for CubeCL on Metal are filed as the input to the
       `ComputeDevice` request.
-- [ ] **DEP-03**: A klein-rs request to move Wasmtime to ≥ 49.0.1 with deterministic relaxed-SIMD and NaN
+- [ ] **DEP-03**: A klein-rs request to move Wasmtime to ≥ 49.0.2 (D-17) with deterministic relaxed-SIMD and NaN
       canonicalisation is filed and listed in ROADMAP "Dependencies on Klein core".
 
 ### Plugins and packaging (PLUG)
 
-- [ ] **PLUG-01**: CI builds a reproducible `wasm32-wasip2` component and a native worker, a `klein.plugin.v1` manifest,
+- [ ] **PLUG-01**: CI builds a reproducible zero-import WASM component (D-16) and a native worker, a `klein.plugin.v1` manifest,
       a raw detached Ed25519 signature that passes `verify_strict`, and an artifact addressed by digest.
 - [ ] **PLUG-02**: A WIT interface exposes one typed tool (`invoke`, `plan`, `map`, `reduce` over JCS bytes), and one
       trivial operation returns byte-identical results from R0 and R2.
