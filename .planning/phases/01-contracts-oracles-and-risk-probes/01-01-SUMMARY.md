@@ -384,3 +384,143 @@ of each restored file was clean, and the full suite was green again (33/33).
 
 - `a402acf` `test(01-01)`: RED witnesses for response invariants and duplicate keys (review F1/F2)
 - `e465f6a` `fix(01-01)`: enforce response invariants and reject duplicate keys (review F1/F2)
+
+### F3: the F1 invariants held only on `Response::from_slice` (re-review)
+
+- **Counter-example (compiled, and serialised `"numeric_class":"approx"`):** the reviewer's struct literal
+  `Response { v: 1, status: Status::Exact, numeric_class: "approx".into(), result: Some(int1), identity: Some("0"×64) }`
+  followed by `response.to_jcs()`.
+- **Second variant:** `serde_json::from_str::<Response>` skipped `check`, because `Deserialize` was derived. The
+  same shape existed on `Request` and `Budget`, `Record` and `Provenance`. Each had public fields and a derived
+  `Deserialize`, and `Record::new` hashed any `&[u8]`.
+- **Fix: invariants by construction, with one mechanism.**
+  - `Request`, `Response` and `Record` have private fields and read accessors.
+  - `Response` has `status()`, `numeric_class()`, `result()` and `identity()`. It is built only by
+    `Response::exact`, `Response::fuel_exhausted` or a decoder.
+  - `Request` has `op()`, `args()`, `budget()` and `to_jcs()`, and is built by `Request::new` or a decoder.
+  - `Record` has `request_digest()`, `response_digest()` and `provenance()`.
+  - Each envelope has a private wire form (`RequestWire`, `ResponseWire`, `RecordWire`) and one private
+    `Wire::check`. Every decode path reads the wire form and checks it with that function:
+    - the byte decoders `Request::from_canonical_slice` and `Response::from_slice`;
+    - all three serde `Deserialize` impls. They use the same strict parse as tables (`strict_document`, now shared
+      with `Table`), the same JSON-number positions and the same `check`.
+  - Only the canonical byte comparison is limited to the byte path, because serde does not expose the original
+    bytes. A value read through serde still encodes to its one canonical byte string. The test pins this.
+  - The public `Response::check` is gone. Its rules are now `ResponseWire::check`, unchanged.
+- **Typed `Record::new(&Request, &Response, Provenance)`:** it hashes `to_jcs()` of each argument. For decoded
+  inputs, those are the bytes that were read, so the digest semantics are identical. `envelope_provenance_outside`
+  still asserts `sha256_hex(bytes as sent)`. This supersedes the F1 note that `Record` needed no change.
+- **Parse, don't validate:**
+  - `Budget` holds a `u64` (`Budget::new`, `steps()`), and `steps_u64()` is gone.
+  - `Provenance.wall_ms` is a `u64`. Its fields stay public, because every value is valid.
+  - Both are written as decimal numeral strings. `wall_ms` is read with the step grammar.
+  - `numeral::parse_steps` is renamed `numeral::parse_u64`.
+- **Other rules:**
+  - `Record` digests must be 64 lowercase hex digits (`Shape` at `/request_digest` or `/response_digest`).
+  - `Response`'s `result` and `identity` keys are required on every path. Serde had read a missing key as `null`.
+- **Error order:** the byte decoders now check the rules before the canonical byte comparison. Before, the
+  comparison came first. Every existing test case is canonical, so none changed. A document that is both
+  non-canonical and invalid now reports the rule it breaks.
+- **`Table`:** its fields were already private and its `Deserialize` already validated (F2). It is unchanged.
+- **Schema:** `schema/expr.v1.md` now states:
+  - the Record digest shape and the `wall_ms` grammar;
+  - that a record is built only from checked envelopes;
+  - that other readers, serde among them, apply every rule except the byte comparison;
+  - that a missing or unknown key fails before the canonical-form check.
+
+### F3 RED evidence (commit `7a4c916`, run against the unfixed code)
+
+`cargo test -p ksci-wire --no-fail-fast`: contract 33 passed and 3 failed; doctests 0 passed and 5 failed. The tests
+collect every bypass before asserting, so each count is complete.
+
+- `serde_response_validates`: **15 of 15** invalid responses were accepted by `serde_json::from_str::<Response>`.
+  That covers the 13 F1 cases, including the reviewer's counter-example, and the 2 missing-key documents.
+- `serde_request_validates`: **5 of 5** were accepted: `v: 2`, steps `"007"`, `""` and `"18446744073709551616"`,
+  and a repeated argument name (last one won).
+- `serde_record_validates`: **6 of 7** were accepted: three bad digests (`"xyz"`, uppercase hex, 63 digits) and
+  `wall_ms` values `"abc"`, `"05"` and `"-1"`. The seventh, `wall_ms` as the JSON number `5`, was rejected, but by a
+  type error that did not name its path.
+- Five `compile_fail` doctests on `Response`, `Request` and `Record` each reported "Test compiled successfully, but
+  it's marked `compile_fail`":
+  - the reviewer's struct literal;
+  - `response.numeric_class = …`;
+  - `request.v = 2`;
+  - `Record::new(b"{}", b"not a response", p)`;
+  - `record.response_digest = …`.
+- **Compile-fail codes after the fix.** Stable rustdoc does not check the `E0xxx` code on a `compile_fail` block:
+  a probe that changed `E0451` to `E0999` still passed. So each snippet was also compiled with `rustc` against the
+  fixed rlib. Each failed with exactly its claimed code and nothing else:
+  - the struct literal: **E0451** (`v`, `status`, `numeric_class`, `result` and `identity` are private);
+  - the three field assignments: **E0616**;
+  - `Record::new` over bytes: **E0308**.
+
+### F3 mutation witnesses (on the fixed code)
+
+Each core part was reverted and the suite run. The file was then restored from a saved copy, and `git diff` was clean
+each time.
+
+| # | Mutation | Result |
+|---|---|---|
+| M7 | `Response::deserialize` back to the unchecked wire read (the derived-`Deserialize` equivalent) | `serde_response_validates` FAIL: 13/15 accepted (the 2 missing-key cases are still caught by M12's attribute); 35/36 pass |
+| M8 | `Request::deserialize` back to the unchecked wire read | `serde_request_validates` FAIL: 5/5 accepted |
+| M9 | `deserialize_checked` reads `Value::deserialize` instead of `strict_document` | `serde_request_validates` FAIL: the repeated argument name is accepted |
+| M10 | `if false && !is_digest(digest)` | `serde_record_validates` FAIL: the 3 bad digests are accepted |
+| M11 | `wall_ms` parsed with `str::parse::<u64>().unwrap_or(0)` | `serde_record_validates` FAIL: `"abc"`, `"05"` and `"-1"` are accepted |
+| M12 | drop `deserialize_with = "Option::deserialize"` on `result`/`identity` | `serde_response_validates` FAIL: both missing-key documents are accepted |
+| M13 | `Response` fields made `pub` again | doctests FAIL: both `Response` `compile_fail` blocks compile (3/5 pass) |
+
+### F3 code oracles (CLAUDE.md rule 7)
+
+- **Semantic: compiler enumeration** (no LSP in this session). After the library change,
+  `cargo check --workspace --all-targets` listed **18 errors, all in `tests/contract.rs`**. The library and every
+  other target were clean.
+  - 13 errors, E0616 on private fields, now replaced by the accessors:
+    - `request.op`, `request.budget` (×2) and `request.args`;
+    - `r.identity`;
+    - 8 `Record` field reads (`provenance`, `request_digest`, `response_digest`).
+  - 2 errors, E0277 and E0599 on `Budget { steps: "007" }.steps_u64()`. That line is now
+    `numeral::parse_u64("007") == None`, plus a `Budget::new(u64::MAX)` encoding check.
+  - 3 errors, E0308: one on `wall_ms: String` (now `u64`), and one on each `Record::new(bytes, bytes, _)` call (now
+    the decoded `&Request` and `&Response`).
+  - The literals in `exact_response()` and `exhausted_response()` were not in that list, because rustc reports
+    E0451 in a later pass. They were found by reading the file and replaced with `Response::exact(..)` and
+    `Response::fuel_exhausted()`. Their bytes stay pinned by the literal JSON in `envelope_response_shape`, which
+    now also checks every accessor. The second check reported none.
+  - After the fixes: `cargo check --workspace --all-targets`, `cargo check -p ksci-wire --target wasm32-wasip2` and
+    clippy `-D warnings` each report **0** errors and **0** warnings.
+- **Structural: tree-sitter (ast-grep 0.45.3)** over all 4 `.rs` files in the worktree (`envelope.rs`, `lib.rs`,
+  `numeral.rs`, `contract.rs`):
+  - Struct literals:
+    - `Response { $$$ }`: **3**, all in `envelope.rs`: `ResponseWire::check` after its checks, `exact` and
+      `fuel_exhausted`.
+    - `Request { $$$ }`: **1** (`Request::new`).
+    - `Record { $$$ }`: **2** (`RecordWire::check`, `Record::new`).
+    - `Budget { $$$ }`: **1** (`Budget::new`).
+    - `Provenance { $$$ }`: **1** (the test helper; its fields are public by design).
+  - Constructors:
+    - `Record::new($$$)`: **2**, both typed.
+    - `Request::new($$$)`: **2**.
+    - `Budget::new($$$)`: **2**.
+    - `Response::exact($$$)` and `Response::fuel_exhausted()`: **3** each.
+  - Removed API: `$X.steps_u64()` **0**, `parse_steps($$$)` **0**. `$X.check()` gives **1**, the single
+    `wire.check()` in `decode`.
+  - Field access:
+    - `$X.v`: 3. `$X.op`: 2. `$X.args`: 2. `$X.budget`: 2. `$X.steps`: 2. `$X.status`: 3. `$X.numeric_class`: 3.
+      `$X.result`: 3. `$X.request_digest`: 3. `$X.response_digest`: 3. `$X.provenance`: 2. `$X.wall_ms`: 0.
+      `$X.impl_`: 0.
+    - All of these are `self.*` inside `envelope.rs`.
+    - `$X.identity`: 5. Four are `self.*` in `envelope.rs`. The fifth is the method `Table::identity()` in
+      `contract.rs`.
+  - **Gap:** tree-sitter does not parse macro bodies (`assert_eq!`, `format!`). A text scan closed it:
+    - non-call field access to any envelope field in `contract.rs`, macro bodies included: **0**;
+    - doc comments and doctests: **6** lines, all inside the 5 `compile_fail` blocks, which are the negative
+      witnesses;
+    - `schema/expr.v1.md`: every mention of `numeric_class`, `identity`, `result`, `budget`, `request_digest`,
+      `response_digest` and `wall_ms` agrees with the code.
+- **Suite:** 36/36 `cargo nextest run -p ksci-wire` (33 + 3 new) and 5/5 doctests pass.
+  `cargo fmt --check` and `cargo build -p ksci-wire --target wasm32-wasip2` are clean.
+
+### F3 commits
+
+- `7a4c916` `test(01-01)`: RED witnesses for serde and struct-literal bypasses of envelope invariants (review F3)
+- `3058308` `fix(01-01)`: envelope invariants by construction on every path (review F3)

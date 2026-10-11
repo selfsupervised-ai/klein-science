@@ -440,10 +440,18 @@ fn envelope_request_roundtrip() {
     let json = request_json(r#""100""#);
     let request =
         Request::from_canonical_slice(json.as_bytes()).expect("canonical request decodes");
-    assert_eq!(request.op, "science.cas.canonicalize");
-    assert_eq!(request.budget.steps_u64(), Some(100));
-    assert_eq!(request.args["expr"].identity(), X2_PLUS_1_IDENTITY);
+    assert_eq!(request.op(), "science.cas.canonicalize");
+    assert_eq!(request.budget().steps(), 100);
+    assert_eq!(request.args()["expr"].identity(), X2_PLUS_1_IDENTITY);
     assert_eq!(to_jcs(&request).expect("encodes"), json.as_bytes());
+    assert_eq!(request.to_jcs(), json.as_bytes());
+    // The constructor builds the same request.
+    let built = Request::new(
+        "science.cas.canonicalize",
+        [("expr".to_owned(), table(X2_PLUS_1_CANONICAL))].into(),
+        Budget::new(100),
+    );
+    assert_eq!(built, request);
 }
 
 #[test]
@@ -480,7 +488,7 @@ fn envelope_steps() {
         let request =
             Request::from_canonical_slice(request_json(&format!(r#""{steps}""#)).as_bytes())
                 .expect("steps decode");
-        assert_eq!(request.budget.steps_u64(), Some(expected));
+        assert_eq!(request.budget().steps(), expected);
     }
     for steps in ["18446744073709551616", "-1", "01", "", "+1", "1.5"] {
         assert_eq!(
@@ -497,12 +505,11 @@ fn envelope_steps() {
             path: "/budget/steps".into()
         }
     );
+    assert_eq!(ksci_wire::numeral::parse_u64("007"), None);
+    // A budget holds a u64, so it encodes to the one step numeral of its value.
     assert_eq!(
-        Budget {
-            steps: "007".into()
-        }
-        .steps_u64(),
-        None
+        to_jcs(&Budget::new(u64::MAX)).expect("encodes"),
+        br#"{"steps":"18446744073709551615"}"#
     );
 }
 
@@ -541,24 +548,13 @@ fn envelope_request_rejects_bad_contents() {
     }
 }
 
+/// The exact response for x**2 + 1. Its bytes are pinned by `envelope_response_shape`.
 fn exact_response() -> Response {
-    Response {
-        v: 1,
-        status: Status::Exact,
-        numeric_class: "exact".into(),
-        result: Some(table(X2_PLUS_1_CANONICAL)),
-        identity: Some(X2_PLUS_1_IDENTITY.into()),
-    }
+    Response::exact(&table(X2_PLUS_1_CANONICAL))
 }
 
 fn exhausted_response() -> Response {
-    Response {
-        v: 1,
-        status: Status::FuelExhausted,
-        numeric_class: "exact".into(),
-        result: None,
-        identity: None,
-    }
+    Response::fuel_exhausted()
 }
 
 #[test]
@@ -567,6 +563,16 @@ fn envelope_response_shape() {
         r#"{{"identity":"{X2_PLUS_1_IDENTITY}","numeric_class":"exact","result":{X2_PLUS_1_CANONICAL},"status":"exact","v":1}}"#
     );
     let exhausted = r#"{"identity":null,"numeric_class":"exact","result":null,"status":"fuel_exhausted","v":1}"#;
+    // The accessors read what the constructors built.
+    let response = exact_response();
+    assert_eq!(response.status(), Status::Exact);
+    assert_eq!(response.numeric_class(), "exact");
+    assert_eq!(response.result(), Some(&table(X2_PLUS_1_CANONICAL)));
+    assert_eq!(response.identity(), Some(X2_PLUS_1_IDENTITY));
+    let response = exhausted_response();
+    assert_eq!(response.status(), Status::FuelExhausted);
+    assert_eq!(response.numeric_class(), "exact");
+    assert_eq!((response.result(), response.identity()), (None, None));
     assert_eq!(exact_response().to_jcs(), exact.as_bytes());
     assert_eq!(exhausted_response().to_jcs(), exhausted.as_bytes());
     assert_eq!(Response::from_slice(exact.as_bytes()), Ok(exact_response()));
@@ -596,12 +602,11 @@ fn is_invalid_response(err: &WireError, path: &str) -> bool {
 
 const INT_1: &str = r#"{"nodes":[["Int","1"]],"root":0,"v":1}"#;
 
-/// Review F1: a response must be internally consistent, not merely well-typed.
-#[test]
-fn envelope_response_invariants() {
+/// Invariant-invalid responses, each in canonical form, with the InvalidResponse path each is rejected at, or `None`
+/// for IdentityMismatch.
+fn invalid_responses() -> Vec<(String, Option<&'static str>)> {
     let x2 = format!(r#""{X2_PLUS_1_IDENTITY}""#);
-    let int1_identity = table(INT_1).identity();
-    let int1 = format!(r#""{int1_identity}""#);
+    let int1 = format!(r#""{}""#, table(INT_1).identity());
     let zeros = format!(r#""{}""#, "0".repeat(64));
     // The reviewer's counter-example: a wrong numeric class and an all-zero identity.
     let counter = response_json(&zeros, "approx", INT_1, "exact");
@@ -609,8 +614,7 @@ fn envelope_response_invariants() {
         counter,
         r#"{"identity":"0000000000000000000000000000000000000000000000000000000000000000","numeric_class":"approx","result":{"nodes":[["Int","1"]],"root":0,"v":1},"status":"exact","v":1}"#
     );
-    // Each case names the InvalidResponse path it expects, or None for IdentityMismatch.
-    let cases: Vec<(String, Option<&str>)> = vec![
+    vec![
         (counter, Some("/numeric_class")),
         // numeric_class is "exact" in Phase 1, whatever the status.
         (
@@ -672,8 +676,15 @@ fn envelope_response_invariants() {
             ),
             Some("/result"),
         ),
-    ];
-    for (json, path) in &cases {
+    ]
+}
+
+/// Review F1: a response must be internally consistent, not merely well-typed.
+#[test]
+fn envelope_response_invariants() {
+    let int1_identity = table(INT_1).identity();
+    let int1 = format!(r#""{int1_identity}""#);
+    for (json, path) in &invalid_responses() {
         let err = response_rejected(json);
         let expected = match path {
             Some(path) => is_invalid_response(&err, path),
@@ -684,7 +695,7 @@ fn envelope_response_invariants() {
     // The two valid shapes still decode, and the constructors produce them.
     let ok = response_json(&int1, "exact", INT_1, "exact");
     assert_eq!(
-        Response::from_slice(ok.as_bytes()).map(|r| r.identity),
+        Response::from_slice(ok.as_bytes()).map(|r| r.identity().map(str::to_owned)),
         Ok(Some(int1_identity))
     );
     let dirty = table(
@@ -695,6 +706,139 @@ fn envelope_response_invariants() {
     for response in [Response::exact(&dirty), Response::fuel_exhausted()] {
         assert_eq!(Response::from_slice(&response.to_jcs()), Ok(response));
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Review F3: the invariants hold on every path, not only on the byte decoders. serde's own entry points validate,
+// and the struct-literal and field-assignment bypasses are compile errors (the compile_fail doctests in
+// src/envelope.rs).
+
+/// Decode each case through plain serde_json, which never sees the byte decoders, and list every case that is not
+/// rejected with an error containing its expected text. Collecting, not panicking on the first, shows every bypass.
+fn serde_bypasses<T: serde::de::DeserializeOwned + std::fmt::Debug>(
+    cases: &[(String, String)],
+) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|(json, expected)| match serde_json::from_str::<T>(json) {
+            Ok(value) => Some(format!("{json}\n  accepted as {value:?}")),
+            Err(e) if !e.to_string().contains(expected.as_str()) => {
+                Some(format!("{json}\n  rejected as {e}, expected {expected:?}"))
+            }
+            Err(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn serde_response_validates() {
+    // Every response the byte decoder rejects, serde rejects with the same rule.
+    let mut cases: Vec<(String, String)> = invalid_responses()
+        .into_iter()
+        .map(|(json, path)| {
+            let expected = match path {
+                Some(path) => format!("invalid response at {path}"),
+                None => "is not the result's identity".to_owned(),
+            };
+            (json, expected)
+        })
+        .collect();
+    // The keys are always present: a missing result or identity is not read as null.
+    for json in [
+        r#"{"numeric_class":"exact","result":null,"status":"fuel_exhausted","v":1}"#,
+        r#"{"identity":null,"numeric_class":"exact","status":"fuel_exhausted","v":1}"#,
+    ] {
+        cases.push((json.to_owned(), "missing field".to_owned()));
+    }
+    let bypasses = serde_bypasses::<Response>(&cases);
+    assert!(bypasses.is_empty(), "{}", bypasses.join("\n"));
+    // Valid responses decode to the same value as the byte decoder gives.
+    let exact =
+        String::from_utf8(Response::exact(&table(X2_PLUS_1_CANONICAL)).to_jcs()).expect("utf-8");
+    let exhausted = String::from_utf8(Response::fuel_exhausted().to_jcs()).expect("utf-8");
+    for json in [exact, exhausted] {
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).ok(),
+            Response::from_slice(json.as_bytes()).ok(),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn serde_request_validates() {
+    let canonical = request_json(r#""100""#);
+    let numeral = "bad numeral at /budget/steps".to_owned();
+    let cases = [
+        // A version other than 1.
+        (
+            format!(
+                r#"{}"v":2}}"#,
+                canonical
+                    .strip_suffix(r#""v":1}"#)
+                    .expect("request ends with v")
+            ),
+            "unsupported schema version at /v".to_owned(),
+        ),
+        // Step numerals outside the grammar or above u64.
+        (request_json(r#""007""#), numeral.clone()),
+        (request_json(r#""""#), numeral.clone()),
+        (request_json(r#""18446744073709551616""#), numeral),
+        // A repeated argument name: serde's map would keep the last one.
+        (
+            canonical.replacen(r#"{"expr":"#, &format!(r#"{{"expr":{INT_1},"expr":"#), 1),
+            "duplicate object key at /args/expr".to_owned(),
+        ),
+    ];
+    let bypasses = serde_bypasses::<Request>(&cases);
+    assert!(bypasses.is_empty(), "{}", bypasses.join("\n"));
+    // The serde path cannot see the original bytes, so a valid request in another spelling decodes. Its value is the
+    // canonical request: it encodes, and so hashes, to the canonical bytes.
+    let spaced = canonical.replacen('{', "{ ", 1);
+    let request =
+        serde_json::from_str::<Request>(&spaced).expect("valid request decodes through serde");
+    assert_eq!(to_jcs(&request).expect("encodes"), canonical.as_bytes());
+}
+
+#[test]
+fn serde_record_validates() {
+    let digest = "ab".repeat(32);
+    let record = |request: &str, response: &str, wall_ms: &str| {
+        format!(
+            r#"{{"provenance":{{"backend":"b","device":"d","driver":"r","impl":"i","wall_ms":{wall_ms}}},"request_digest":{request},"response_digest":{response}}}"#
+        )
+    };
+    let quoted = |s: &str| format!(r#""{s}""#);
+    let good = quoted(&digest);
+    let request_digest = "at /request_digest".to_owned();
+    let response_digest = "at /response_digest".to_owned();
+    let wall_ms = "wall_ms".to_owned();
+    let cases = [
+        // A digest is 64 lowercase hex digits.
+        (record(&quoted("xyz"), &good, r#""5""#), request_digest),
+        (
+            record(&good, &quoted(&digest.to_uppercase()), r#""5""#),
+            response_digest.clone(),
+        ),
+        (
+            record(&good, &quoted(&"a".repeat(63)), r#""5""#),
+            response_digest,
+        ),
+        // wall_ms is a decimal numeral string.
+        (record(&good, &good, r#""abc""#), wall_ms.clone()),
+        (record(&good, &good, r#""05""#), wall_ms.clone()),
+        (record(&good, &good, "5"), wall_ms.clone()),
+    ];
+    let mut bypasses = serde_bypasses::<Record>(&cases);
+    bypasses.extend(serde_bypasses::<Provenance>(&[(
+        r#"{"backend":"b","device":"d","driver":"r","impl":"i","wall_ms":"-1"}"#.to_owned(),
+        wall_ms,
+    )]));
+    assert!(bypasses.is_empty(), "{}", bypasses.join("\n"));
+    // A valid record round-trips byte for byte.
+    let json = record(&good, &good, r#""5""#);
+    let decoded = serde_json::from_str::<Record>(&json).expect("valid record decodes");
+    assert_eq!(to_jcs(&decoded).expect("encodes"), json.as_bytes());
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -802,7 +946,7 @@ fn provenance(tag: &str) -> Provenance {
         backend: format!("backend-{tag}"),
         device: format!("device-{tag}"),
         driver: format!("driver-{tag}"),
-        wall_ms: format!("{}", tag.len()),
+        wall_ms: tag.len() as u64,
     }
 }
 
@@ -810,20 +954,27 @@ fn provenance(tag: &str) -> Provenance {
 fn envelope_provenance_outside() {
     let request = request_json(r#""100""#);
     let response = exact_response().to_jcs();
-    let r0 = Record::new(request.as_bytes(), &response, provenance("r0"));
-    let r2 = Record::new(request.as_bytes(), &response, provenance("r2-metal"));
-    assert_ne!(r0.provenance, r2.provenance);
-    assert_eq!(r0.request_digest, r2.request_digest);
-    assert_eq!(r0.response_digest, r2.response_digest);
-    assert_eq!(r0.request_digest, sha256_hex(request.as_bytes()));
-    assert_eq!(r0.response_digest, sha256_hex(&response));
-    // The record itself carries provenance under "impl".
+    // The record is built from the decoded request and response; its digests are those of the bytes as sent.
+    let decoded_request =
+        Request::from_canonical_slice(request.as_bytes()).expect("request decodes");
+    let decoded_response = Response::from_slice(&response).expect("response decodes");
+    let r0 = Record::new(&decoded_request, &decoded_response, provenance("r0"));
+    let r2 = Record::new(&decoded_request, &decoded_response, provenance("r2-metal"));
+    assert_ne!(r0.provenance(), r2.provenance());
+    assert_eq!(r0.request_digest(), r2.request_digest());
+    assert_eq!(r0.response_digest(), r2.response_digest());
+    assert_eq!(r0.request_digest(), sha256_hex(request.as_bytes()));
+    assert_eq!(r0.response_digest(), sha256_hex(&response));
+    // The record itself carries provenance under "impl", and wall_ms as a decimal string.
     let record = String::from_utf8(to_jcs(&r0).expect("encodes")).expect("utf-8");
     assert!(
         record.contains(r#""provenance":{"backend":"backend-r0""#),
         "{record}"
     );
     assert!(record.contains(r#""impl":"ksci-r0""#), "{record}");
+    assert!(record.contains(r#""wall_ms":"2""#), "{record}");
+    // A record reads back through serde to the same value.
+    assert_eq!(serde_json::from_str::<Record>(&record).ok(), Some(r0));
     // A response or request carrying provenance is rejected.
     let with_provenance = String::from_utf8(response).expect("utf-8").replacen(
         r#""numeric_class""#,

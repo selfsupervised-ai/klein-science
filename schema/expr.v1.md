@@ -185,16 +185,22 @@ and a budget-exhausted response is
 {"provenance":{"backend":"...","device":"...","driver":"...","impl":"...","wall_ms":"<decimal>"},"request_digest":"<hex>","response_digest":"<hex>"}
 ```
 
-`request_digest` and `response_digest` are lowercase-hex SHA-256 of the request and response bytes. Every
-provenance field is a string, including `wall_ms`. Two records of the same request and response have the same
-digests whatever their provenance.
+`request_digest` and `response_digest` are lowercase-hex SHA-256 of the request and response bytes: 64 lowercase
+hex digits each, and any other digest is rejected. A record is built only from a request and a response that meet the
+rules above, so it never hashes bytes that break them. Every provenance field is a string, including `wall_ms`, which
+is a decimal numeral (`0|[1-9][0-9]*`, at most `18446744073709551615`). Two records of the same request and
+response have the same digests whatever their provenance.
 
 ### Canonical input
 
-A request is accepted only if its bytes equal their own JCS re-encoding. Any other spelling (whitespace, key order,
-an unnecessary escape, a trailing newline) is rejected as `NonCanonical`, so each request has exactly one byte
-string and one digest. A duplicated key is rejected before this check, as `DuplicateKey`. Responses are read back
-under the same rules, and then checked against the Response rules above.
+A request is accepted only if it meets the Request rules and its bytes equal their own JCS re-encoding. Any other
+spelling (whitespace, key order, an unnecessary escape, a trailing newline) is rejected as `NonCanonical`, so each
+request has exactly one byte string and one digest. Some failures are reported before this check: a duplicated key
+as `DuplicateKey`, and a missing or unknown key as an envelope error. Responses are read back under the same rules and the Response rules above.
+
+Every other way of reading an envelope applies the same rules, except the byte comparison, which needs the original
+bytes. That includes a generic JSON deserialiser such as serde. A value read that way still encodes to its one
+canonical byte string, and that string is what a record hashes.
 
 ### What is hashed
 

@@ -37,8 +37,8 @@ pub fn is_float(man: &str, exp: &str, prec: &str) -> bool {
     is_int(man) && is_int(exp) && is_positive(prec)
 }
 
-/// A step budget: `0|[1-9][0-9]*`, within `u64`.
-pub fn parse_steps(s: &str) -> Option<u64> {
+/// A non-negative decimal numeral `0|[1-9][0-9]*` within `u64`: a step budget, or a wall time.
+pub fn parse_u64(s: &str) -> Option<u64> {
     if s == "0" || is_positive(s) {
         s.parse().ok()
     } else {
