@@ -151,8 +151,13 @@ pub struct PlatformPin {
     /// The reference docker runs: the base image's digest reference, or the local per-platform
     /// tag of a built image (`ksci-oracle-<name>:linux-arm64`).
     pub reference: String,
-    /// The identity `docker image inspect --platform <p>` reports (`sha256:<hex>`).
+    /// The local image ID (`docker image inspect <reference>` `.Id`, `sha256:<hex>`). It is
+    /// content-addressed, and it is what `docker run` executes: never the reference, which is a
+    /// tag a concurrent build can move (review W1). For `base` it is the index digest.
     pub identity: String,
+    /// The platform manifest the identity resolves to on this platform
+    /// (`docker image inspect --platform <p> <identity>`), checked before every run.
+    pub manifest: String,
     /// Whether the platform was pinned under emulation on the pinning host.
     pub emulated: bool,
     /// sha256 of the saved image tar in the artifact store (images built locally).
@@ -234,23 +239,48 @@ fn docker_output(args: &[&str]) -> Res<String> {
         .map_err(|e| format!("docker {}: {e}", args.join(" ")))
 }
 
-/// The identity docker reports for `reference` on `platform`: the platform's manifest digest.
-fn image_identity(reference: &str, platform: &str) -> Res<String> {
-    let id = docker_output(&[
-        "image",
-        "inspect",
-        "--platform",
-        platform,
-        "--format",
-        "{{.Id}}",
-        reference,
-    ])?;
+/// `.Id` from `docker image inspect [--platform <p>] <image>`, which must be `sha256:<hex>`.
+fn inspect_id(image: &str, platform: Option<&str>) -> Res<String> {
+    let mut args = vec!["image", "inspect"];
+    if let Some(p) = platform {
+        args.extend(["--platform", p]);
+    }
+    args.extend(["--format", "{{.Id}}", image]);
+    let id = docker_output(&args)?;
     match id.strip_prefix("sha256:") {
         Some(hex) if store::check_digest(hex).is_ok() => Ok(id),
         _ => Err(format!(
-            "docker reports identity {id:?} for {reference} on {platform}; expected sha256:<hex>"
+            "docker reports {id:?} for {image}; expected sha256:<hex>"
         )),
     }
+}
+
+/// The local image ID of `reference`: the content-addressed identity `docker run` executes.
+fn image_identity(reference: &str) -> Res<String> {
+    inspect_id(reference, None)
+}
+
+/// The platform manifest digest the image `identity` resolves to on `platform`.
+fn platform_manifest(identity: &str, platform: &str) -> Res<String> {
+    inspect_id(identity, Some(platform))
+}
+
+/// Checks that the pinned identity is present locally and resolves to the pinned manifest on
+/// `platform`; the caller then runs exactly `pin.identity`.
+fn verify_pin(name: &str, platform: &str, pin: &PlatformPin) -> Res<()> {
+    let manifest = platform_manifest(&pin.identity, platform).map_err(|e| {
+        format!(
+            "image {name} ({platform}) {} is not available locally ({e}); run: cargo xtask oracle build-image {name} --platform {platform} --from-store",
+            pin.identity
+        )
+    })?;
+    if manifest != pin.manifest {
+        return Err(format!(
+            "image {name} ({platform}) {} resolves to manifest {manifest} locally but is pinned to {}; refusing to run",
+            pin.identity, pin.manifest
+        ));
+    }
+    Ok(())
 }
 
 /// The daemon's native platform (`linux/arm64` on the Mac), for the `emulated` flag.
@@ -319,9 +349,11 @@ fn build_image(name: &str, platforms: &[String]) -> Res<()> {
     for platform in platforms {
         let pin = if name == "base" {
             docker_status(&["pull", "--platform", platform, BASE_REFERENCE])?;
+            let identity = image_identity(BASE_REFERENCE)?;
             PlatformPin {
                 reference: BASE_REFERENCE.to_owned(),
-                identity: image_identity(BASE_REFERENCE, platform)?,
+                manifest: platform_manifest(&identity, platform)?,
+                identity,
                 emulated: *platform != native,
                 tar_sha256: None,
             }
@@ -345,7 +377,10 @@ fn build_image(name: &str, platforms: &[String]) -> Res<()> {
                 context,
             ])?;
             drop(held);
-            let identity = image_identity(&tag, platform)?;
+            // From here on only the content-addressed identity is used, so a concurrent retag
+            // cannot change what is saved or pinned.
+            let identity = image_identity(&tag)?;
+            let manifest = platform_manifest(&identity, platform)?;
             let tar = store::target_dir()?
                 .join("oracle")
                 .join(format!("save-{}.tar", std::process::id()));
@@ -353,19 +388,21 @@ fn build_image(name: &str, platforms: &[String]) -> Res<()> {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("create {}: {e}", parent.display()))?;
             }
-            let saved = docker_status(&["save", "-o", path_str(&tar)?, &tag])
+            let saved = docker_status(&["save", "-o", path_str(&tar)?, &identity])
                 .and_then(|()| store::put(&cache, &tar));
             let _ = fs::remove_file(&tar);
             PlatformPin {
                 reference: tag,
                 identity,
+                manifest,
                 emulated: *platform != native,
                 tar_sha256: Some(saved?),
             }
         };
         println!(
-            "{name} {platform} identity={}{}",
+            "{name} {platform} identity={} manifest={}{}",
             pin.identity,
+            pin.manifest,
             pin.tar_sha256
                 .as_deref()
                 .map(|t| format!(" tar_sha256={t}"))
@@ -392,8 +429,8 @@ fn build_image(name: &str, platforms: &[String]) -> Res<()> {
 }
 
 /// Makes the pinned image available on each platform without building it: pulled by digest
-/// (`base`), or `docker load`ed from its stored tar when absent locally. Either way the local
-/// identity must equal the pin.
+/// (`base`), or `docker load`ed from its stored tar when absent locally. Either way the pinned
+/// identity must then be present and resolve to the pinned manifest ([`verify_pin`]).
 fn obtain_pinned(name: &str, platforms: &[String]) -> Res<()> {
     check_name(name)?;
     let root = workspace::root()?;
@@ -409,7 +446,7 @@ fn obtain_pinned(name: &str, platforms: &[String]) -> Res<()> {
             .platforms
             .get(platform)
             .ok_or_else(|| format!("image {name:?} has no pin for {platform} in {PINS_PATH}"))?;
-        if image_identity(&pin.reference, platform).is_err() {
+        if image_identity(&pin.identity).is_err() {
             match &pin.tar_sha256 {
                 None => docker_status(&["pull", "--platform", platform, &pin.reference])?,
                 Some(hex) => {
@@ -420,14 +457,11 @@ fn obtain_pinned(name: &str, platforms: &[String]) -> Res<()> {
                 }
             }
         }
-        let local = image_identity(&pin.reference, platform)?;
-        if local != pin.identity {
-            return Err(format!(
-                "image {name} ({platform}) is {local} locally but pinned as {}",
-                pin.identity
-            ));
-        }
-        println!("{name} {platform} identity={local} ok");
+        verify_pin(name, platform, pin)?;
+        println!(
+            "{name} {platform} identity={} manifest={} ok",
+            pin.identity, pin.manifest
+        );
     }
     Ok(())
 }
@@ -617,9 +651,10 @@ fn resolve_input(cache: &Cache, spec: &str) -> Res<(PathBuf, String)> {
 /// The outputs of one run: file name to the sha256 of its stored, canonical bytes.
 pub type Outputs = BTreeMap<String, String>;
 
-/// What `docker run` executes for a pinned platform.
+/// What `docker run` executes for a pinned platform: the content-addressed identity that
+/// [`verify_pin`] checked, never the reference (review W1).
 fn run_image(pin: &PlatformPin) -> &str {
-    &pin.reference
+    &pin.identity
 }
 
 /// Runs `args.script` in the pinned image; on success, canonicalises and stores every output.
@@ -640,13 +675,7 @@ pub fn run_script(args: &RunArgs) -> Res<(ExitCode, Outputs)> {
             args.image, args.platform
         )
     })?;
-    let local = image_identity(&pinned.reference, &args.platform)?;
-    if local != pinned.identity {
-        return Err(format!(
-            "image {} ({}) is {local} locally but pinned as {}; refusing to run",
-            args.image, args.platform, pinned.identity
-        ));
-    }
+    verify_pin(&args.image, &args.platform, pinned)?;
 
     let script = container_script(&args.script, args.mount_standin)?;
     if !root.join(&args.script).is_file() {
@@ -948,6 +977,7 @@ mod tests {
         let pin = PlatformPin {
             reference: built_tag("sympy", "linux/arm64"),
             identity: format!("sha256:{}", "a".repeat(64)),
+            manifest: format!("sha256:{}", "d".repeat(64)),
             emulated: false,
             tar_sha256: None,
         };
@@ -1001,6 +1031,7 @@ mod tests {
             PlatformPin {
                 reference: built_tag("sympy", "linux/arm64"),
                 identity: format!("sha256:{}", "a".repeat(64)),
+                manifest: format!("sha256:{}", "d".repeat(64)),
                 emulated: false,
                 tar_sha256: Some("b".repeat(64)),
             },
