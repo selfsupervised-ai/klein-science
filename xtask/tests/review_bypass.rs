@@ -654,7 +654,8 @@ fn provenance_repo(name: &str) -> PathBuf {
     let repo = klein_repo(name);
     fs::write(
         repo.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\", \"xtask\"]\n",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\", \"xtask\"]\n\n\
+         [workspace.metadata.ksci]\nr0-crates = [\"k\"]\n",
     )
     .unwrap();
     fs::write(repo.join("NOTICE"), "klein-science\n").unwrap();
@@ -728,6 +729,101 @@ fn assert_violation(out: &Output, path: &str, reason: &str) {
 
 const NO_HEADER: &str = "no provenance header";
 const WITNESS: &str = "review-fixture/witness.rs";
+
+/// The check failed, and printed a violation line that `matches` accepts.
+fn assert_violation_where(out: &Output, what: &str, matches: impl Fn(&str) -> bool) {
+    let shown = text(out);
+    assert!(!out.status.success(), "check provenance passed:\n{shown}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).lines().any(matches),
+        "check provenance did not report {what}:\n{shown}"
+    );
+}
+
+#[test]
+fn provenance_judges_files_in_its_own_target_dir() {
+    // Review C1: nothing under target/provenance is exempt merely for being there.
+    let repo = provenance_repo("prov-target-file");
+    let dir = repo.join("target/provenance");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("unchecked.rs"), "pub fn unchecked() {}\n").unwrap();
+    add_to_lib(
+        &repo,
+        "include!(\"../../../target/provenance/unchecked.rs\");",
+    );
+    assert_violation(
+        &provenance(&repo),
+        "target/provenance/unchecked.rs",
+        NO_HEADER,
+    );
+}
+
+#[test]
+fn provenance_judges_workspace_build_script_output() {
+    // Review C1: a headed build script does not vouch for the bytes it generates.
+    let repo = provenance_repo("prov-out-dir");
+    fs::write(
+        repo.join("crates/k/build.rs"),
+        "// provenance: original\nfn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    \
+         std::fs::write(format!(\"{out}/gen.rs\"), \"pub fn generated() {}\\n\").unwrap();\n}\n",
+    )
+    .unwrap();
+    add_to_lib(&repo, "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));");
+    assert_violation_where(&provenance(&repo), "the generated gen.rs", |l| {
+        l.starts_with("target/provenance/") && l.contains("/out/gen.rs: ") && l.contains(NO_HEADER)
+    });
+}
+
+#[test]
+fn provenance_testdata_rule_needs_a_testdata_directory() {
+    // Review W5: a file named `testdata` is not under a testdata/ directory.
+    let repo = provenance_repo("prov-testdata-file");
+    fs::write(repo.join("crates/k/src/testdata"), "x\n").unwrap();
+    add_to_lib(&repo, "pub const T: &[u8] = include_bytes!(\"testdata\");");
+    assert_violation(
+        &provenance(&repo),
+        "crates/k/src/testdata",
+        "outside testdata/",
+    );
+}
+
+#[test]
+fn provenance_judges_the_wasm_build() {
+    // Operator decision 2026-10-11: a module only the R0 (wasm32-wasip2) build reads is judged.
+    let repo = provenance_repo("prov-wasm-cfg");
+    fs::write(
+        repo.join("crates/k/src/wasm_only.rs"),
+        "pub fn wasm_only() {}\n",
+    )
+    .unwrap();
+    add_to_lib(
+        &repo,
+        "#[cfg(target_arch = \"wasm32\")]\n#[path = \"wasm_only.rs\"]\npub mod wasm_only;",
+    );
+    assert_violation(&provenance(&repo), "crates/k/src/wasm_only.rs", NO_HEADER);
+}
+
+#[test]
+fn provenance_requires_declared_r0_crates() {
+    // The R0 crate set is one declared list; without it the wasm build cannot be judged.
+    let repo = provenance_repo("prov-no-r0");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\", \"xtask\"]\n",
+    )
+    .unwrap();
+    let out = provenance(&repo);
+    assert!(
+        !out.status.success(),
+        "check provenance passed:\n{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("r0-crates"),
+        "no clear r0-crates error:\n{}",
+        text(&out)
+    );
+}
 
 #[test]
 fn provenance_passes_a_clean_workspace() {

@@ -164,9 +164,84 @@ fn split_words(line: &str) -> Vec<String> {
     words
 }
 
+/// Checks that one artifact's dep-info inputs (as written, relative to `root`) include the
+/// artifact's own target source `src` (cargo's `src_path`). (RED stub: accepts anything.)
+pub fn require_source(_dep: &Path, _inputs: &[PathBuf], _root: &Path, _src: &Path) -> Res<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rejects(text: &str) {
+        assert!(
+            parse_dep_info(text).is_err(),
+            "accepted {text:?}: {:?}",
+            parse_dep_info(text)
+        );
+    }
+
+    #[test]
+    fn depinfo_rejects_multi_target_rule() {
+        rejects("a b: c\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_second_colon_word() {
+        rejects("a: b: c\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_continuation_backslash() {
+        rejects("a: b \\\nc:\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_unknown_escape() {
+        rejects("a: b\\#c\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_escaped_backslash() {
+        rejects("a: b\\\\c\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_recipe_line() {
+        rejects("a: b\n\tcmd\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_tab_separator() {
+        rejects("a: b\tc\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_line_without_rule() {
+        rejects("no rule here\n");
+    }
+
+    #[test]
+    fn depinfo_rejects_empty_target() {
+        rejects(": b\n");
+    }
+
+    #[test]
+    fn depinfo_requires_the_artifact_source() {
+        let dir = std::env::temp_dir().join(format!("ksci-xtask-depsrc-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "").unwrap();
+        fs::write(dir.join("src/other.rs"), "").unwrap();
+        let src = dir.join("src/lib.rs");
+        let dep = Path::new("k-1.d");
+        assert!(require_source(dep, &[PathBuf::from("src/lib.rs")], &dir, &src).is_ok());
+        assert!(require_source(dep, &[src.clone()], &dir, &src).is_ok());
+        // An empty (or comment-only, or phony-only) dep-info lists nothing.
+        assert!(require_source(dep, &[], &dir, &src).is_err());
+        assert!(require_source(dep, &[PathBuf::from("src/other.rs")], &dir, &src).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn depinfo_parses_rules_comments_and_escaped_spaces() {
