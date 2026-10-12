@@ -68,6 +68,15 @@ pub const VENV_PYTHON: &str = "3.13.16";
 /// approved by the operator on 2026-10-12 (plan 01-08, Task 2). Never shipped.
 pub const DEV_LOCK: &str = "conformance/python/dev.lock";
 
+/// The dev venv's directory, relative to the checkout root.
+const VENV_DIR: &str = ".venv";
+
+/// The dev venv's interpreter, `.venv/bin/python` under the checkout `root`: the one definition
+/// of that path. `tools venv` creates and syncs it; `ci` and `oracle standin` run it.
+pub fn venv_python_path(root: &Path) -> PathBuf {
+    root.join(VENV_DIR).join("bin").join("python")
+}
+
 /// Runs one `tools` command.
 pub fn run(cmd: ToolsCmd) -> Res<ExitCode> {
     match cmd {
@@ -860,11 +869,16 @@ fn venv() -> Res<ExitCode> {
             Err(format!("uv {} failed: {status}", args.join(" ")))
         }
     };
-    let venv = root.join(".venv");
-    if fs::symlink_metadata(&venv).is_err() {
-        run_uv(&["venv", "--managed-python", "--python", VENV_PYTHON, ".venv"])?;
+    if fs::symlink_metadata(root.join(VENV_DIR)).is_err() {
+        run_uv(&[
+            "venv",
+            "--managed-python",
+            "--python",
+            VENV_PYTHON,
+            VENV_DIR,
+        ])?;
     }
-    let python = venv.join("bin").join("python");
+    let python = venv_python_path(&root);
     let out = Command::new(&python)
         .arg("--version")
         .output()
@@ -876,13 +890,18 @@ fn venv() -> Res<ExitCode> {
             python.display()
         ));
     }
+    // uv runs from the checkout root, so it gets the same interpreter path relative to it.
+    let relative = venv_python_path(Path::new(""));
+    let relative = relative
+        .to_str()
+        .ok_or("the dev venv interpreter path is not UTF-8")?;
     run_uv(&[
         "pip",
         "sync",
         "--require-hashes",
         "--no-build",
         "--python",
-        ".venv/bin/python",
+        relative,
         DEV_LOCK,
     ])?;
     println!("{reported} at {}, synced to {DEV_LOCK}", python.display());
@@ -1078,5 +1097,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn venv_python_path_is_dot_venv_bin_python() {
+        assert_eq!(
+            venv_python_path(Path::new("/checkout")),
+            Path::new("/checkout/.venv/bin/python")
+        );
+        // `tools venv` hands uv this relative form; it must stay the path uv always got.
+        assert_eq!(
+            venv_python_path(Path::new("")).to_str(),
+            Some(".venv/bin/python")
+        );
     }
 }

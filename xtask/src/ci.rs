@@ -125,7 +125,7 @@ pub const STEPS: &[Step] = &[
 pub fn run() -> Res<ExitCode> {
     let root = workspace::root()?;
     let cargo = host::cargo()?;
-    let python = root.join(".venv").join("bin").join("python");
+    let python = host::venv_python_path(&root);
     let worker = release::shipped_worker(&root)?;
     println!("ci: cargo is {}", cargo.path.display());
     let _held = heavy_job()?;

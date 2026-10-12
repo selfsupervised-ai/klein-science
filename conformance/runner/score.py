@@ -17,13 +17,18 @@ message. ImportError messages embed the module file path ("... from 'sympy' (/pa
 one trailing parenthesised group is removed from both sides first (normalise_import_message); every other message is
 compared verbatim.
 
+`level1_message_equal` is a stricter count beside the three levels, which it does not change: level 1 and, for a
+golden error case, `error_message_equal`. For every other case it equals level 1. It keeps a candidate that raises
+the golden's exception type with other text (for example the stand-in's unavailable-name NotImplementedError against
+SymPy's own) from counting as a match.
+
 No case is dropped. A golden case with no candidate record fails all three levels and counts in `missing`. Excluded
 case_ids (the golden manifest's adjudication list) are not scored and count in `excluded`. A candidate record for a
 case that is neither golden nor excluded is not scored and counts in `extra`.
 
-Outputs: the aggregate (counts, and each level's share of the scored cases as a string with one decimal) encoded with
-the stand-in's JCS mirror `sympy._wire.dumps`, the one Python encoder; and per-case results as JSON Lines in case_id
-order, each line JCS. Neither output holds stdout, messages or code. The input order never changes the bytes.
+Outputs: the aggregate (counts, and the share of the scored cases for each level and for level1_message_equal, as a
+string with one decimal) encoded with the stand-in's JCS mirror `sympy._wire.dumps`, the one Python encoder; and
+per-case results as JSON Lines in case_id order, each line JCS. Neither output holds stdout, messages or code. The input order never changes the bytes.
 
 Standard library plus the stand-in mirror. Run with PYTHONPATH=standin:conformance:
   python conformance/runner/score.py --golden G --candidate C [--exclude FILE] --out AGG --cases-out CASES
@@ -70,6 +75,7 @@ def score_case(golden, candidate):
             "level2": False,
             "level3": False,
             "error_message_equal": False if error else None,
+            "level1_message_equal": False,
         }
     level3 = golden["status"] == candidate["status"] and (
         not error or golden["exception"]["type"] == candidate["exception"]["type"]
@@ -80,11 +86,13 @@ def score_case(golden, candidate):
         and golden["stdout"] == candidate["stdout"]
         and golden["stdout_truncated"] == candidate["stdout_truncated"]
     )
+    message_equal = (level3 and _message(golden) == _message(candidate)) if error else None
     return {
         "level1": level1,
         "level2": level2,
         "level3": level3,
-        "error_message_equal": (level3 and _message(golden) == _message(candidate)) if error else None,
+        "error_message_equal": message_equal,
+        "level1_message_equal": level1 and message_equal is not False,
     }
 
 
@@ -137,7 +145,7 @@ def score(golden, candidate, exclude=()):
     candidate = _by_case(candidate, "candidate")
     excluded = set(exclude)
     cases = []
-    counts = {"level1": 0, "level2": 0, "level3": 0}
+    counts = {"level1": 0, "level2": 0, "level3": 0, "level1_message_equal": 0}
     error_cases = 0
     error_message_equal = 0
     missing = 0
@@ -208,6 +216,7 @@ def main(argv=None):
     print(
         "score: scored={scored} excluded={excluded} missing={missing} extra={extra} "
         "level1={level1_percent}% level2={level2_percent}% level3={level3_percent}% "
+        "level1_message_equal={level1_message_equal_percent}% "
         "error_message_equal={error_message_equal}/{error_cases}".format(**aggregate)
     )
     return 0
