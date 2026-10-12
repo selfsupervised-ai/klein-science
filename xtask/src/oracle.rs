@@ -1615,7 +1615,9 @@ fn verify_golden(path: &Path) -> Res<()> {
 
 /// Where stand-in score files live, relative to the checkout.
 pub const SCORES_DIR: &str = "conformance/golden/scores";
-/// The schema tag of a stand-in score file.
+/// The schema tag of a stand-in score file: the scorer's aggregate (its keys, including the three
+/// levels and the stricter `level1_message_equal`, are documented in [`SCORER`]) plus the digests,
+/// label and parameters `oracle standin` adds beside them.
 pub const STANDIN_SCHEMA: &str = "ksci.standin-score.v1";
 /// The three-level scorer, relative to the checkout.
 pub const SCORER: &str = "conformance/runner/score.py";
@@ -1884,7 +1886,7 @@ fn standin(args: &StandinArgs) -> Res<()> {
         None => String::new(),
     };
     println!(
-        "standin {} ({}): scored={} excluded={} missing={} level1={}% level2={}% level3={}% error_message_equal={}/{} lint={lint}",
+        "standin {} ({}): scored={} excluded={} missing={} level1={}% level2={}% level3={}% level1_message_equal={}% error_message_equal={}/{} lint={lint}",
         args.name,
         STANDIN_LABEL,
         field("scored"),
@@ -1893,6 +1895,7 @@ fn standin(args: &StandinArgs) -> Res<()> {
         field("level1_percent"),
         field("level2_percent"),
         field("level3_percent"),
+        field("level1_message_equal_percent"),
         field("error_message_equal"),
         field("error_cases"),
     );

@@ -155,6 +155,53 @@ class ImportMessage(unittest.TestCase):
         self.assertFalse(score.score_case(g, c)["error_message_equal"])
 
 
+class Level1MessageEqual(unittest.TestCase):
+    """The stricter count: level 1 and, for a golden error case, equal error text."""
+
+    def test_same_type_different_text_passes_level1_not_strict(self):
+        # The coincidence 01-13 found: both sides raise NotImplementedError, with different text.
+        g = rec("a", "error", exc_type="NotImplementedError", message="solving Abs(x) is not supported")
+        c = rec("a", "error", exc_type="NotImplementedError",
+                message="sympy.symbols is not available in the klein-science stand-in")
+        result = score.score_case(g, c)
+        self.assertEqual((result["level1"], result["level2"], result["level3"]), (True, True, True))
+        self.assertFalse(result["level1_message_equal"])
+
+    def test_equal_text_after_import_path_normalisation_passes(self):
+        g = rec("a", "error", exc_type="ImportError",
+                message="cannot import name 'binom' from 'sympy' (/usr/lib/sympy/__init__.py)")
+        c = rec("a", "error", exc_type="ImportError",
+                message="cannot import name 'binom' from 'sympy' (/opt/ksci/standin/sympy/__init__.py)")
+        self.assertTrue(score.score_case(g, c)["level1_message_equal"])
+
+    def test_non_error_cases_follow_level1(self):
+        self.assertTrue(score.score_case(rec("a", stdout="1\n"), rec("a", stdout="1\n"))["level1_message_equal"])
+        self.assertFalse(score.score_case(rec("a", stdout="1\n"), rec("a", stdout="1"))["level1_message_equal"])
+        self.assertTrue(score.score_case(rec("a", "timeout"), rec("a", "timeout"))["level1_message_equal"])
+        # Equal text never rescues a level-1 failure.
+        g = rec("a", "error", "x\n", "ValueError", "bad")
+        self.assertFalse(score.score_case(g, rec("a", "error", "y\n", "ValueError", "bad"))["level1_message_equal"])
+        self.assertFalse(score.score_case(g, None)["level1_message_equal"])
+
+    def test_aggregate_counts_level1_message_equal(self):
+        golden = [
+            rec("a", stdout="1\n"),
+            rec("b", "error", exc_type="NotImplementedError", message="sympy's own text"),
+            rec("c", "error", exc_type="AttributeError", message="same"),
+            rec("d", stdout="4\n"),
+        ]
+        candidate = [
+            rec("a", stdout="1\n"),
+            rec("b", "error", exc_type="NotImplementedError", message="stand-in text"),
+            rec("c", "error", exc_type="AttributeError", message="same"),
+        ]
+        aggregate, cases = score.score(golden, candidate)
+        self.assertEqual(aggregate["level1"], 3)
+        self.assertEqual(aggregate["level1_message_equal"], 2)
+        self.assertEqual(aggregate["level1_message_equal_percent"], "50.0")
+        self.assertEqual([c["level1_message_equal"] for c in cases], [True, False, True, False])
+
+
 class Command(unittest.TestCase):
     def test_cli_writes_jcs_aggregate_and_sorted_cases(self):
         with tempfile.TemporaryDirectory() as d:
