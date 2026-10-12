@@ -1672,7 +1672,7 @@ fn merge_score(aggregate: Value, fields: serde_json::Map<String, Value>) -> Res<
 /// Runs the dev venv's Python with `args` from the checkout root, with PYTHONPATH set to the
 /// checkout directories `pythonpath`; returns its exit code (None when killed by a signal).
 fn venv_python(root: &Path, pythonpath: &[&str], args: &[&OsStr]) -> Res<Option<i32>> {
-    let python = root.join(".venv").join("bin").join("python");
+    let python = host::venv_python_path(root);
     if !python.is_file() {
         return Err(format!(
             "{} is missing; run: cargo xtask tools venv",
