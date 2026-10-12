@@ -285,8 +285,40 @@ None.
 
 - Every later TIR gate (60 %, 90 %, 97 %) can be measured with `cargo xtask oracle standin` against `tir-slice-v1.golden.json`, compared with this proxy baseline.
 - Open for the operator:
-  - the placeholder exception-type question above;
+  - the placeholder exception-type question above (resolved in the Follow-up below);
   - pushing the golden, run, record and per-case blobs to the remote store (D-05).
+
+## Follow-up (2026-10-12, after the plan)
+
+The placeholder exception-type question was resolved under the operator's standing instruction (the recommended option after root-cause analysis).
+
+- **The finding.** 24 of the 134 level-1 passes are coincidences, and so are 25 of the 135 level-3 passes:
+  - 23 golden cases raise SymPy's own `NotImplementedError` and meet a placeholder's `NotImplementedError`. 22 of them pass all three levels; 1 passes level 3 only, because SymPy printed 8 bytes before raising. That case is the gap between level 3 (135) and level 1 (134).
+  - 2 golden cases raise TypeError, and the stand-in raises TypeError too, with other text.
+- **Why the subclass option (b) is ruled out.** A distinct `NotImplementedError` subclass cannot be written in guest code. Lint R1 mirrors a real Monty limit. Checked with pydantic-monty 1.1.0 from the dev venv:
+  - `class StandinNotImplementedError(NotImplementedError): pass` is rejected at parse time: "The monty syntax parser does not yet support class inheritance and metaclasses".
+  - `type('StandinNotImplementedError', (NotImplementedError,), {})` passes the lint, but at run time Monty gives "TypeError: type() bases are not supported". It would also be a way around R1.
+  - A plain class with no bases cannot be raised: Monty turns `raise C()` into a TypeError.
+  - CPython 3.13 has no built-in subclass of `NotImplementedError` (`__subclasses__()` is `[]`), so no built-in type is both distinct by name and caught by `except NotImplementedError`.
+- **How the 2 TypeError cases arise.** They are caused by the placeholders, but not by the placeholder's own raise. Values such as `sp.pi`, `sp.true` and `sp.false` are bound as plain functions, so Python's operator dispatch raises before any placeholder runs:
+  - `2 * sp.pi` gives "unsupported operand type(s) for *: 'int' and 'function'", where SymPy raises "cannot determine truth value of Relational: …";
+  - `sp.false | sp.true` gives "… for |: 'function' and 'function'", where SymPy raises "BooleanAtom not allowed in this context."
+  - So even a subclass would have left these two.
+- **What was done instead (option (a)).** `conformance/runner/score.py` adds one stricter count, `level1_message_equal` (with `level1_message_equal_percent`).
+  - It is level 1 and, for a golden error case, equal error text, compared through the existing ImportError path normaliser. For every other case it equals level 1.
+  - The three CONF-03 levels and their definitions are unchanged.
+  - The tests in `test_score.py` were seen RED: 4 errors (KeyError) before the scorer change.
+  - Commit `99f1124`.
+- **The new figures.** The M0 scores were regenerated with the same candidate records: run.json `eebc5543…` and records `880e0b0a…` are unchanged, and only the scorer blob and the per-case blob are new.
+
+  | Score file | level 1 | level 2 | level 3 | level1_message_equal |
+  |---|---|---|---|---|
+  | `tir-slice-v1.m0-standin.json` | 134 (13.5 %) | 134 (13.5 %) | 135 (13.6 %) | **110 (11.0 %)** |
+  | `imports-v1.m0-standin.json` | 9 (100.0 %) | 9 (100.0 %) | 9 (100.0 %) | **9 (100.0 %)** |
+
+  The 24 cases the strict count drops are exactly the 22 NotImplementedError and the 2 TypeError coincidences. No case passes the strict count without passing level 1.
+- **Open item.** Monty: subclassing built-in exceptions. This is a request candidate for 01-18's Klein-core request drafts, and it is not filed yet. If Monty gains it, the placeholders can get their own type and R1 can be relaxed explicitly for that case.
+- **Also done after the plan.** `host::venv_python_path` is now the one definition of the dev venv's interpreter path (commit `e41ef31`). That closes the "Python venv path in three places" issue above.
 
 ---
 *Phase: 01-contracts-oracles-and-risk-probes*
