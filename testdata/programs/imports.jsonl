@@ -1,0 +1,9 @@
+{"case_id": "8d40a79e03529204f62b80e5c7c008108679480253ed92aa324614822266ba2a", "code": "import sympy\nprint(\"ok\")\n"}
+{"case_id": "325907fb57f4863dba5034c2f4e1077c5cd1ca9b5b195d835c764ba25206528a", "code": "import sympy as sp\nprint(\"ok\")\n"}
+{"case_id": "c7aef18e9579338206951b43835e2fb3170a51866b91543a9e763cff27a3ece6", "code": "from sympy import symbols\nprint(\"ok\")\n"}
+{"case_id": "35b4a2fbaf1f7a6e3eddcf05e064a9f3459e19d2a3c571e43c08a140fb76987c", "code": "from sympy import *\nprint(\"ok\")\n"}
+{"case_id": "3215139020baa9e766f5560cc9636e43ae5289f5045dd4fdcebe4139e66a5e6a", "code": "from sympy.abc import x\nprint(\"ok\")\n"}
+{"case_id": "f914d4e100743f65aeefbcbce937b1d9cd4ce659861c79d595db19aec6dd2881", "code": "from sympy import binom\n"}
+{"case_id": "babf5ea3e2d32610b7bda6b2a00225749a57312318f1a6231ccb222e498e70ef", "code": "from sympy.abc import nonexistent_name\n"}
+{"case_id": "5a8751de1bb54875f952eb8ae8555de610b1e9efc88551e8efcbc07c93189cdb", "code": "import sympy\nsympy.not_a_name\n"}
+{"case_id": "dda300d6eaa0cffc2dc374170b349f8d167886bc4db0cec284dc76d29b196efe", "code": "import sympy\nprint(len(sympy.__all__))\n"}
