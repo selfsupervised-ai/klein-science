@@ -21,12 +21,17 @@
 //! is byte-identical in every run; every other case is listed for adjudication with a reason.
 //! The golden records live in the store by digest. Git holds only the manifest
 //! ([`GoldenManifest`]), which `oracle golden --verify` re-derives from the stored run blobs.
+//!
+//! The stand-in baseline (CONF-03, GUEST-02) is produced by `oracle standin`: the same
+//! [`run_script`] and run_programs.py run the stand-in on a verified manifest's programs, the
+//! three-level scorer ([`SCORER`]) compares its records with the goldens, and git holds only the
+//! aggregate and its digests, labelled [`STANDIN_LABEL`].
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::{ExitCode, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -76,6 +81,30 @@ pub enum OracleCmd {
     /// store the cases whose records agree in every run as goldens, and write
     /// conformance/golden/<name>.golden.json; or, with --verify, re-derive a manifest.
     Golden(GoldenArgs),
+    /// Run the stand-in on a golden manifest's programs (the base image, standin/ mounted
+    /// read-only, the host_shim prelude, seed 0), score the records against the goldens on three
+    /// levels, and write conformance/golden/scores/<name>.m0-standin.json (labelled proxy).
+    Standin(StandinArgs),
+}
+
+/// `cargo xtask oracle standin ...`
+#[derive(Args)]
+pub struct StandinArgs {
+    /// The golden manifest whose programs are run and whose goldens are the reference.
+    #[arg(long)]
+    pub golden_manifest: PathBuf,
+    /// Score file stem ([a-z0-9-]+): writes conformance/golden/scores/<name>.m0-standin.json.
+    #[arg(long)]
+    pub name: String,
+    /// Platform to run (the base image must be pinned for it).
+    #[arg(long, default_value = "linux/arm64")]
+    pub platform: String,
+    /// Worker count requested inside the container (default: the manifest's).
+    #[arg(long)]
+    pub jobs: Option<u32>,
+    /// CPU limit per case in seconds (default: the manifest's).
+    #[arg(long)]
+    pub cpu_seconds: Option<u32>,
 }
 
 /// `cargo xtask oracle golden ...`
@@ -167,6 +196,7 @@ pub fn run(cmd: OracleCmd) -> Res<ExitCode> {
             None => golden(&args),
         }
         .map(|()| ExitCode::SUCCESS),
+        OracleCmd::Standin(args) => standin(&args).map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -1249,36 +1279,45 @@ fn check_run_report(
     input_sha256: &str,
     report: &Value,
 ) -> Res<()> {
-    let expect = |pointer: &str, expected: Value| -> Res<()> {
+    check_report(
+        &format!(
+            "run.json sha256:{} of {} seed {} run {}",
+            run.run_sha256, run.platform, run.seed, run.run
+        ),
+        report,
+        &[
+            ("/python_hash_seed", run.seed.to_string().into()),
+            ("/machine", machine(&run.platform)?.into()),
+            ("/limits/cpu_seconds", params.cpu_seconds.into()),
+            ("/limits/mem_bytes", params.mem_bytes.into()),
+            ("/pids/jobs_requested", params.jobs.into()),
+            ("/sympy/ground_types", "python".into()),
+            ("/sympy/mpmath_backend", "python".into()),
+            ("/inputs/0/sha256", input_sha256.into()),
+        ],
+    )
+}
+
+/// Requires every `(pointer, value)` of `expected` in a run_programs.py run.json, and exactly
+/// one input. `what` names the report in errors.
+fn check_report(what: &str, report: &Value, expected: &[(&str, Value)]) -> Res<()> {
+    for (pointer, value) in expected {
         match report.pointer(pointer) {
-            Some(found) if *found == expected => Ok(()),
-            found => Err(format!(
-                "run.json sha256:{} of {} seed {} run {}: {pointer} is {}, expected {expected}",
-                run.run_sha256,
-                run.platform,
-                run.seed,
-                run.run,
-                found.map_or_else(|| "absent".to_owned(), Value::to_string)
-            )),
+            Some(found) if found == value => {}
+            found => {
+                return Err(format!(
+                    "{what}: {pointer} is {}, expected {value}",
+                    found.map_or_else(|| "absent".to_owned(), Value::to_string)
+                ));
+            }
         }
-    };
-    expect("/python_hash_seed", run.seed.to_string().into())?;
-    expect("/machine", machine(&run.platform)?.into())?;
-    expect("/limits/cpu_seconds", params.cpu_seconds.into())?;
-    expect("/limits/mem_bytes", params.mem_bytes.into())?;
-    expect("/pids/jobs_requested", params.jobs.into())?;
-    expect("/sympy/ground_types", "python".into())?;
-    expect("/sympy/mpmath_backend", "python".into())?;
-    expect("/inputs/0/sha256", input_sha256.into())?;
+    }
     let inputs = report
         .pointer("/inputs")
         .and_then(Value::as_array)
         .map(Vec::len);
     if inputs != Some(1) {
-        return Err(format!(
-            "run.json sha256:{}: {inputs:?} inputs, expected exactly one",
-            run.run_sha256
-        ));
+        return Err(format!("{what}: {inputs:?} inputs, expected exactly one"));
     }
     Ok(())
 }
@@ -1570,6 +1609,323 @@ fn verify_golden(path: &Path) -> Res<()> {
         derived.runs.len()
     );
     Ok(())
+}
+
+// The stand-in baseline (CONF-03, GUEST-02).
+
+/// Where stand-in score files live, relative to the checkout.
+pub const SCORES_DIR: &str = "conformance/golden/scores";
+/// The schema tag of a stand-in score file.
+pub const STANDIN_SCHEMA: &str = "ksci.standin-score.v1";
+/// The three-level scorer, relative to the checkout.
+pub const SCORER: &str = "conformance/runner/score.py";
+/// What every stand-in score is until Klein runs the guest under Monty (klein-rs D4).
+pub const STANDIN_LABEL: &str = "proxy: CPython host_shim until klein-rs D4";
+/// The image the stand-in runs in: the pinned base image, which has no SymPy.
+const STANDIN_IMAGE: &str = "base";
+/// The prelude that installs the CPython tool transport. No KSCI_WORKER reaches the container,
+/// so the installed transport refuses every tool call.
+const STANDIN_PRELUDE: &str = "host_shim";
+/// The hash seed of a stand-in run (the production value).
+const STANDIN_SEED: u32 = 0;
+
+/// The trimmed UTF-8 stdout of the pinned `git -C <root> <args>`.
+fn git_text(root: &Path, args: &[&str]) -> Res<String> {
+    let out = host::git_output(root, args)?;
+    String::from_utf8(out)
+        .map(|s| s.trim().to_owned())
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))
+}
+
+/// `git status --porcelain` of standin/, untracked files included: empty when the mounted tree
+/// is the committed tree the score names.
+fn standin_changes(root: &Path) -> Res<String> {
+    git_text(
+        root,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "standin",
+        ],
+    )
+}
+
+/// The score file: the scorer's aggregate (it owns those keys) with `fields` added. A field the
+/// aggregate already has is an error, never an overwrite.
+fn merge_score(aggregate: Value, fields: serde_json::Map<String, Value>) -> Res<Value> {
+    let Value::Object(mut score) = aggregate else {
+        return Err("the scorer's aggregate is not a JSON object".to_owned());
+    };
+    for (key, value) in fields {
+        if score.contains_key(&key) {
+            return Err(format!(
+                "the scorer's aggregate already has the key {key:?}"
+            ));
+        }
+        score.insert(key, value);
+    }
+    Ok(Value::Object(score))
+}
+
+/// Runs the dev venv's Python with `args` from the checkout root, with PYTHONPATH set to the
+/// checkout directories `pythonpath`; returns its exit code (None when killed by a signal).
+fn venv_python(root: &Path, pythonpath: &[&str], args: &[&OsStr]) -> Res<Option<i32>> {
+    let python = root.join(".venv").join("bin").join("python");
+    if !python.is_file() {
+        return Err(format!(
+            "{} is missing; run: cargo xtask tools venv",
+            python.display()
+        ));
+    }
+    let paths: Vec<PathBuf> = pythonpath.iter().map(|p| root.join(p)).collect();
+    let pythonpath =
+        std::env::join_paths(&paths).map_err(|e| format!("PYTHONPATH {paths:?}: {e}"))?;
+    let status = Command::new(&python)
+        .args(args)
+        .env("PYTHONPATH", pythonpath)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|e| format!("run {}: {e}", python.display()))?;
+    Ok(status.code())
+}
+
+/// `oracle standin`: runs the stand-in on the programs of a verified golden manifest through
+/// [`run_script`] (base image, standin/ read-only, host_shim prelude, seed 0, the manifest's
+/// memory limit), scores the records with [`SCORER`], stores the per-case results, runs the
+/// Monty-subset lint, and writes the aggregate with its digests to
+/// `conformance/golden/scores/<name>.m0-standin.json`, labelled [`STANDIN_LABEL`]. Only the
+/// aggregate and digests go in git; records and per-case results stay in the store.
+fn standin(args: &StandinArgs) -> Res<()> {
+    check_name("score name", &args.name)?;
+    check_platform(&args.platform)?;
+    let root = workspace::root()?;
+    // The score names the stand-in by its committed tree, so the mounted tree must be that tree.
+    let changes = standin_changes(&root)?;
+    if !changes.is_empty() {
+        return Err(format!(
+            "standin/ differs from HEAD, so the score could not name it; commit it first:\n{changes}"
+        ));
+    }
+    let standin_tree = git_text(&root, &["rev-parse", "HEAD:standin"])?;
+    let run_programs_blob = git_text(&root, &["hash-object", "--", RUN_PROGRAMS])?;
+    let scorer_blob = git_text(&root, &["hash-object", "--", SCORER])?;
+
+    // The reference: a manifest that re-derives byte for byte from its stored runs.
+    verify_golden(&args.golden_manifest)?;
+    let manifest_bytes = fs::read(&args.golden_manifest)
+        .map_err(|e| format!("read {}: {e}", args.golden_manifest.display()))?;
+    let manifest: GoldenManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("{}: {e}", args.golden_manifest.display()))?;
+    let cpu_seconds = args.cpu_seconds.unwrap_or(manifest.params.cpu_seconds);
+    let jobs = args.jobs.unwrap_or(manifest.params.jobs);
+    if cpu_seconds == 0 || jobs == 0 {
+        return Err("--jobs and --cpu-seconds must be positive".to_owned());
+    }
+    let mem_bytes = manifest.params.mem_bytes;
+    let cache = Cache::from_env()?;
+    let remote = Remote::from_env();
+    let (_, golden_blob) = store::fetch_blob(&cache, &manifest.golden_sha256, None, Some(&remote))?;
+
+    let platforms = [args.platform.clone()];
+    obtain_pinned(STANDIN_IMAGE, &platforms)?;
+    let identity = |pins: &Pins| {
+        pins.images
+            .get(STANDIN_IMAGE)
+            .and_then(|i| i.platforms.get(&args.platform))
+            .map(|p| p.identity.clone())
+            .ok_or_else(|| format!("image {STANDIN_IMAGE:?} has no pin for {}", args.platform))
+    };
+    let image = identity(&load_pins(&root)?)?;
+    let (_, outputs) = run_script(&RunArgs {
+        image: STANDIN_IMAGE.to_owned(),
+        platform: args.platform.clone(),
+        script: PathBuf::from(RUN_PROGRAMS),
+        inputs: vec![manifest.input_sha256.clone()],
+        seed: STANDIN_SEED,
+        jobs: Some(jobs),
+        cpu_seconds: Some(cpu_seconds),
+        prelude: Some(STANDIN_PRELUDE.to_owned()),
+        mount_standin: true,
+        require_sympy_env: false,
+        script_args: vec!["--mem-bytes".to_owned(), mem_bytes.to_string()],
+    })?;
+    let output = |file: &str| {
+        outputs.get(file).cloned().ok_or_else(|| {
+            format!("the stand-in run stored no {file} (the run failed); no score written")
+        })
+    };
+    let candidate_sha256 = output("records.jsonl")?;
+    let candidate_run_sha256 = output("run.json")?;
+    // Neither the stand-in nor its pin may have moved while it ran.
+    if !standin_changes(&root)?.is_empty()
+        || git_text(&root, &["rev-parse", "HEAD:standin"])? != standin_tree
+    {
+        return Err("standin/ changed during the run; no score written".to_owned());
+    }
+    if identity(&load_pins(&root)?)? != image {
+        return Err(format!(
+            "the {STANDIN_IMAGE} pin in {PINS_PATH} changed during the run; no score written"
+        ));
+    }
+    let report: Value = serde_json::from_slice(&read_blob(&cache, &candidate_run_sha256)?)
+        .map_err(|e| format!("run.json sha256:{candidate_run_sha256}: {e}"))?;
+    check_standin_report(
+        &format!("stand-in run.json sha256:{candidate_run_sha256}"),
+        &report,
+        &args.platform,
+        cpu_seconds,
+        mem_bytes,
+        jobs,
+        &manifest.input_sha256,
+    )?;
+
+    // Score: the goldens against the stand-in's records, the adjudicated cases excluded.
+    let scratch = store::target_dir()?
+        .join("oracle")
+        .join(format!("standin-{}", std::process::id()));
+    if scratch.exists() {
+        fs::remove_dir_all(&scratch).map_err(|e| format!("remove {}: {e}", scratch.display()))?;
+    }
+    fs::create_dir_all(&scratch).map_err(|e| format!("create {}: {e}", scratch.display()))?;
+    let exclude = scratch.join("exclude.txt");
+    let excluded: String = manifest
+        .adjudication
+        .iter()
+        .map(|a| format!("{}\n", a.case_id))
+        .collect();
+    fs::write(&exclude, excluded).map_err(|e| format!("write {}: {e}", exclude.display()))?;
+    let aggregate_path = scratch.join("aggregate.json");
+    let percase_path = scratch.join("percase.jsonl");
+    let candidate_blob = cache
+        .lookup(&candidate_sha256)?
+        .ok_or_else(|| format!("sha256:{candidate_sha256} is not in the cache"))?;
+    let scorer_args: Vec<&OsStr> = vec![
+        SCORER.as_ref(),
+        "--golden".as_ref(),
+        golden_blob.as_os_str(),
+        "--candidate".as_ref(),
+        candidate_blob.as_os_str(),
+        "--exclude".as_ref(),
+        exclude.as_os_str(),
+        "--out".as_ref(),
+        aggregate_path.as_os_str(),
+        "--cases-out".as_ref(),
+        percase_path.as_os_str(),
+    ];
+    if venv_python(&root, &["standin", "conformance"], &scorer_args)? != Some(0) {
+        return Err(format!("{SCORER} failed; no score written"));
+    }
+    let aggregate: Value = serde_json::from_slice(
+        &fs::read(&aggregate_path)
+            .map_err(|e| format!("read {}: {e}", aggregate_path.display()))?,
+    )
+    .map_err(|e| format!("{}: {e}", aggregate_path.display()))?;
+    let percase_sha256 = store::put(&cache, &percase_path)?;
+    let _ = fs::remove_dir_all(&scratch);
+
+    // GUEST-02: the stand-in holds to the Monty subset.
+    let lint_args: Vec<&OsStr> = vec!["-m".as_ref(), "lint".as_ref(), "standin/sympy".as_ref()];
+    let lint = match venv_python(&root, &["standin"], &lint_args)? {
+        Some(0) => "pass",
+        Some(1) => "fail",
+        other => {
+            return Err(format!(
+                "the Monty-subset lint did not run (exit {other:?})"
+            ));
+        }
+    };
+
+    let mut fields = serde_json::Map::new();
+    let mut put = |key: &str, value: Value| fields.insert(key.to_owned(), value);
+    put("schema", STANDIN_SCHEMA.into());
+    put("name", args.name.clone().into());
+    put("label", STANDIN_LABEL.into());
+    put("golden_manifest", manifest.name.clone().into());
+    put(
+        "golden_manifest_sha256",
+        ksci_wire::sha256_hex(&manifest_bytes).into(),
+    );
+    put("golden_sha256", manifest.golden_sha256.clone().into());
+    put("input_sha256", manifest.input_sha256.clone().into());
+    put("candidate_sha256", candidate_sha256.into());
+    put("candidate_run_sha256", candidate_run_sha256.into());
+    put("percase_sha256", percase_sha256.into());
+    put("standin_tree", standin_tree.into());
+    put("run_programs_blob", run_programs_blob.into());
+    put("scorer_blob", scorer_blob.into());
+    put("lint", lint.into());
+    put("platform", args.platform.clone().into());
+    put("image", image.into());
+    put(
+        "params",
+        serde_json::json!({
+            "seed": STANDIN_SEED,
+            "cpu_seconds": cpu_seconds,
+            "mem_bytes": mem_bytes,
+            "jobs": jobs,
+            "prelude": STANDIN_PRELUDE,
+        }),
+    );
+    let score = merge_score(aggregate, fields)?;
+    let bytes = ksci_wire::to_jcs(&score).map_err(|e| format!("encode score: {e}"))?;
+    let dir = root.join(SCORES_DIR);
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{}.m0-standin.json", args.name));
+    let partial = path.with_extension(format!("json.partial.{}", std::process::id()));
+    fs::write(&partial, &bytes).map_err(|e| format!("write {}: {e}", partial.display()))?;
+    fs::rename(&partial, &path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+    let field = |key: &str| match score.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    };
+    println!(
+        "standin {} ({}): scored={} excluded={} missing={} level1={}% level2={}% level3={}% error_message_equal={}/{} lint={lint}",
+        args.name,
+        STANDIN_LABEL,
+        field("scored"),
+        field("excluded"),
+        field("missing"),
+        field("level1_percent"),
+        field("level2_percent"),
+        field("level3_percent"),
+        field("error_message_equal"),
+        field("error_cases"),
+    );
+    println!("wrote {SCORES_DIR}/{}.m0-standin.json", args.name);
+    Ok(())
+}
+
+/// Requires a stand-in run.json to show the run `standin` asked for: seed 0, the platform, the
+/// limits, the host_shim prelude, the worker request, the manifest's sole input, and no SymPy
+/// environment in the image (`sympy` is null: what ran is the stand-in, not a real SymPy).
+fn check_standin_report(
+    what: &str,
+    report: &Value,
+    platform: &str,
+    cpu_seconds: u32,
+    mem_bytes: u64,
+    jobs: u32,
+    input_sha256: &str,
+) -> Res<()> {
+    check_report(
+        what,
+        report,
+        &[
+            ("/python_hash_seed", STANDIN_SEED.to_string().into()),
+            ("/machine", machine(platform)?.into()),
+            ("/limits/cpu_seconds", cpu_seconds.into()),
+            ("/limits/mem_bytes", mem_bytes.into()),
+            ("/limits/prelude", STANDIN_PRELUDE.into()),
+            ("/pids/jobs_requested", jobs.into()),
+            ("/sympy", Value::Null),
+            ("/inputs/0/sha256", input_sha256.into()),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -1973,5 +2329,53 @@ mod tests {
         assert_eq!(back, manifest);
         let unknown = text.replace(r#""name""#, r#""stdout":"x","name""#);
         assert!(serde_json::from_str::<GoldenManifest>(&unknown).is_err());
+    }
+
+    /// The scorer owns its keys: xtask adds digests and the label beside them, never over them.
+    #[test]
+    fn standin_score_merge_never_overwrites() {
+        let aggregate = serde_json::json!({"scored": 9, "level1": 9, "level1_percent": "100.0"});
+        let mut fields = serde_json::Map::new();
+        fields.insert("label".to_owned(), STANDIN_LABEL.into());
+        let merged = merge_score(aggregate.clone(), fields).unwrap();
+        assert_eq!(merged["scored"], 9);
+        assert_eq!(merged["label"], STANDIN_LABEL);
+        let text = String::from_utf8(ksci_wire::to_jcs(&merged).unwrap()).unwrap();
+        assert_eq!(text.matches("proxy").count(), 1, "{text}");
+        let mut clash = serde_json::Map::new();
+        clash.insert("scored".to_owned(), 0.into());
+        assert!(merge_score(aggregate, clash).is_err());
+        assert!(merge_score(Value::Null, serde_json::Map::new()).is_err());
+    }
+
+    /// A stand-in run must be the one asked for, and must not have found a real SymPy.
+    #[test]
+    fn standin_run_report_must_match_the_run() {
+        let input = "a".repeat(64);
+        let report = serde_json::json!({
+            "python_hash_seed": "0",
+            "machine": "aarch64",
+            "limits": {"cpu_seconds": 10, "mem_bytes": GOLDEN_MEM_BYTES, "prelude": "host_shim"},
+            "pids": {"jobs_requested": 4},
+            "inputs": [{"name": input, "sha256": input, "cases": 9}],
+            "sympy": null,
+        });
+        let check = |r: &Value| {
+            check_standin_report("t", r, "linux/arm64", 10, GOLDEN_MEM_BYTES, 4, &input)
+        };
+        check(&report).unwrap();
+        for (pointer, value) in [
+            ("/python_hash_seed", Value::from("1")),
+            ("/machine", "x86_64".into()),
+            ("/limits/cpu_seconds", 60.into()),
+            ("/limits/prelude", Value::Null),
+            ("/pids/jobs_requested", 8.into()),
+            ("/inputs/0/sha256", "d".repeat(64).into()),
+            ("/sympy", serde_json::json!({"sympy_version": "1.14.0"})),
+        ] {
+            let mut r = report.clone();
+            *r.pointer_mut(pointer).unwrap() = value;
+            assert!(check(&r).is_err(), "{pointer}");
+        }
     }
 }
