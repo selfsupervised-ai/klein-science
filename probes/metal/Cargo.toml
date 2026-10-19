@@ -1,0 +1,26 @@
+[package]
+name = "ksci-metal-probe"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Unshipped Metal risk probe (ACCEL-01): CubeCL integer kernels, fast-math default, watchdog"
+
+# No `[lints] workspace = true`: the probe is unshipped measurement tooling. It reads clocks,
+# spawns its own subprocesses (the watchdog trials) and sets thread QoS, which the shipped-crate
+# lints forbid. deny.toml excludes it from the shipped graph.
+
+[features]
+default = ["path-wgpu-msl"]
+# CubeCL `metal`: the wgpu runtime with the MSL emitter.
+path-wgpu-msl = ["cubecl/metal"]
+# CubeCL `metal-native`: the cubecl-metal runtime (objc2-metal).
+path-metal-native = ["cubecl/metal-native"]
+# CubeCL's `persistence` feature (the on-disk kernel and autotune cache) is never enabled: it
+# writes a cache outside any pinned location. `cargo tree -e features -p ksci-metal-probe` shows
+# no persistence feature anywhere in the graph.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cubecl = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }

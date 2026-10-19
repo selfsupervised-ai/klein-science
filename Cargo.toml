@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "conformance/ksci-conform", "xtask"]
+members = ["crates/*", "conformance/ksci-conform", "probes/metal", "xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -35,6 +35,10 @@ wit-bindgen = { version = "=0.62.0", default-features = false, features = ["macr
 # component model only: no WASI, no parallel compilation, no cache, no async.
 wasmtime46 = { package = "wasmtime", version = "=46.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "std"] }
 wasmtime49 = { package = "wasmtime", version = "=49.0.2", default-features = false, features = ["runtime", "cranelift", "component-model", "std"] }
+# The Metal probe (ksci-metal-probe: unshipped, macOS only). Exact pin, because CubeCL's README
+# warns of breaking changes between minor versions. Default features are off, so no backend and
+# never the `persistence` kernel/autotune cache come in by accident; the probe names each feature.
+cubecl = { version = "=0.11.0", default-features = false }
 
 # The disallowed lists live in clippy.toml (plan 01-03).
 [workspace.lints.clippy]
@@ -47,3 +51,15 @@ lto = "fat"
 panic = "abort"
 debug = false
 incremental = false
+
+# The Metal probe's build (`cargo xtask bench probe`; unshipped). Release optimisation without the
+# fat LTO and single codegen unit of the shipped profile, which would relink CubeCL, wgpu and naga
+# for minutes on every probe change. The probe crate itself, which holds the timed CPU baselines,
+# keeps one codegen unit.
+[profile.probe]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[profile.probe.package.ksci-metal-probe]
+codegen-units = 1

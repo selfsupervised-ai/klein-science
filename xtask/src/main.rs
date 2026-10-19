@@ -3,6 +3,7 @@
 //!
 //! Each command group owns its sub-enum in its own module; `main` only dispatches.
 
+mod bench;
 mod check;
 mod ci;
 mod depinfo;
@@ -45,6 +46,9 @@ enum Cmd {
     /// Build the shipped artifacts (R0 component, R2 worker) and their digests.
     #[command(subcommand)]
     Release(release::ReleaseCmd),
+    /// Benchmarks and probes under a fixed-box manifest.
+    #[command(subcommand)]
+    Bench(bench::BenchCmd),
 }
 
 fn main() -> ExitCode {
@@ -55,6 +59,7 @@ fn main() -> ExitCode {
         Cmd::Ci => ci::run(),
         Cmd::Oracle(cmd) => oracle::run(cmd),
         Cmd::Release(cmd) => release::run(cmd),
+        Cmd::Bench(cmd) => bench::run(cmd),
     };
     match result {
         Ok(code) => code,

@@ -806,7 +806,6 @@ pub fn heavy_job() -> Res<HeavyGuard> {
 }
 
 /// Whether a klein-rs `cargo` or `rustc` process is running (the box manifest records this).
-#[expect(dead_code, reason = "API for plan 01-11's fixed-box manifest")]
 pub fn klein_rs_build_running() -> Res<bool> {
     Ok(!klein_rs_builds()?.is_empty())
 }
